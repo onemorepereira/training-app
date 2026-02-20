@@ -19,8 +19,15 @@
 
   let detailModal = $state<DeviceDetails | null>(null);
   let detailLoading = $state('');
+  let detailDialogEl = $state<HTMLDialogElement | null>(null);
   let connectingIds = $state<Set<string>>(new Set());
   let disconnectingIds = $state<Set<string>>(new Set());
+
+  $effect(() => {
+    if (detailModal && detailDialogEl && !detailDialogEl.open) {
+      detailDialogEl.showModal();
+    }
+  });
 
   function syncStore() {
     connectedDevices.set(devices);
@@ -177,11 +184,8 @@
   }
 
   function closeModal() {
+    detailDialogEl?.close();
     detailModal = null;
-  }
-
-  function handleModalKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') closeModal();
   }
 
   function shortUuid(uuid: string): string {
@@ -444,11 +448,8 @@
 </div>
 
 {#if detailModal}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <!-- svelte-ignore a11y_interactive_supports_focus -->
-  <div class="modal-backdrop" role="dialog" aria-modal="true" onclick={closeModal} onkeydown={handleModalKeydown}>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={handleModalKeydown}>
+  <dialog bind:this={detailDialogEl} class="modal-dialog" onclose={closeModal}>
+    <div class="modal">
       <div class="modal-header">
         <h2>{detailModal.name ?? 'Unknown Device'}</h2>
         <button class="modal-close" onclick={closeModal} aria-label="Close">
@@ -543,7 +544,7 @@
         {/if}
       </div>
     </div>
-  </div>
+  </dialog>
 {/if}
 
 <style>
@@ -873,16 +874,18 @@
   }
 
   /* Modal */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
+  .modal-dialog {
+    border: none;
+    background: transparent;
+    padding: 0;
+    max-width: none;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .modal-dialog::backdrop {
     background: rgba(0, 0, 0, 0.6);
     backdrop-filter: blur(4px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    padding: var(--space-lg);
     animation: fade-in 150ms ease;
   }
 
@@ -890,8 +893,8 @@
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-lg);
-    width: 100%;
-    max-width: 560px;
+    width: 560px;
+    max-width: 90vw;
     max-height: 80vh;
     display: flex;
     flex-direction: column;

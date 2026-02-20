@@ -33,6 +33,19 @@
     mode?: 'post-ride' | 'edit';
   } = $props();
 
+  let dialogEl = $state<HTMLDialogElement | null>(null);
+
+  $effect(() => {
+    if (dialogEl && !dialogEl.open) {
+      dialogEl.showModal();
+    }
+  });
+
+  function handleClose() {
+    dialogEl?.close();
+    onClose();
+  }
+
   function autoTitle(startTime: string): string {
     const hour = new Date(startTime).getHours();
     if (hour >= 5 && hour < 12) return 'Morning Ride';
@@ -97,13 +110,11 @@
   }
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="modal-backdrop" onclick={onClose} onkeydown={(e) => e.key === 'Escape' && onClose()}>
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
+<dialog bind:this={dialogEl} class="modal-dialog" onclose={handleClose}>
+  <div class="modal">
     <div class="modal-header">
       <h2>{mode === 'post-ride' ? 'Save Activity' : 'Edit Activity'}</h2>
-      <button class="close-btn" onclick={onClose} aria-label="Close">
+      <button class="close-btn" onclick={handleClose} aria-label="Close">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
         </svg>
@@ -187,7 +198,7 @@
         </button>
       {/if}
       <div class="actions-right">
-        <button class="btn-secondary" onclick={onClose}>
+        <button class="btn-secondary" onclick={handleClose}>
           {mode === 'post-ride' ? 'Skip' : 'Cancel'}
         </button>
         <button class="btn-primary" onclick={handleSave}>
@@ -196,19 +207,21 @@
       </div>
     </div>
   </div>
-</div>
+</dialog>
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
+  .modal-dialog {
+    border: none;
+    background: transparent;
+    padding: 0;
+    max-width: none;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .modal-dialog::backdrop {
     background: rgba(0, 0, 0, 0.6);
     backdrop-filter: blur(4px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    padding: var(--space-lg);
     animation: fade-in 150ms ease;
   }
 
@@ -222,8 +235,8 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-xl);
     padding: var(--space-xl);
-    width: 100%;
-    max-width: 480px;
+    width: 480px;
+    max-width: 90vw;
     max-height: 90vh;
     overflow-y: auto;
     box-shadow: var(--shadow-lg);
