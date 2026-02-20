@@ -84,9 +84,17 @@ pub fn run() {
             let log_dir = std::path::Path::new(&data_dir).join("logs");
             std::fs::create_dir_all(&log_dir).expect("Failed to create log directory");
 
-            let _logger = Logger::try_with_env_or_str(
-                "info, btleplug=warn, rusb=warn, sqlx=warn",
-            )
+            #[cfg(feature = "production")]
+            let log_spec = "warn, app_lib=info, btleplug=warn, rusb=warn, sqlx=warn";
+            #[cfg(not(feature = "production"))]
+            let log_spec = "info, btleplug=warn, rusb=warn, sqlx=warn";
+
+            #[cfg(feature = "production")]
+            let stderr_dup = Duplicate::Warn;
+            #[cfg(not(feature = "production"))]
+            let stderr_dup = Duplicate::All;
+
+            let _logger = Logger::try_with_env_or_str(log_spec)
             .expect("Failed to parse log spec")
             .log_to_file(
                 FileSpec::default()
@@ -100,7 +108,7 @@ pub fn run() {
             )
             .write_mode(WriteMode::BufferAndFlush)
             .format_for_files(file_format)
-            .duplicate_to_stderr(Duplicate::All)
+            .duplicate_to_stderr(stderr_dup)
             .format_for_stderr(stderr_format)
             .start()
             .expect("Failed to start logger");
