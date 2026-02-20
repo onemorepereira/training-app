@@ -81,36 +81,51 @@ fn detect_package_manager() -> Option<&'static str> {
     None
 }
 
-fn build_fix_script(status: &PrereqStatus, udev_rules_source: &str) -> String {
-    let mut script = String::from("set -e\n");
+/// Build the list of commands to run as root via pkexec.
+/// Each entry is a Vec of arguments to pass to `pkexec` directly,
+/// avoiding shell script construction and shell injection risks.
+fn build_fix_commands(status: &PrereqStatus, udev_rules_source: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
 
     if !status.udev_rules {
-        script.push_str(&format!(
-            "cp '{}' /etc/udev/rules.d/99-ant-usb.rules\n\
-             udevadm control --reload-rules\n\
-             udevadm trigger\n",
-            udev_rules_source
-        ));
+        commands.push(vec![
+            "cp".into(),
+            udev_rules_source.into(),
+            "/etc/udev/rules.d/99-ant-usb.rules".into(),
+        ]);
+        commands.push(vec![
+            "udevadm".into(),
+            "control".into(),
+            "--reload-rules".into(),
+        ]);
+        commands.push(vec!["udevadm".into(), "trigger".into()]);
     }
 
     if !status.bluez_installed {
         if let Some(pm) = detect_package_manager() {
-            let install_cmd = match pm {
-                "apt-get" => "apt-get install -y bluez",
-                "dnf" => "dnf install -y bluez",
-                "pacman" => "pacman -S --noconfirm bluez bluez-utils",
+            let install_args: Vec<String> = match pm {
+                "apt-get" => vec!["apt-get", "install", "-y", "bluez"],
+                "dnf" => vec!["dnf", "install", "-y", "bluez"],
+                "pacman" => vec!["pacman", "-S", "--noconfirm", "bluez", "bluez-utils"],
                 _ => unreachable!(),
-            };
-            script.push_str(install_cmd);
-            script.push('\n');
+            }
+            .into_iter()
+            .map(String::from)
+            .collect();
+            commands.push(install_args);
         }
     }
 
     if !status.bluetooth_service {
-        script.push_str("systemctl enable --now bluetooth\n");
+        commands.push(vec![
+            "systemctl".into(),
+            "enable".into(),
+            "--now".into(),
+            "bluetooth".into(),
+        ]);
     }
 
-    script
+    commands
 }
 
 pub fn fix(udev_rules_source: &str) -> FixResult {
@@ -135,37 +150,41 @@ pub fn fix(udev_rules_source: &str) -> FixResult {
         };
     }
 
-    let script = build_fix_script(&status, udev_rules_source);
+    let commands = build_fix_commands(&status, udev_rules_source);
 
-    let output = Command::new("pkexec")
-        .args(["/bin/bash", "-c", &script])
-        .output();
+    for args in &commands {
+        let output = Command::new("pkexec").args(args).output();
+        match output {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let new_status = check();
+                return FixResult {
+                    success: false,
+                    message: format!("Fix failed at '{}': {}", args.join(" "), stderr.trim()),
+                    status: new_status,
+                };
+            }
+            Err(e) => {
+                let new_status = check();
+                return FixResult {
+                    success: false,
+                    message: format!("Failed to run pkexec {}: {}", args.join(" "), e),
+                    status: new_status,
+                };
+            }
+            Ok(_) => {} // success, continue to next command
+        }
+    }
 
     let new_status = check();
-
-    match output {
-        Ok(o) if o.status.success() => FixResult {
-            success: new_status.all_met,
-            message: if new_status.all_met {
-                "All prerequisites fixed successfully.".into()
-            } else {
-                "Fix completed but some prerequisites still unmet.".into()
-            },
-            status: new_status,
+    FixResult {
+        success: new_status.all_met,
+        message: if new_status.all_met {
+            "All prerequisites fixed successfully.".into()
+        } else {
+            "Fix completed but some prerequisites still unmet.".into()
         },
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            FixResult {
-                success: false,
-                message: format!("Fix failed: {}", stderr.trim()),
-                status: new_status,
-            }
-        }
-        Err(e) => FixResult {
-            success: false,
-            message: format!("Failed to run pkexec: {}", e),
-            status: new_status,
-        },
+        status: new_status,
     }
 }
 
@@ -174,7 +193,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fix_script_all_missing() {
+    fn fix_commands_all_missing() {
         let status = PrereqStatus {
             udev_rules: false,
             bluez_installed: false,
@@ -182,17 +201,23 @@ mod tests {
             all_met: false,
             pkexec_available: true,
         };
-        let script = build_fix_script(&status, "/tmp/99-ant-usb.rules");
-        assert!(script.contains("set -e"));
-        assert!(script.contains("cp '/tmp/99-ant-usb.rules' /etc/udev/rules.d/99-ant-usb.rules"));
-        assert!(script.contains("udevadm control --reload-rules"));
-        assert!(script.contains("udevadm trigger"));
-        // BlueZ install command depends on detected package manager, but service line is always present
-        assert!(script.contains("systemctl enable --now bluetooth"));
+        let cmds = build_fix_commands(&status, "/tmp/99-ant-usb.rules");
+        // udev: cp, udevadm control, udevadm trigger (3 commands)
+        // bluez: conditional on package manager
+        // bluetooth: systemctl (1 command)
+        assert!(cmds.len() >= 4, "expected at least 4 commands, got {}", cmds.len());
+
+        assert_eq!(cmds[0], vec!["cp", "/tmp/99-ant-usb.rules", "/etc/udev/rules.d/99-ant-usb.rules"]);
+        assert_eq!(cmds[1], vec!["udevadm", "control", "--reload-rules"]);
+        assert_eq!(cmds[2], vec!["udevadm", "trigger"]);
+
+        // Last command is always the systemctl enable
+        let last = cmds.last().unwrap();
+        assert_eq!(last, &vec!["systemctl", "enable", "--now", "bluetooth"]);
     }
 
     #[test]
-    fn fix_script_only_udev_missing() {
+    fn fix_commands_only_udev_missing() {
         let status = PrereqStatus {
             udev_rules: false,
             bluez_installed: true,
@@ -200,18 +225,15 @@ mod tests {
             all_met: false,
             pkexec_available: true,
         };
-        let script = build_fix_script(&status, "/opt/rules/99-ant-usb.rules");
-        assert!(script.contains("cp '/opt/rules/99-ant-usb.rules'"));
-        assert!(script.contains("udevadm"));
-        assert!(!script.contains("systemctl"));
-        // Should not contain any install command
-        assert!(!script.contains("apt-get"));
-        assert!(!script.contains("dnf"));
-        assert!(!script.contains("pacman"));
+        let cmds = build_fix_commands(&status, "/opt/rules/99-ant-usb.rules");
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0], vec!["cp", "/opt/rules/99-ant-usb.rules", "/etc/udev/rules.d/99-ant-usb.rules"]);
+        assert_eq!(cmds[1], vec!["udevadm", "control", "--reload-rules"]);
+        assert_eq!(cmds[2], vec!["udevadm", "trigger"]);
     }
 
     #[test]
-    fn fix_script_all_met() {
+    fn fix_commands_all_met_produces_no_commands() {
         let status = PrereqStatus {
             udev_rules: true,
             bluez_installed: true,
@@ -219,15 +241,12 @@ mod tests {
             all_met: true,
             pkexec_available: true,
         };
-        let script = build_fix_script(&status, "/tmp/rules");
-        assert_eq!(script.trim(), "set -e");
+        let cmds = build_fix_commands(&status, "/tmp/rules");
+        assert!(cmds.is_empty());
     }
 
     #[test]
-    fn fix_script_bluez_missing_has_install_cmd() {
-        // This test verifies that when BlueZ is missing and a package manager is detected,
-        // the script contains an install command. Since detect_package_manager() is live,
-        // we just verify the script structure is correct.
+    fn fix_commands_bluez_missing_has_install_cmd() {
         let status = PrereqStatus {
             udev_rules: true,
             bluez_installed: false,
@@ -235,17 +254,38 @@ mod tests {
             all_met: false,
             pkexec_available: true,
         };
-        let script = build_fix_script(&status, "/tmp/rules");
-        // Should not contain udev or systemctl commands
-        assert!(!script.contains("udevadm"));
-        assert!(!script.contains("systemctl"));
+        let cmds = build_fix_commands(&status, "/tmp/rules");
+        // No udev or systemctl commands
+        for cmd in &cmds {
+            assert_ne!(cmd[0], "udevadm");
+            assert_ne!(cmd[0], "systemctl");
+        }
         // If a package manager is available, there should be an install command
         if detect_package_manager().is_some() {
+            assert_eq!(cmds.len(), 1);
+            let install = &cmds[0];
             assert!(
-                script.contains("apt-get install")
-                    || script.contains("dnf install")
-                    || script.contains("pacman -S")
+                install[0] == "apt-get" || install[0] == "dnf" || install[0] == "pacman",
+                "expected a package manager command, got {:?}",
+                install
             );
         }
+    }
+
+    #[test]
+    fn fix_commands_path_with_special_chars_is_passed_verbatim() {
+        // The whole point of this fix: paths with shell-special characters
+        // are passed as discrete arguments, not interpolated into a script.
+        let status = PrereqStatus {
+            udev_rules: false,
+            bluez_installed: true,
+            bluetooth_service: true,
+            all_met: false,
+            pkexec_available: true,
+        };
+        let evil_path = "/tmp/it's a \"test\" && rm -rf /";
+        let cmds = build_fix_commands(&status, evil_path);
+        // The path must appear as a single, unmodified argument
+        assert_eq!(cmds[0][1], evil_path);
     }
 }
