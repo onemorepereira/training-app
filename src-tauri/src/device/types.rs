@@ -7,12 +7,32 @@ pub enum Transport {
     AntPlus,
 }
 
+impl Transport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ble => "Ble",
+            Self::AntPlus => "AntPlus",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DeviceType {
     HeartRate,
     Power,
     CadenceSpeed,
     FitnessTrainer,
+}
+
+impl DeviceType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::HeartRate => "HeartRate",
+            Self::Power => "Power",
+            Self::CadenceSpeed => "CadenceSpeed",
+            Self::FitnessTrainer => "FitnessTrainer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

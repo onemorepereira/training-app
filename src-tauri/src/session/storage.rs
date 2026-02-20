@@ -226,14 +226,8 @@ impl Storage {
     }
 
     pub async fn upsert_known_device(&self, device: &DeviceInfo) -> Result<(), AppError> {
-        let device_type = serde_json::to_string(&device.device_type)
-            .unwrap()
-            .trim_matches('"')
-            .to_string();
-        let transport = serde_json::to_string(&device.transport)
-            .unwrap()
-            .trim_matches('"')
-            .to_string();
+        let device_type = device.device_type.as_str();
+        let transport = device.transport.as_str();
         let last_seen = device
             .last_seen
             .clone()
