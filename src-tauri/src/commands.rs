@@ -12,6 +12,16 @@ use crate::session::manager::SessionManager;
 use crate::session::storage::Storage;
 use crate::session::types::{LiveMetrics, SessionConfig, SessionSummary};
 
+/// Validate that a session ID from the frontend is a safe UUID string.
+/// Prevents path traversal via crafted IDs like "../../etc/passwd".
+fn validate_session_id(id: &str) -> Result<(), AppError> {
+    if !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        Ok(())
+    } else {
+        Err(AppError::Session("Invalid session ID".into()))
+    }
+}
+
 pub struct AppState {
     pub device_manager: Arc<tokio::sync::Mutex<DeviceManager>>,
     pub session_manager: Arc<SessionManager>,
@@ -239,6 +249,7 @@ pub async fn update_session_metadata(
     rpe: Option<u8>,
     notes: Option<String>,
 ) -> Result<(), AppError> {
+    validate_session_id(&session_id)?;
     state
         .storage
         .update_session_metadata(&session_id, title, activity_type, rpe, notes)
@@ -250,6 +261,7 @@ pub async fn delete_session(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<(), AppError> {
+    validate_session_id(&session_id)?;
     state.storage.delete_session(&session_id).await
 }
 
@@ -258,6 +270,7 @@ pub async fn export_session_fit(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<String, AppError> {
+    validate_session_id(&session_id)?;
     let summary = state.storage.get_session(&session_id).await?;
     let readings = state.storage.load_sensor_data(&session_id)?;
     let fit_data = fit_export::export_fit(&summary, &readings)?;
@@ -303,4 +316,44 @@ pub async fn fix_prerequisites(
     })
     .await
     .map_err(|e| AppError::Session(format!("Prereq fix failed: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_uuid_session_id() {
+        assert!(validate_session_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+    }
+
+    #[test]
+    fn valid_hex_only_session_id() {
+        assert!(validate_session_id("abcdef0123456789").is_ok());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(validate_session_id("../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_dot_dot_slash() {
+        assert!(validate_session_id("..").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_string() {
+        assert!(validate_session_id("").is_err());
+    }
+
+    #[test]
+    fn rejects_spaces() {
+        assert!(validate_session_id("abc def").is_err());
+    }
+
+    #[test]
+    fn rejects_null_bytes() {
+        assert!(validate_session_id("abc\0def").is_err());
+    }
 }
