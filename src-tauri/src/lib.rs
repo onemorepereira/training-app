@@ -62,6 +62,16 @@ fn file_format(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Work around WebKitGTK EGL crashes in AppImage bundles on certain
+    // GPU/driver combinations (AMD Mesa, some NVIDIA). Must be set before
+    // WebKitGTK initializes. See: https://github.com/tauri-apps/tauri/issues/11988
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
     tauri::Builder::default()
         .setup(|app| {
             let data_dir = app
