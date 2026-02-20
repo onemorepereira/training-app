@@ -7,6 +7,7 @@ use crate::device::manager::DeviceManager;
 use crate::device::types::{DeviceDetails, DeviceInfo, DeviceType, SensorReading};
 use crate::error::AppError;
 use crate::prerequisites;
+use crate::session::analysis::{self, SessionAnalysis};
 use crate::session::fit_export;
 use crate::session::manager::SessionManager;
 use crate::session::storage::Storage;
@@ -109,6 +110,33 @@ pub async fn get_live_metrics(state: State<'_, AppState>) -> Result<Option<LiveM
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionSummary>, AppError> {
     state.storage.list_sessions().await.map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn get_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<SessionSummary, AppError> {
+    validate_session_id(&session_id)?;
+    state.storage.get_session(&session_id).await
+}
+
+#[tauri::command]
+pub async fn get_session_analysis(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<SessionAnalysis, AppError> {
+    validate_session_id(&session_id)?;
+    let session = state.storage.get_session(&session_id).await?;
+    let config = state.storage.get_user_config().await?;
+    let storage = state.storage.clone();
+    let sid = session_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let readings = storage.load_sensor_data(&sid)?;
+        Ok::<_, AppError>(analysis::compute_analysis(&readings, &session, &config))
+    })
+    .await
+    .map_err(|e| AppError::Session(format!("Analysis failed: {}", e)))?
 }
 
 #[tauri::command]
