@@ -168,15 +168,17 @@ pub fn decode_indoor_bike_data(data: &[u8], device_id: &str) -> Vec<SensorReadin
     let timestamp = Some(std::time::Instant::now());
     let did = device_id.to_string();
 
-    // Instantaneous Speed — mandatory field, always present at offset 2
-    if data.len() >= offset + 2 {
-        let raw_speed = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        readings.push(SensorReading::Speed {
-            kmh: raw_speed as f32 * 0.01,
-            timestamp,
-            epoch_ms,
-            device_id: did.clone(),
-        });
+    // Instantaneous Speed — present when bit 0 is 0 (FTMS inverted logic)
+    if flags & 0x01 == 0 {
+        if data.len() >= offset + 2 {
+            let raw_speed = u16::from_le_bytes([data[offset], data[offset + 1]]);
+            readings.push(SensorReading::Speed {
+                kmh: raw_speed as f32 * 0.01,
+                timestamp,
+                epoch_ms,
+                device_id: did.clone(),
+            });
+        }
         offset += 2;
     }
 
@@ -539,19 +541,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_indoor_bike_speed_always_present() {
-        // Speed is mandatory regardless of bit 0
-        let flags: u16 = 0x0001; // bit0=1, speed still present
-        let raw_speed: u16 = 2500; // 25.0 km/h
+    fn decode_indoor_bike_speed_not_present_when_bit0_set() {
+        // FTMS inverted logic: bit0=1 means speed is NOT present
+        let flags: u16 = 0x0001;
         let mut data = Vec::new();
         data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&raw_speed.to_le_bytes());
+        // No speed bytes follow — only the 2-byte flags field
         let readings = decode_indoor_bike_data(&data, DEV);
-        assert_eq!(readings.len(), 1);
-        match &readings[0] {
-            SensorReading::Speed { kmh, .. } => assert_approx(*kmh, 25.0, 0.01, "speed with bit0=1"),
-            _ => panic!("expected Speed"),
-        }
+        assert!(readings.is_empty(), "bit0=1 should suppress speed");
     }
 
     #[test]
