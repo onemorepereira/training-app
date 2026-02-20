@@ -12,6 +12,7 @@
   import { trainerError } from '$lib/stores/trainer';
   import { api, extractError, type SessionSummary } from '$lib/tauri';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
+  import { formatDuration } from '$lib/utils/format';
 
   let error = $state('');
   let postRideSession = $state<SessionSummary | null>(null);
@@ -51,14 +52,6 @@
     } catch (e) {
       error = extractError(e);
     }
-  }
-
-  function formatTime(secs: number): string {
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    const s = secs % 60;
-    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    return `${m}:${String(s).padStart(2, '0')}`;
   }
 
   function toggleFullscreen() {
@@ -102,7 +95,7 @@
         <MetricCard label="Speed" value={$currentSpeed != null ? formatSpeed($currentSpeed, $unitSystem) : null} unit={$speedUnit} size="lg" />
         <MetricCard
           label="Time"
-          value={$liveMetrics ? formatTime($liveMetrics.elapsed_secs) : '--'}
+          value={$liveMetrics ? formatDuration($liveMetrics.elapsed_secs) : '--'}
           size="lg"
         />
       </div>
