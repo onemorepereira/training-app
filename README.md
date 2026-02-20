@@ -48,6 +48,10 @@ cd src-tauri && cargo test   # Rust tests
 npm run check                # Frontend type checking
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
