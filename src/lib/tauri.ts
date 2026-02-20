@@ -102,6 +102,32 @@ export interface DeviceDetails {
   services: ServiceInfo[];
 }
 
+export interface TimeseriesPoint {
+  elapsed_secs: number;
+  power: number | null;
+  heart_rate: number | null;
+  cadence: number | null;
+  speed: number | null;
+}
+
+export interface PowerCurvePoint {
+  duration_secs: number;
+  watts: number;
+}
+
+export interface ZoneBucket {
+  zone: number;
+  duration_secs: number;
+  percentage: number;
+}
+
+export interface SessionAnalysis {
+  timeseries: TimeseriesPoint[];
+  power_curve: PowerCurvePoint[];
+  power_zone_distribution: ZoneBucket[];
+  hr_zone_distribution: ZoneBucket[];
+}
+
 export interface PrereqStatus {
   udev_rules: boolean;
   bluez_installed: boolean;
@@ -135,6 +161,8 @@ export const api = {
   resumeSession: () => invoke<void>('resume_session'),
   getLiveMetrics: () => invoke<LiveMetrics | null>('get_live_metrics'),
   listSessions: () => invoke<SessionSummary[]>('list_sessions'),
+  getSession: (sessionId: string) => invoke<SessionSummary>('get_session', { sessionId }),
+  getSessionAnalysis: (sessionId: string) => invoke<SessionAnalysis>('get_session_analysis', { sessionId }),
   getUserConfig: () => invoke<SessionConfig>('get_user_config'),
   saveUserConfig: (config: SessionConfig) => invoke<void>('save_user_config', { config }),
   setTrainerPower: (watts: number) => invoke<void>('set_trainer_power', { watts }),
