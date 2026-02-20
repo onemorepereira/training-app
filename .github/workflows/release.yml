@@ -54,6 +54,18 @@ jobs:
           restore-keys: |
             node-${{ runner.os }}-
 
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # Patch tauri.conf.json
+          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
+          # Patch Cargo.toml (only the package version, not dependency versions)
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" src-tauri/Cargo.toml
+          # Patch package.json
+          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
+          echo "Set version to $VERSION"
+
       - name: Install npm dependencies
         run: npm ci
 
