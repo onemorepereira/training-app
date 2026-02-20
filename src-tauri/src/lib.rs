@@ -298,6 +298,8 @@ pub fn run() {
             commands::resume_session,
             commands::get_live_metrics,
             commands::list_sessions,
+            commands::get_session,
+            commands::get_session_analysis,
             commands::get_user_config,
             commands::save_user_config,
             commands::set_trainer_power,
