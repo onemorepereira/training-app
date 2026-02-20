@@ -28,33 +28,39 @@ let latestSpeed: number | null = null;
 
 let metricsInterval: ReturnType<typeof setInterval> | null = null;
 let unlistenFn: (() => void) | null = null;
+let initializing = false;
 
 export async function startSensorListening() {
-  if (unlistenFn) return;
+  if (unlistenFn || initializing) return;
+  initializing = true;
 
-  unlistenFn = await listen<SensorReading>('sensor_reading', (event) => {
-    const reading = event.payload;
-    if (reading.Power) { latestPower = reading.Power.watts; currentPower.set(latestPower); }
-    if (reading.HeartRate) { latestHR = reading.HeartRate.bpm; currentHR.set(latestHR); }
-    if (reading.Cadence) { latestCadence = reading.Cadence.rpm; currentCadence.set(latestCadence); }
-    if (reading.Speed) { latestSpeed = reading.Speed.kmh; currentSpeed.set(latestSpeed); }
+  try {
+    unlistenFn = await listen<SensorReading>('sensor_reading', (event) => {
+      const reading = event.payload;
+      if (reading.Power) { latestPower = reading.Power.watts; currentPower.set(latestPower); }
+      if (reading.HeartRate) { latestHR = reading.HeartRate.bpm; currentHR.set(latestHR); }
+      if (reading.Cadence) { latestCadence = reading.Cadence.rpm; currentCadence.set(latestCadence); }
+      if (reading.Speed) { latestSpeed = reading.Speed.kmh; currentSpeed.set(latestSpeed); }
 
-    if (get(sessionActive) && !get(sessionPaused)) {
-      metricHistory.update((h) => {
-        const next = [...h, { t: Date.now(), power: latestPower, hr: latestHR, cadence: latestCadence, speed: latestSpeed }];
-        return next.length > MAX_HISTORY ? next.slice(next.length - MAX_HISTORY) : next;
-      });
-    }
-  });
+      if (get(sessionActive) && !get(sessionPaused)) {
+        metricHistory.update((h) => {
+          const next = [...h, { t: Date.now(), power: latestPower, hr: latestHR, cadence: latestCadence, speed: latestSpeed }];
+          return next.length > MAX_HISTORY ? next.slice(next.length - MAX_HISTORY) : next;
+        });
+      }
+    });
 
-  metricsInterval = setInterval(async () => {
-    try {
-      const metrics = await api.getLiveMetrics();
-      liveMetrics.set(metrics);
-    } catch {
-      // Session may not be active
-    }
-  }, 250);
+    metricsInterval = setInterval(async () => {
+      try {
+        const metrics = await api.getLiveMetrics();
+        liveMetrics.set(metrics);
+      } catch {
+        // Session may not be active
+      }
+    }, 250);
+  } finally {
+    initializing = false;
+  }
 }
 
 export function stopSensorListening() {
