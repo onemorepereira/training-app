@@ -443,17 +443,21 @@ impl Storage {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<(), AppError> {
+        // Delete file first, then DB row. A row without a file is visible in
+        // history (gracefully handleable). A file without a row is an orphan
+        // that wastes disk space silently forever.
+        let path = Path::new(&self.data_dir)
+            .join("sessions")
+            .join(format!("{}.bin", session_id));
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| AppError::Session(format!("Failed to delete session file: {}", e)))?;
+        }
         sqlx::query("DELETE FROM sessions WHERE id = ?")
             .bind(session_id)
             .execute(&self.pool)
             .await
             .map_err(AppError::Database)?;
-        let path = Path::new(&self.data_dir)
-            .join("sessions")
-            .join(format!("{}.bin", session_id));
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
         Ok(())
     }
 
