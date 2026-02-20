@@ -1,0 +1,7 @@
+# Garmin ANT+ USB sticks — set permissions for direct USB access
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fcf", ATTR{idProduct}=="1008", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fcf", ATTR{idProduct}=="1009", MODE="0666"
+
+# Prevent usb_serial_simple from claiming ANT+ sticks
+# (the driver has Dynastream VID/PID in its static ID table)
+ACTION=="bind", SUBSYSTEM=="usb", ATTRS{idVendor}=="0fcf", DRIVER=="usb_serial_simple", RUN+="/bin/sh -c 'echo $kernel > /sys/bus/usb/drivers/usb_serial_simple/unbind 2>/dev/null || true'"

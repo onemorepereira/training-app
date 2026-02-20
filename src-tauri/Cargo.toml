@@ -1,0 +1,40 @@
+[package]
+name = "training-app"
+version = "0.1.0"
+description = "A cycling training application"
+authors = ["Miguel Pereira"]
+license = "GPL-3.0"
+repository = "https://github.com/onemorepereira/training-app"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+btleplug = "0.11"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+bincode = "1"
+log = "0.4"
+flexi_logger = "0.29"
+thiserror = "2"
+futures = "0.3"
+rusb = "0.9"
+
+[features]
+production = []
+
+[dev-dependencies]
+tempfile = "3"
