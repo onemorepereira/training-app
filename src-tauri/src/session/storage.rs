@@ -157,6 +157,12 @@ impl Storage {
         for stmt in migration_008_stmts {
             run_alter_ignore_duplicate(&pool, stmt).await?;
         }
+        // Migration 009: distance
+        run_alter_ignore_duplicate(
+            &pool,
+            "ALTER TABLE sessions ADD COLUMN distance_km REAL",
+        )
+        .await?;
         Ok(Self {
             pool,
             data_dir: data_dir.to_string(),
@@ -185,9 +191,9 @@ impl Storage {
         sqlx::query(
             "INSERT OR IGNORE INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
              normalized_power, tss, intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, \
-             work_kj, variability_index, \
+             work_kj, variability_index, distance_km, \
              raw_file_path, title, activity_type, rpe, notes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&summary.id)
         .bind(&start_time)
@@ -204,6 +210,7 @@ impl Storage {
         .bind(summary.avg_speed)
         .bind(summary.work_kj.map(|v| v as f64))
         .bind(summary.variability_index.map(|v| v as f64))
+        .bind(summary.distance_km.map(|v| v as f64))
         .bind(&raw_file_path)
         .bind(&summary.title)
         .bind(&summary.activity_type)
@@ -226,7 +233,7 @@ impl Storage {
         let rows = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
              intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
-             title, activity_type, rpe, notes FROM sessions ORDER BY start_time DESC",
+             distance_km, title, activity_type, rpe, notes FROM sessions ORDER BY start_time DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -362,7 +369,7 @@ impl Storage {
         let row = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
              intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
-             title, activity_type, rpe, notes FROM sessions WHERE id = ?",
+             distance_km, title, activity_type, rpe, notes FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_one(&self.pool)
@@ -619,6 +626,7 @@ struct SessionRow {
     avg_speed: Option<f64>,
     work_kj: Option<f64>,
     variability_index: Option<f64>,
+    distance_km: Option<f64>,
     title: Option<String>,
     activity_type: Option<String>,
     rpe: Option<i32>,
@@ -653,6 +661,7 @@ impl TryFrom<SessionRow> for SessionSummary {
             avg_speed: row.avg_speed.map(|v| v as f32),
             work_kj: row.work_kj.map(|v| v as f32),
             variability_index: row.variability_index.map(|v| v as f32),
+            distance_km: row.distance_km.map(|v| v as f32),
             title: row.title,
             activity_type: row.activity_type,
             rpe: row.rpe.map(|v| v as u8),
@@ -728,6 +737,7 @@ mod tests {
             avg_speed: Some(30.0),
             work_kj: Some(648.0),
             variability_index: Some(1.05),
+            distance_km: None,
             title: None,
             activity_type: None,
             rpe: None,
@@ -820,6 +830,7 @@ mod tests {
             avg_speed: None,
             work_kj: None,
             variability_index: None,
+            distance_km: None,
             title: None,
             activity_type: None,
             rpe: None,

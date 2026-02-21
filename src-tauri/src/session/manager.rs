@@ -100,6 +100,7 @@ impl SessionManager {
             avg_speed: session.metrics.avg_speed(),
             work_kj: session.metrics.work_kj(),
             variability_index: session.metrics.variability_index(),
+            distance_km: session.metrics.distance_km(),
             title: None,
             activity_type: None,
             rpe: None,
@@ -156,8 +157,8 @@ impl SessionManager {
                 session.metrics.record_cadence(*rpm);
                 session.last_cadence = Some(now);
             }
-            SensorReading::Speed { kmh, .. } => {
-                session.metrics.record_speed(*kmh);
+            SensorReading::Speed { kmh, epoch_ms, .. } => {
+                session.metrics.record_speed(*kmh, *epoch_ms);
                 session.last_speed = Some(now);
             }
             SensorReading::TrainerCommand { .. } => {
@@ -219,6 +220,7 @@ impl SessionManager {
             avg_speed: session.metrics.avg_speed(),
             work_kj: session.metrics.work_kj(),
             variability_index: session.metrics.variability_index(),
+            distance_km: session.metrics.distance_km(),
             title: None,
             activity_type: None,
             rpe: None,

@@ -15,7 +15,7 @@ pub struct MetricsCalculator {
     last_epoch_ms: Option<u64>,
     hr_readings: Vec<u8>,
     cadence_readings: Vec<f32>,
-    speed_readings: Vec<f32>,
+    speed_history: Vec<(u64, f32)>,
 }
 
 impl MetricsCalculator {
@@ -31,7 +31,7 @@ impl MetricsCalculator {
             last_epoch_ms: None,
             hr_readings: Vec::new(),
             cadence_readings: Vec::new(),
-            speed_readings: Vec::new(),
+            speed_history: Vec::new(),
         }
     }
 
@@ -90,8 +90,8 @@ impl MetricsCalculator {
         self.cadence_readings.push(rpm);
     }
 
-    pub fn record_speed(&mut self, kmh: f32) {
-        self.speed_readings.push(kmh);
+    pub fn record_speed(&mut self, kmh: f32, epoch_ms: u64) {
+        self.speed_history.push((epoch_ms, kmh));
     }
 
     pub fn current_power(&self) -> Option<u16> {
@@ -160,7 +160,7 @@ impl MetricsCalculator {
     }
 
     pub fn current_speed(&self) -> Option<f32> {
-        self.speed_readings.last().copied()
+        self.speed_history.last().map(|(_, v)| *v)
     }
 
     pub fn max_power(&self) -> Option<u16> {
@@ -174,9 +174,21 @@ impl MetricsCalculator {
     }
 
     pub fn avg_speed(&self) -> Option<f32> {
-        let nonzero: Vec<f32> = self.speed_readings.iter().copied().filter(|&v| v > 0.0).collect();
+        let nonzero: Vec<f32> = self.speed_history.iter().map(|(_, v)| *v).filter(|&v| v > 0.0).collect();
         if nonzero.is_empty() { return None; }
         Some(nonzero.iter().sum::<f32>() / nonzero.len() as f32)
+    }
+
+    pub fn distance_km(&self) -> Option<f32> {
+        if self.speed_history.len() < 2 {
+            return None;
+        }
+        let mut total_km: f64 = 0.0;
+        for pair in self.speed_history.windows(2) {
+            let dt_hours = (pair[1].0 as f64 - pair[0].0 as f64) / 1000.0 / 3600.0;
+            total_km += pair[0].1 as f64 * dt_hours;
+        }
+        Some(total_km as f32)
     }
 
     pub fn work_kj(&self) -> Option<f32> {
@@ -554,9 +566,9 @@ mod tests {
     #[test]
     fn avg_speed_excludes_zeros() {
         let mut calc = MetricsCalculator::new(200);
-        calc.record_speed(30.0);
-        calc.record_speed(0.0);
-        calc.record_speed(30.0);
+        calc.record_speed(30.0, 1000);
+        calc.record_speed(0.0, 2000);
+        calc.record_speed(30.0, 3000);
         assert_approx(calc.avg_speed().unwrap(), 30.0, 0.1, "avg speed excluding zeros");
     }
 
@@ -617,5 +629,45 @@ mod tests {
         feed_constant_power(&mut calc, 300, 30, 30);
         let vi = calc.variability_index().unwrap();
         assert!(vi > 1.0, "VI ({vi}) should exceed 1.0 for variable power");
+    }
+
+    // --- Distance ---
+
+    #[test]
+    fn distance_constant_speed() {
+        let mut calc = MetricsCalculator::new(200);
+        // 30 km/h for 120 seconds = 30 * (120/3600) = 1.0 km
+        for i in 0..=120 {
+            calc.record_speed(30.0, i * 1000);
+        }
+        let km = calc.distance_km().unwrap();
+        assert_approx(km, 1.0, 0.01, "30 km/h for 120s");
+    }
+
+    #[test]
+    fn distance_empty_returns_none() {
+        let calc = MetricsCalculator::new(200);
+        assert!(calc.distance_km().is_none());
+    }
+
+    #[test]
+    fn distance_single_reading_returns_none() {
+        let mut calc = MetricsCalculator::new(200);
+        calc.record_speed(30.0, 1000);
+        assert!(calc.distance_km().is_none());
+    }
+
+    #[test]
+    fn distance_zero_speed_contributes_nothing() {
+        let mut calc = MetricsCalculator::new(200);
+        // 60s at 0 km/h then 60s at 30 km/h = 30 * (60/3600) = 0.5 km
+        for i in 0..=60 {
+            calc.record_speed(0.0, i * 1000);
+        }
+        for i in 61..=120 {
+            calc.record_speed(30.0, i * 1000);
+        }
+        let km = calc.distance_km().unwrap();
+        assert_approx(km, 0.5, 0.01, "zero speed then 30 km/h for 60s");
     }
 }
