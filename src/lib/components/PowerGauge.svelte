@@ -8,7 +8,7 @@
   } = $props();
 
   let chartEl: HTMLDivElement;
-  let chart: echarts.ECharts | null = null;
+  let chart = $state<echarts.ECharts | null>(null);
 
   const maxPower = () => Math.max(ftp * 1.5, 500);
 
