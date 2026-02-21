@@ -5,6 +5,7 @@
   import { api, extractError } from '$lib/tauri';
   import SessionTimeseries from '$lib/components/SessionTimeseries.svelte';
   import PowerCurve from '$lib/components/PowerCurve.svelte';
+  import PowerHistogram from '$lib/components/PowerHistogram.svelte';
   import ZoneDistribution from '$lib/components/ZoneDistribution.svelte';
   import ZoneRideAnalysis from '$lib/components/ZoneRideAnalysis.svelte';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
@@ -22,6 +23,7 @@
   let exportingFit = $state(false);
   let smoothing = $state(1);
   let zoneConfig = $state<ZoneRideConfig | null>(null);
+  let histBucket = $state(20);
 
   const TYPE_LABELS: Record<string, string> = {
     endurance: 'Endurance', intervals: 'Intervals', threshold: 'Threshold',
@@ -261,6 +263,29 @@
         {/if}
       </section>
     </div>
+
+    <!-- Power Histogram -->
+    {#if analysis && analysis.timeseries.some((p) => p.power != null)}
+      <section class="chart-section">
+        <div class="section-header">
+          <h2>Power Distribution</h2>
+          <div class="smoothing-toggle">
+            {#each [{ v: 10, l: '10W' }, { v: 20, l: '20W' }, { v: 50, l: '50W' }] as opt}
+              <button
+                class="smooth-btn"
+                class:active={histBucket === opt.v}
+                onclick={() => histBucket = opt.v}
+              >
+                {opt.l}
+              </button>
+            {/each}
+          </div>
+        </div>
+        <div class="panel-wrap">
+          <PowerHistogram timeseries={analysis.timeseries} bucketWidth={histBucket} ftp={session.ftp} />
+        </div>
+      </section>
+    {/if}
   {/if}
 </div>
 
