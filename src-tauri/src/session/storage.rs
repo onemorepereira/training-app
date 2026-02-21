@@ -167,7 +167,7 @@ impl Storage {
         // a file without a row is invisible (data loss on crash).
         let ftp = summary.ftp.map(|v| v as i32);
         sqlx::query(
-            "INSERT INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
+            "INSERT OR IGNORE INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
              normalized_power, tss, intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, \
              raw_file_path, title, activity_type, rpe, notes) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -751,6 +751,20 @@ mod tests {
         assert_eq!(sessions[0].avg_power, None);
         assert_eq!(sessions[0].avg_hr, None);
         assert_eq!(sessions[0].tss, None);
+    }
+
+    #[tokio::test]
+    async fn save_session_duplicate_id_is_ignored() {
+        let (storage, _tmp) = test_storage().await;
+        let summary = make_summary("dup-1");
+        storage.save_session(&summary, b"first").await.unwrap();
+
+        // Second save with same ID should succeed (INSERT OR IGNORE)
+        storage.save_session(&summary, b"second").await.unwrap();
+
+        // Only one row should exist
+        let sessions = storage.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
     }
 
     #[tokio::test]
