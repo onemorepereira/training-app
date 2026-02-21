@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import type { SessionSummary, SessionAnalysis, ZoneRideConfig } from '$lib/tauri';
+  import type { SessionSummary, SessionAnalysis, ZoneRideConfig, PowerCurvePoint } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
   import SessionTimeseries from '$lib/components/SessionTimeseries.svelte';
   import PowerCurve from '$lib/components/PowerCurve.svelte';
@@ -24,6 +24,8 @@
   let smoothing = $state(1);
   let zoneConfig = $state<ZoneRideConfig | null>(null);
   let histBucket = $state(20);
+  let overlayPeriod = $state<string>('all');
+  let bestCurve = $state<PowerCurvePoint[]>([]);
 
   const TYPE_LABELS: Record<string, string> = {
     endurance: 'Endurance', intervals: 'Intervals', threshold: 'Threshold',
@@ -87,7 +89,17 @@
       })
       .catch(() => { /* optional data, ignore errors */ });
 
+    // Backfill power curves (idempotent, skips already-done)
+    api.backfillPowerCurves().catch(() => { /* best-effort */ });
+
     return () => { cancelled = true; };
+  });
+
+  $effect(() => {
+    const period = overlayPeriod;
+    api.getBestPowerCurve(period)
+      .then((curve) => { bestCurve = curve; })
+      .catch(() => { bestCurve = []; });
   });
 
   async function exportFit() {
@@ -251,12 +263,31 @@
     <!-- Power Curve + Zone Distribution (two-column) -->
     <div class="two-col">
       <section class="chart-section">
-        <h2>Power Curve</h2>
+        <div class="section-header">
+          <h2>Power Curve</h2>
+          <div class="smoothing-toggle">
+            {#each [{ v: 'all', l: 'All' }, { v: '90d', l: '90d' }, { v: '30d', l: '30d' }] as opt}
+              <button
+                class="smooth-btn"
+                class:active={overlayPeriod === opt.v}
+                onclick={() => overlayPeriod = opt.v}
+              >
+                {opt.l}
+              </button>
+            {/each}
+          </div>
+        </div>
         <div class="panel-wrap">
           {#if analysisLoading}
             <div class="chart-skeleton">Loading chart...</div>
           {:else if analysis && analysis.power_curve.length > 0}
-            <PowerCurve powerCurve={analysis.power_curve} ftp={session.ftp} />
+            <PowerCurve
+              powerCurve={analysis.power_curve}
+              ftp={session.ftp}
+              overlays={bestCurve.length > 0
+                ? [{ label: `Best (${overlayPeriod === 'all' ? 'All time' : overlayPeriod})`, data: bestCurve, color: '#4a90d9' }]
+                : []}
+            />
           {:else}
             <div class="chart-empty">No power data</div>
           {/if}

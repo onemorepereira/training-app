@@ -255,6 +255,9 @@ export const api = {
   saveZoneRideConfig: (sessionId: string, zoneConfig: string) =>
     invoke<void>('save_zone_ride_config', { sessionId, zoneConfig }),
   getZoneRideConfig: (sessionId: string) => invoke<string | null>('get_zone_ride_config', { sessionId }),
+  getBestPowerCurve: (period: string) =>
+    invoke<PowerCurvePoint[]>('get_best_power_curve', { period }),
+  backfillPowerCurves: () => invoke<number>('backfill_power_curves'),
   checkPrerequisites: () => invoke<PrereqStatus>('check_prerequisites'),
   fixPrerequisites: () => invoke<FixResult>('fix_prerequisites'),
 };

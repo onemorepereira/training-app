@@ -94,6 +94,12 @@ pub fn compute_pwc(timeseries: &[TimeseriesPoint]) -> Option<PwcMarkers> {
     })
 }
 
+/// Compute power curve from raw sensor readings.
+/// Public wrapper for use by power curve storage and backfill.
+pub fn compute_power_curve_from_readings(readings: &[SensorReading]) -> Vec<PowerCurvePoint> {
+    compute_power_curve(readings)
+}
+
 /// Build a 1-second timeseries from raw sensor readings.
 /// Public wrapper for use by zone control history estimation.
 pub fn build_timeseries_from_readings(

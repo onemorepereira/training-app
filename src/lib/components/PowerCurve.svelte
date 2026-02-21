@@ -3,12 +3,19 @@
   import * as echarts from 'echarts';
   import type { PowerCurvePoint } from '$lib/tauri';
 
+  interface OverlaySeries {
+    label: string;
+    data: PowerCurvePoint[];
+    color: string;
+  }
+
   interface Props {
     powerCurve: PowerCurvePoint[];
     ftp?: number | null;
+    overlays?: OverlaySeries[];
   }
 
-  let { powerCurve, ftp = null }: Props = $props();
+  let { powerCurve, ftp = null, overlays = [] }: Props = $props();
 
   let chartEl: HTMLDivElement;
   let chart = $state<echarts.ECharts | null>(null);
@@ -34,13 +41,14 @@
         backgroundColor: '#1c1c30',
         borderColor: 'rgba(255,255,255,0.08)',
         textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
-        formatter(params: unknown) {
-          const p = Array.isArray(params) ? params[0] : params;
-          const item = p as { data: [number, number] };
-          if (!item?.data) return '';
-          const [secs, watts] = item.data;
-          return `${formatDuration(secs)}: <b>${watts}W</b>`;
-        },
+      },
+      legend: {
+        show: false,
+        top: 4,
+        right: 10,
+        textStyle: { color: '#70708a', fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' },
+        itemWidth: 16,
+        itemHeight: 2,
       },
       xAxis: {
         type: 'log',
@@ -69,23 +77,7 @@
         axisLine: { show: false },
         axisLabel: { color: '#70708a', fontSize: 10 },
       },
-      series: [
-        {
-          type: 'line',
-          smooth: true,
-          symbol: 'circle',
-          symbolSize: 6,
-          lineStyle: { color: '#ff4d6d', width: 2 },
-          itemStyle: { color: '#ff4d6d' },
-          areaStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(255, 77, 109, 0.25)' },
-              { offset: 1, color: 'rgba(255, 77, 109, 0)' },
-            ]),
-          },
-          data: [],
-        },
-      ],
+      series: [],
     };
   }
 
@@ -109,11 +101,21 @@
   $effect(() => {
     const curve = powerCurve;
     const ftpVal = ftp;
+    const ovls = overlays;
     if (!chart || curve.length === 0) return;
 
     const data = curve.map((p) => [p.duration_secs, p.watts]);
-    const maxWatts = Math.max(...curve.map((p) => p.watts), ftpVal ?? 0);
-    const maxDuration = Math.max(...curve.map((p) => p.duration_secs));
+    const allWatts = [...curve.map((p) => p.watts)];
+    const allDurations = [...curve.map((p) => p.duration_secs)];
+
+    for (const o of ovls) {
+      allWatts.push(...o.data.map((p) => p.watts));
+      allDurations.push(...o.data.map((p) => p.duration_secs));
+    }
+    if (ftpVal) allWatts.push(ftpVal);
+
+    const maxWatts = Math.max(...allWatts);
+    const maxDuration = Math.max(...allDurations);
 
     const markLine = ftpVal
       ? {
@@ -130,11 +132,67 @@
         }
       : undefined;
 
-    chart.setOption({
-      xAxis: { max: maxDuration },
-      yAxis: { max: Math.ceil(maxWatts / 50) * 50 + 50 },
-      series: [{ data, markLine }],
-    });
+    const series: echarts.SeriesOption[] = [
+      {
+        type: 'line',
+        name: 'Session',
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 6,
+        lineStyle: { color: '#ff4d6d', width: 2 },
+        itemStyle: { color: '#ff4d6d' },
+        areaStyle: {
+          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+            { offset: 0, color: 'rgba(255, 77, 109, 0.25)' },
+            { offset: 1, color: 'rgba(255, 77, 109, 0)' },
+          ]),
+        },
+        data,
+        markLine,
+      },
+    ];
+
+    for (const o of ovls) {
+      series.push({
+        type: 'line',
+        name: o.label,
+        smooth: true,
+        symbol: 'none',
+        lineStyle: { color: o.color, width: 1.5, type: 'dashed' },
+        itemStyle: { color: o.color },
+        data: o.data.map((p) => [p.duration_secs, p.watts]),
+      });
+    }
+
+    const hasOverlays = ovls.length > 0;
+
+    chart.setOption(
+      {
+        legend: { show: hasOverlays },
+        tooltip: {
+          formatter(params: unknown) {
+            const items = (Array.isArray(params) ? params : [params]) as {
+              seriesName: string;
+              data: [number, number];
+              color: string;
+            }[];
+            if (items.length === 0 || !items[0]?.data) return '';
+            const secs = items[0].data[0];
+            const lines: string[] = [`<b>${formatDuration(secs)}</b>`];
+            for (const item of items) {
+              if (!item?.data) continue;
+              const dot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${item.color};margin-right:6px"></span>`;
+              lines.push(`${dot}${item.seriesName}: <b>${item.data[1]}W</b>`);
+            }
+            return lines.join('<br>');
+          },
+        },
+        xAxis: { max: maxDuration },
+        yAxis: { max: Math.ceil(maxWatts / 50) * 50 + 50 },
+        series,
+      },
+      { replaceMerge: ['series'] },
+    );
   });
 </script>
 
