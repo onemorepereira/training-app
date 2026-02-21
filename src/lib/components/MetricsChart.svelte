@@ -5,6 +5,14 @@
   import { get } from 'svelte/store';
   import { unitSystem, kmhToMph, speedUnit } from '$lib/stores/units';
 
+  let {
+    zoneBand = null,
+    commandedPowerSeries = null,
+  }: {
+    zoneBand?: { lower: number; upper: number } | null;
+    commandedPowerSeries?: (number | null)[] | null;
+  } = $props();
+
   let chartEl: HTMLDivElement;
   let chart = $state<echarts.ECharts | null>(null);
 
@@ -140,6 +148,16 @@
           },
           data: [],
         },
+        {
+          name: 'Cmd Power',
+          type: 'line',
+          yAxisIndex: 0,
+          smooth: false,
+          symbol: 'none',
+          lineStyle: { color: '#ff9800', width: 2, type: 'dashed' },
+          itemStyle: { color: '#ff9800' },
+          data: [],
+        },
       ],
     };
   }
@@ -189,6 +207,21 @@
     const maxPower = Math.max(200, ...history.map((e) => e.power ?? 0), ...history.map((e) => e.hr ?? 0));
     const maxRight = Math.max(120, ...history.map((e) => e.cadence ?? 0), ...speedData.map((v) => v ?? 0));
 
+    const powerSeriesOpt: Record<string, unknown> = { data: history.map((e) => e.power) };
+    if (zoneBand) {
+      powerSeriesOpt.markArea = {
+        silent: true,
+        data: [[
+          { yAxis: zoneBand.lower, itemStyle: { color: 'rgba(76, 175, 80, 0.08)' } },
+          { yAxis: zoneBand.upper },
+        ]],
+      };
+    }
+
+    const cmdData = commandedPowerSeries && commandedPowerSeries.length > 0
+      ? commandedPowerSeries
+      : history.map(() => null);
+
     chart.setOption({
       xAxis: {
         data: labels,
@@ -201,10 +234,11 @@
         { max: Math.ceil(maxRight / 25) * 25 },
       ],
       series: [
-        { data: history.map((e) => e.power) },
+        powerSeriesOpt,
         { data: history.map((e) => e.hr) },
         { data: history.map((e) => e.cadence) },
         { data: speedData },
+        { data: cmdData },
       ],
     });
   });

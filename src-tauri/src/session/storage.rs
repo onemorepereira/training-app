@@ -7,7 +7,7 @@ use super::types::{SessionConfig, SessionSummary};
 use serde::Deserialize;
 
 use crate::commands::validate_session_id;
-use crate::device::types::{ConnectionStatus, DeviceInfo, DeviceType, SensorReading, Transport};
+use crate::device::types::{CommandSource, ConnectionStatus, DeviceInfo, DeviceType, SensorReading, Transport};
 use crate::error::AppError;
 
 /// Legacy sensor reading format: Power variant lacked pedal_balance field because
@@ -38,6 +38,11 @@ enum LegacySensorReading {
         #[serde(default)]
         device_id: String,
     },
+    TrainerCommand {
+        target_watts: u16,
+        epoch_ms: u64,
+        source: CommandSource,
+    },
 }
 
 impl From<LegacySensorReading> for SensorReading {
@@ -58,6 +63,9 @@ impl From<LegacySensorReading> for SensorReading {
             }
             LegacySensorReading::Speed { kmh, epoch_ms, device_id } => {
                 SensorReading::Speed { kmh, timestamp: None, epoch_ms, device_id }
+            }
+            LegacySensorReading::TrainerCommand { target_watts, epoch_ms, source } => {
+                SensorReading::TrainerCommand { target_watts, epoch_ms, source }
             }
         }
     }
@@ -544,6 +552,30 @@ impl Storage {
             .await
             .map_err(AppError::Database)?;
         Ok(())
+    }
+
+    pub async fn save_zone_config(
+        &self,
+        session_id: &str,
+        zone_config: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("UPDATE sessions SET zone_config = ? WHERE id = ?")
+            .bind(zone_config)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::Database)?;
+        Ok(())
+    }
+
+    pub async fn get_zone_config(&self, session_id: &str) -> Result<Option<String>, AppError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT zone_config FROM sessions WHERE id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(AppError::Database)?;
+        Ok(row.and_then(|(v,)| v))
     }
 
     pub async fn list_known_devices(&self) -> Result<Vec<DeviceInfo>, AppError> {

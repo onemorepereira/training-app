@@ -1,11 +1,12 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import type { SessionSummary, SessionAnalysis } from '$lib/tauri';
+  import type { SessionSummary, SessionAnalysis, ZoneRideConfig } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
   import SessionTimeseries from '$lib/components/SessionTimeseries.svelte';
   import PowerCurve from '$lib/components/PowerCurve.svelte';
   import ZoneDistribution from '$lib/components/ZoneDistribution.svelte';
+  import ZoneRideAnalysis from '$lib/components/ZoneRideAnalysis.svelte';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import MetricCard from '$lib/components/MetricCard.svelte';
   import { formatDuration, formatDateLong, formatTime, autoTitle } from '$lib/utils/format';
@@ -20,6 +21,7 @@
   let editSession = $state<SessionSummary | null>(null);
   let exportingFit = $state(false);
   let smoothing = $state(1);
+  let zoneConfig = $state<ZoneRideConfig | null>(null);
 
   const TYPE_LABELS: Record<string, string> = {
     endurance: 'Endurance', intervals: 'Intervals', threshold: 'Threshold',
@@ -74,6 +76,14 @@
       .then((a) => { if (!cancelled) analysis = a; })
       .catch((e) => { if (!cancelled) error = extractError(e); })
       .finally(() => { if (!cancelled) analysisLoading = false; });
+
+    // Load zone ride config (if any)
+    api.getZoneRideConfig(sessionId)
+      .then((json) => {
+        if (cancelled || !json) return;
+        try { zoneConfig = JSON.parse(json) as ZoneRideConfig; } catch { /* ignore malformed */ }
+      })
+      .catch(() => { /* optional data, ignore errors */ });
 
     return () => { cancelled = true; };
   });
@@ -210,6 +220,17 @@
         {/if}
       </div>
     </section>
+
+    <!-- Zone Ride Analysis (if applicable) -->
+    {#if zoneConfig && analysis && analysis.timeseries.length > 0}
+      <ZoneRideAnalysis
+        config={zoneConfig}
+        timeseries={analysis.timeseries.map((pt) => ({
+          power: pt.power ?? null,
+          heart_rate: pt.heart_rate ?? null,
+        }))}
+      />
+    {/if}
 
     <!-- Power Curve + Zone Distribution (two-column) -->
     <div class="two-col">

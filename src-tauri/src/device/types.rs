@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandSource {
+    ZoneControl,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Transport {
     Ble,
     AntPlus,
@@ -100,6 +106,11 @@ pub enum SensorReading {
         #[serde(default)]
         device_id: String,
     },
+    TrainerCommand {
+        target_watts: u16,
+        epoch_ms: u64,
+        source: CommandSource,
+    },
 }
 
 /// Detailed information about a connected device, including GATT services and characteristics.
@@ -156,6 +167,7 @@ impl SensorReading {
             SensorReading::HeartRate { epoch_ms, .. } => *epoch_ms,
             SensorReading::Cadence { epoch_ms, .. } => *epoch_ms,
             SensorReading::Speed { epoch_ms, .. } => *epoch_ms,
+            SensorReading::TrainerCommand { epoch_ms, .. } => *epoch_ms,
         }
     }
 
@@ -165,6 +177,7 @@ impl SensorReading {
             SensorReading::HeartRate { device_id, .. } => device_id,
             SensorReading::Cadence { device_id, .. } => device_id,
             SensorReading::Speed { device_id, .. } => device_id,
+            SensorReading::TrainerCommand { .. } => "",
         }
     }
 
@@ -174,6 +187,7 @@ impl SensorReading {
             SensorReading::HeartRate { .. } => DeviceType::HeartRate,
             SensorReading::Cadence { .. } => DeviceType::CadenceSpeed,
             SensorReading::Speed { .. } => DeviceType::CadenceSpeed,
+            SensorReading::TrainerCommand { .. } => DeviceType::FitnessTrainer,
         }
     }
 }

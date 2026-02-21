@@ -12,6 +12,9 @@ use crate::session::fit_export;
 use crate::session::manager::SessionManager;
 use crate::session::storage::Storage;
 use crate::session::types::{LiveMetrics, SessionConfig, SessionSummary};
+use crate::session::analysis::{compute_hr_power_regression, TimeseriesPoint};
+use crate::session::zone_control::controller::ZoneController;
+use crate::session::zone_control::types::{StopReason, ZoneControlStatus, ZoneMode, ZoneTarget};
 
 /// Validate that a session ID from the frontend is a safe UUID string.
 /// Prevents path traversal via crafted IDs like "../../etc/passwd".
@@ -66,6 +69,7 @@ pub struct AppState {
     pub storage: Arc<Storage>,
     pub sensor_tx: broadcast::Sender<SensorReading>,
     pub primary_devices: Arc<tokio::sync::Mutex<HashMap<DeviceType, String>>>,
+    pub zone_controller: Arc<tokio::sync::Mutex<ZoneController>>,
 }
 
 #[tauri::command]
@@ -330,6 +334,132 @@ pub async fn export_session_fit(
         .map_err(|e| AppError::Serialization(format!("Failed to write FIT file: {}", e)))?;
 
     Ok(fit_path.to_string_lossy().to_string())
+}
+
+/// Load recent sessions with both HR and power data, compute regression,
+/// and estimate the power needed to produce `target_hr`.
+async fn estimate_power_from_history(
+    storage: &Arc<Storage>,
+    target_hr: u8,
+) -> Result<Option<u16>, AppError> {
+    let sessions = storage.list_sessions().await?;
+    // Take last 5 sessions (most recent first from list_sessions)
+    let recent: Vec<_> = sessions.into_iter().take(5).collect();
+
+    if recent.is_empty() {
+        return Ok(None);
+    }
+
+    // Build combined timeseries from recent sessions
+    let storage_clone = storage.clone();
+    let combined = tokio::task::spawn_blocking(move || {
+        let mut all_points: Vec<TimeseriesPoint> = Vec::new();
+        for session in &recent {
+            if let Ok(readings) = storage_clone.load_sensor_data(&session.id) {
+                let ts = crate::session::analysis::build_timeseries_from_readings(&readings, session.duration_secs);
+                all_points.extend(ts);
+            }
+        }
+        all_points
+    })
+    .await
+    .map_err(|e| AppError::Session(format!("Failed to load history: {}", e)))?;
+
+    let model = match compute_hr_power_regression(&combined) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
+    // Estimate: power = (target_hr - intercept) / slope
+    if model.slope.abs() < 1e-6 {
+        return Ok(None);
+    }
+    let estimated = ((target_hr as f64 - model.intercept) / model.slope).round();
+    if estimated < 50.0 || estimated > 500.0 {
+        return Ok(None);
+    }
+
+    Ok(Some(estimated as u16))
+}
+
+#[tauri::command]
+pub async fn start_zone_control(
+    state: State<'_, AppState>,
+    target: ZoneTarget,
+) -> Result<(), AppError> {
+    let config = state.storage.get_user_config().await?;
+    let ftp = Some(config.ftp);
+    let max_hr = config.max_hr;
+
+    // For HR mode, try to estimate initial power from historical data
+    let initial_power_estimate = if target.mode == ZoneMode::HeartRate {
+        let target_hr = ((target.lower_bound + target.upper_bound) / 2) as u8;
+        estimate_power_from_history(&state.storage, target_hr).await.ok().flatten()
+    } else {
+        None
+    };
+
+    let dm = state.device_manager.clone();
+    let tx = state.sensor_tx.clone();
+    let mut zc = state.zone_controller.lock().await;
+    zc.start_with_config(target, dm, tx, ftp, max_hr, initial_power_estimate).await
+}
+
+#[tauri::command]
+pub async fn estimate_initial_power(
+    state: State<'_, AppState>,
+    target_hr: u8,
+) -> Result<Option<u16>, AppError> {
+    estimate_power_from_history(&state.storage, target_hr).await
+}
+
+#[tauri::command]
+pub async fn stop_zone_control(
+    state: State<'_, AppState>,
+) -> Result<Option<StopReason>, AppError> {
+    let mut zc = state.zone_controller.lock().await;
+    Ok(zc.stop().await)
+}
+
+#[tauri::command]
+pub async fn pause_zone_control(state: State<'_, AppState>) -> Result<(), AppError> {
+    let zc = state.zone_controller.lock().await;
+    zc.pause().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn resume_zone_control(state: State<'_, AppState>) -> Result<(), AppError> {
+    let zc = state.zone_controller.lock().await;
+    zc.resume().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_zone_control_status(
+    state: State<'_, AppState>,
+) -> Result<ZoneControlStatus, AppError> {
+    let zc = state.zone_controller.lock().await;
+    Ok(zc.status().await)
+}
+
+#[tauri::command]
+pub async fn save_zone_ride_config(
+    state: State<'_, AppState>,
+    session_id: String,
+    zone_config: String,
+) -> Result<(), AppError> {
+    validate_session_id(&session_id)?;
+    state.storage.save_zone_config(&session_id, &zone_config).await
+}
+
+#[tauri::command]
+pub async fn get_zone_ride_config(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<String>, AppError> {
+    validate_session_id(&session_id)?;
+    state.storage.get_zone_config(&session_id).await
 }
 
 #[tauri::command]

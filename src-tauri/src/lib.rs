@@ -12,6 +12,7 @@ use flexi_logger::{
 use log::Record;
 use session::manager::SessionManager;
 use session::storage::Storage;
+use session::zone_control::controller::ZoneController;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -269,12 +270,15 @@ pub fn run() {
                     });
                 }
 
+                let zone_controller = Arc::new(tokio::sync::Mutex::new(ZoneController::new()));
+
                 AppState {
                     device_manager,
                     session_manager,
                     storage,
                     sensor_tx,
                     primary_devices,
+                    zone_controller,
                 }
             });
 
@@ -325,6 +329,14 @@ pub fn run() {
             commands::set_primary_device,
             commands::get_primary_devices,
             commands::unlink_devices,
+            commands::start_zone_control,
+            commands::stop_zone_control,
+            commands::pause_zone_control,
+            commands::resume_zone_control,
+            commands::get_zone_control_status,
+            commands::estimate_initial_power,
+            commands::save_zone_ride_config,
+            commands::get_zone_ride_config,
             commands::check_prerequisites,
             commands::fix_prerequisites,
         ])

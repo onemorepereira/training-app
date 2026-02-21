@@ -158,6 +158,9 @@ impl SessionManager {
                 session.metrics.record_speed(*kmh);
                 session.last_speed = Some(now);
             }
+            SensorReading::TrainerCommand { .. } => {
+                // No metrics to record — logged to sensor_log below
+            }
         }
         session.sensor_log.push(reading);
     }

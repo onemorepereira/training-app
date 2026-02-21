@@ -57,6 +57,15 @@ pub fn compute_analysis(
     }
 }
 
+/// Build a 1-second timeseries from raw sensor readings.
+/// Public wrapper for use by zone control history estimation.
+pub fn build_timeseries_from_readings(
+    readings: &[SensorReading],
+    duration_secs: u64,
+) -> Vec<TimeseriesPoint> {
+    build_timeseries(readings, duration_secs)
+}
+
 fn build_timeseries(readings: &[SensorReading], duration_secs: u64) -> Vec<TimeseriesPoint> {
     if readings.is_empty() {
         return Vec::new();
@@ -94,6 +103,7 @@ fn build_timeseries(readings: &[SensorReading], duration_secs: u64) -> Vec<Times
             SensorReading::HeartRate { bpm, .. } => slot.heart_rate = Some(*bpm),
             SensorReading::Cadence { rpm, .. } => slot.cadence = Some(*rpm),
             SensorReading::Speed { kmh, .. } => slot.speed = Some(*kmh),
+            SensorReading::TrainerCommand { .. } => {}
         }
     }
 
@@ -281,6 +291,77 @@ fn compute_zone_distribution(
         .collect();
 
     (power_zone_dist, hr_zone_dist)
+}
+
+/// Linear regression model: HR = slope * power + intercept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HrPowerModel {
+    pub slope: f64,
+    pub intercept: f64,
+    pub r_squared: f64,
+    pub sample_count: usize,
+}
+
+/// Compute a simple linear regression of HR vs Power from timeseries data.
+///
+/// Returns `None` if fewer than 30 paired (HR, power) data points exist
+/// or if the fit quality r² < 0.3.
+pub fn compute_hr_power_regression(timeseries: &[TimeseriesPoint]) -> Option<HrPowerModel> {
+    let pairs: Vec<(f64, f64)> = timeseries
+        .iter()
+        .filter_map(|pt| {
+            let power = pt.power? as f64;
+            let hr = pt.heart_rate? as f64;
+            Some((power, hr))
+        })
+        .collect();
+
+    if pairs.len() < 30 {
+        return None;
+    }
+
+    let n = pairs.len() as f64;
+    let sum_x: f64 = pairs.iter().map(|(x, _)| x).sum();
+    let sum_y: f64 = pairs.iter().map(|(_, y)| y).sum();
+    let sum_xy: f64 = pairs.iter().map(|(x, y)| x * y).sum();
+    let sum_x2: f64 = pairs.iter().map(|(x, _)| x * x).sum();
+    let sum_y2: f64 = pairs.iter().map(|(_, y)| y * y).sum();
+
+    let denom = n * sum_x2 - sum_x * sum_x;
+    if denom.abs() < 1e-10 {
+        return None; // all power values identical
+    }
+
+    let slope = (n * sum_xy - sum_x * sum_y) / denom;
+    let intercept = (sum_y - slope * sum_x) / n;
+
+    // R² = 1 - SS_res / SS_tot
+    let mean_y = sum_y / n;
+    let ss_tot = sum_y2 - n * mean_y * mean_y;
+    let ss_res: f64 = pairs
+        .iter()
+        .map(|(x, y)| {
+            let predicted = slope * x + intercept;
+            (y - predicted).powi(2)
+        })
+        .sum();
+
+    let r_squared = if ss_tot.abs() < 1e-10 {
+        0.0
+    } else {
+        1.0 - ss_res / ss_tot
+    };
+
+    if r_squared < 0.3 {
+        return None;
+    }
+
+    Some(HrPowerModel {
+        slope,
+        intercept,
+        r_squared,
+        sample_count: pairs.len(),
+    })
 }
 
 #[cfg(test)]
@@ -621,5 +702,107 @@ mod tests {
         let z7 = analysis.power_zone_distribution.iter().find(|z| z.zone == 7);
         assert!(z7.is_some(), "should have zone 7 bucket");
         assert!(z7.unwrap().percentage > 0.0, "200W at FTP=100 should be zone 7");
+    }
+
+    // --- HR-Power regression tests ---
+
+    fn make_timeseries(pairs: &[(u16, u8)]) -> Vec<TimeseriesPoint> {
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, &(power, hr))| TimeseriesPoint {
+                elapsed_secs: i as f64,
+                power: Some(power),
+                heart_rate: Some(hr),
+                cadence: None,
+                speed: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn regression_perfect_linear_relationship() {
+        // HR = 60 + 0.4 * Power
+        // Generate 50 points from power 100..150
+        let ts: Vec<TimeseriesPoint> = (0..50)
+            .map(|i| {
+                let power = 100 + i * 1;
+                let hr = (60.0 + 0.4 * power as f64).round() as u8;
+                TimeseriesPoint {
+                    elapsed_secs: i as f64,
+                    power: Some(power as u16),
+                    heart_rate: Some(hr),
+                    cadence: None,
+                    speed: None,
+                }
+            })
+            .collect();
+
+        let model = compute_hr_power_regression(&ts).expect("should produce a model");
+        assert_approx(model.slope, 0.4, 0.01, "slope");
+        assert_approx(model.intercept, 60.0, 0.5, "intercept");
+        assert_approx(model.r_squared, 1.0, 0.01, "r_squared");
+        assert_eq!(model.sample_count, 50);
+    }
+
+    #[test]
+    fn regression_noisy_data_reflects_lower_r_squared() {
+        // HR ≈ 60 + 0.4 * Power with alternating ±5 bpm noise
+        let ts: Vec<TimeseriesPoint> = (0..50)
+            .map(|i| {
+                let power = 100 + i * 2;
+                let noise: f64 = if i % 2 == 0 { 5.0 } else { -5.0 };
+                let hr = (60.0 + 0.4 * power as f64 + noise).round().clamp(0.0, 255.0) as u8;
+                TimeseriesPoint {
+                    elapsed_secs: i as f64,
+                    power: Some(power as u16),
+                    heart_rate: Some(hr),
+                    cadence: None,
+                    speed: None,
+                }
+            })
+            .collect();
+
+        let model = compute_hr_power_regression(&ts).expect("should produce a model with noise");
+        // Slope should still be close to 0.4
+        assert_approx(model.slope, 0.4, 0.05, "noisy slope");
+        // r² should be less than 1 due to noise
+        assert!(model.r_squared < 1.0, "noisy data should have r² < 1.0");
+        assert!(model.r_squared > 0.3, "fit should still be acceptable");
+    }
+
+    #[test]
+    fn regression_too_few_points_returns_none() {
+        // Only 20 paired points — below the 30-point threshold
+        let ts = make_timeseries(
+            &(0..20).map(|i| (100 + i * 2, 120 + (i as u8))).collect::<Vec<_>>(),
+        );
+        assert!(compute_hr_power_regression(&ts).is_none());
+    }
+
+    #[test]
+    fn regression_missing_channels_excluded() {
+        // 40 points total, but only 20 have both power and HR
+        let mut ts: Vec<TimeseriesPoint> = Vec::new();
+        for i in 0..20 {
+            ts.push(TimeseriesPoint {
+                elapsed_secs: i as f64,
+                power: Some(100 + i as u16 * 2),
+                heart_rate: None, // no HR
+                cadence: None,
+                speed: None,
+            });
+        }
+        for i in 20..40 {
+            ts.push(TimeseriesPoint {
+                elapsed_secs: i as f64,
+                power: Some(100 + i as u16 * 2),
+                heart_rate: Some((60.0 + 0.4 * (100 + i * 2) as f64).round() as u8),
+                cadence: None,
+                speed: None,
+            });
+        }
+        // Only 20 paired points → None
+        assert!(compute_hr_power_regression(&ts).is_none());
     }
 }
