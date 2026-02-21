@@ -82,9 +82,28 @@
       },
       tooltip: {
         trigger: 'axis',
+        axisPointer: {
+          type: 'line',
+          lineStyle: { color: 'rgba(255,255,255,0.2)', type: 'dashed' },
+        },
         backgroundColor: '#1c1c30',
         borderColor: 'rgba(255,255,255,0.08)',
         textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
+        formatter(params: unknown) {
+          const items = params as { seriesName: string; value: number | null; color: string }[];
+          const lines: string[] = [];
+          for (const item of items) {
+            if (item.value == null) continue;
+            let unit = '';
+            if (item.seriesName === 'Power') unit = ' W';
+            else if (item.seriesName === 'HR') unit = ' bpm';
+            else if (item.seriesName === 'Cadence') unit = ' rpm';
+            else if (item.seriesName === 'Speed') unit = ` ${spdUnit}`;
+            const dot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${item.color};margin-right:6px"></span>`;
+            lines.push(`${dot}${item.seriesName} <b>${item.value}${unit}</b>`);
+          }
+          return lines.join('<br>');
+        },
       },
       dataZoom: [
         {
