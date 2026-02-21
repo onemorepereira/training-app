@@ -12,6 +12,8 @@ const AUTO_STOP_THRESHOLD_SECS = 3;
 let tickInterval: ReturnType<typeof setInterval> | null = null;
 let cadenceAboveZeroTicks = 0;
 let speedZeroTicks = 0;
+let starting = false;
+let stopping = false;
 
 function tick() {
   const enabled = get(autoSessionEnabled);
@@ -62,6 +64,8 @@ function tick() {
 }
 
 async function startSession() {
+  if (starting) return;
+  starting = true;
   try {
     const id = await api.startSession();
     sessionId.set(id);
@@ -69,10 +73,14 @@ async function startSession() {
     sessionPaused.set(false);
   } catch {
     // Ignore — user can still start manually
+  } finally {
+    starting = false;
   }
 }
 
 async function stopSession() {
+  if (stopping) return;
+  stopping = true;
   try {
     await api.stopSession();
     sessionActive.set(false);
@@ -80,6 +88,8 @@ async function stopSession() {
     sessionPaused.set(false);
   } catch {
     // Ignore — user can still stop manually
+  } finally {
+    stopping = false;
   }
 }
 
@@ -100,4 +110,6 @@ export function destroyAutoSession() {
     tickInterval = null;
   }
   resetCounters();
+  starting = false;
+  stopping = false;
 }
