@@ -35,6 +35,8 @@ struct ActiveSession {
     last_hr: Option<Instant>,
     last_cadence: Option<Instant>,
     last_speed: Option<Instant>,
+    /// Index up to which sensor_log has been snapshotted for autosave
+    autosave_cursor: usize,
 }
 
 impl SessionManager {
@@ -63,6 +65,7 @@ impl SessionManager {
             last_hr: None,
             last_cadence: None,
             last_speed: None,
+            autosave_cursor: 0,
         };
         *lock = Some(session);
         info!("Session started: {}", id);
@@ -189,10 +192,11 @@ impl SessionManager {
     }
 
     /// Snapshot the active session for autosave without stopping it.
-    /// Returns (session_id, summary, sensor_log) or None if no active session.
+    /// Returns (session_id, summary, new_readings_since_last_snapshot) or None
+    /// if no active session. Only clones the delta to minimize time under lock.
     pub async fn snapshot_for_autosave(&self) -> Option<(String, SessionSummary, Vec<SensorReading>)> {
-        let lock = self.current_session.lock().await;
-        let session = lock.as_ref()?;
+        let mut lock = self.current_session.lock().await;
+        let session = lock.as_mut()?;
         let active_secs = session.active_elapsed_ms / 1000;
         let summary = SessionSummary {
             id: session.id.clone(),
@@ -213,7 +217,9 @@ impl SessionManager {
             rpe: None,
             notes: None,
         };
-        Some((session.id.clone(), summary, session.sensor_log.clone()))
+        let delta = session.sensor_log[session.autosave_cursor..].to_vec();
+        session.autosave_cursor = session.sensor_log.len();
+        Some((session.id.clone(), summary, delta))
     }
 
     #[allow(dead_code)]
