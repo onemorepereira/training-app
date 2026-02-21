@@ -15,7 +15,7 @@ use crate::session::types::{LiveMetrics, SessionConfig, SessionSummary};
 
 /// Validate that a session ID from the frontend is a safe UUID string.
 /// Prevents path traversal via crafted IDs like "../../etc/passwd".
-fn validate_session_id(id: &str) -> Result<(), AppError> {
+pub(crate) fn validate_session_id(id: &str) -> Result<(), AppError> {
     if !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         Ok(())
     } else {
