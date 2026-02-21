@@ -732,6 +732,7 @@ mod tests {
             model_number: None,
             serial_number: None,
             device_group: None,
+            in_range: true,
         }
     }
 
@@ -1255,6 +1256,7 @@ impl From<KnownDeviceRow> for DeviceInfo {
             model_number: row.model_number,
             serial_number: row.serial_number,
             device_group: row.device_group,
+            in_range: true,
         }
     }
 }

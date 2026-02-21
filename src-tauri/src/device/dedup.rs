@@ -142,6 +142,7 @@ mod tests {
             model_number: None,
             serial_number: None,
             device_group: None,
+            in_range: true,
         }
     }
 
@@ -159,6 +160,7 @@ mod tests {
             model_number: None,
             serial_number: None,
             device_group: None,
+            in_range: true,
         }
     }
 

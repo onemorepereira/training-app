@@ -258,11 +258,13 @@
     <div class="empty-state">
       <div class="empty-icon">
         <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 20v-6"/>
-          <path d="M12 10c-3.3 0-6-2.7-6-6"/>
-          <path d="M12 10c3.3 0 6-2.7 6-6"/>
-          <path d="M12 10c-1.7 0-3-1.3-3-3"/>
-          <path d="M12 10c1.7 0 3-1.3 3-3"/>
+          <path d="M4.9 16.1C1 12.2 1 5.8 4.9 1.9"/>
+          <path d="M7.8 4.7a6.14 6.14 0 0 0-.8 7.5"/>
+          <circle cx="12" cy="9" r="2"/>
+          <path d="M16.2 4.8c2 2 2.26 5.11.8 7.47"/>
+          <path d="M19.1 1.9a9.96 9.96 0 0 1 0 14.1"/>
+          <path d="M9.5 18h5"/>
+          <path d="m8 22 4-11 4 11"/>
         </svg>
       </div>
       <p class="empty-text">No devices found</p>
@@ -310,7 +312,7 @@
         {#each group.devices as dd}
           {@const device = dd.primary}
           {@const allTransports = [device, ...dd.linked]}
-          <div class="device-card" class:connected={allTransports.some(d => d.status === 'Connected')}>
+          <div class="device-card" class:connected={allTransports.some(d => d.status === 'Connected')} class:out-of-range={!allTransports.some(d => d.status === 'Connected') && allTransports.every(d => d.in_range === false)}>
             <div class="device-info">
               <div class="device-header">
                 <span class="device-name">{device.name ?? 'Unknown Device'}</span>
@@ -358,6 +360,9 @@
                 {#if dd.linked.length > 0}
                   <span class="meta-item linked-badge">Linked</span>
                 {/if}
+                {#if !allTransports.some(d => d.status === 'Connected') && allTransports.every(d => d.in_range === false)}
+                  <span class="meta-item out-of-range-badge">Not in range</span>
+                {/if}
               </div>
             </div>
             {#if device.status === 'Connected' && (sensorPreview[`${device.device_type}:${device.id}`] || sensorPreview[device.device_type])}
@@ -396,7 +401,7 @@
                 <button
                   class="action-btn"
                   class:danger={td.status === 'Connected' && !disconnectingIds.has(td.id)}
-                  disabled={connectingIds.has(td.id) || disconnectingIds.has(td.id)}
+                  disabled={connectingIds.has(td.id) || disconnectingIds.has(td.id) || (td.status !== 'Connected' && td.in_range === false)}
                   onclick={() => toggleConnection(td)}
                 >
                   {#if connectingIds.has(td.id)}
@@ -681,6 +686,16 @@
     border-color: rgba(76, 175, 80, 0.15);
   }
 
+  .device-card.out-of-range {
+    opacity: 0.45;
+    filter: grayscale(0.5);
+  }
+
+  .device-card.out-of-range:hover {
+    border-color: var(--border-subtle);
+    background: var(--bg-surface);
+  }
+
   .connected-dot {
     display: inline-block;
     width: 8px;
@@ -726,6 +741,11 @@
 
   .linked-badge {
     color: var(--info);
+    font-weight: 600;
+  }
+
+  .out-of-range-badge {
+    color: var(--text-faint);
     font-weight: 600;
   }
 

@@ -266,6 +266,7 @@ impl AntManager {
                 model_number: None,
                 serial_number: None,
                 device_group: None,
+                in_range: true,
             })
             .collect();
 
@@ -334,6 +335,7 @@ impl AntManager {
             model_number: None,
             serial_number: None,
             device_group: None,
+            in_range: true,
         };
 
         self.connected.insert(
