@@ -26,7 +26,7 @@
               <div
                 class="bar-fill"
                 style:width="{Math.max(pct, 1)}%"
-                style:background={POWER_COLORS[i] ?? POWER_COLORS[POWER_COLORS.length - 1]}
+                style:background={POWER_COLORS[z.zone - 1] ?? POWER_COLORS[POWER_COLORS.length - 1]}
               ></div>
             </div>
             <span class="bar-value">{formatDuration(Math.round(z.duration_secs))}</span>
@@ -49,7 +49,7 @@
               <div
                 class="bar-fill"
                 style:width="{Math.max(pct, 1)}%"
-                style:background={HR_COLORS[i] ?? HR_COLORS[HR_COLORS.length - 1]}
+                style:background={HR_COLORS[z.zone - 1] ?? HR_COLORS[HR_COLORS.length - 1]}
               ></div>
             </div>
             <span class="bar-value">{formatDuration(Math.round(z.duration_secs))}</span>
