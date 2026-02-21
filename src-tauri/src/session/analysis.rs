@@ -9,6 +9,15 @@ pub struct SessionAnalysis {
     pub power_curve: Vec<PowerCurvePoint>,
     pub power_zone_distribution: Vec<ZoneBucket>,
     pub hr_zone_distribution: Vec<ZoneBucket>,
+    pub pwc: Option<PwcMarkers>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PwcMarkers {
+    pub pwc150: Option<u16>,
+    pub pwc170: Option<u16>,
+    pub r_squared: f64,
+    pub sample_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,12 +58,40 @@ pub fn compute_analysis(
     let ftp = session.ftp.unwrap_or(config.ftp);
     let (power_zone_distribution, hr_zone_distribution) =
         compute_zone_distribution(readings, ftp, &config.power_zones, &config.hr_zones);
+    let pwc = compute_pwc(&timeseries);
     SessionAnalysis {
         timeseries,
         power_curve,
         power_zone_distribution,
         hr_zone_distribution,
+        pwc,
     }
+}
+
+/// Compute Physical Working Capacity at HR 150 and 170 by inverting the
+/// HR-power regression line: power = (target_HR - intercept) / slope.
+pub fn compute_pwc(timeseries: &[TimeseriesPoint]) -> Option<PwcMarkers> {
+    let model = compute_hr_power_regression(timeseries)?;
+
+    if model.slope.abs() < 1e-10 {
+        return None;
+    }
+
+    let pwc_at = |target_hr: f64| -> Option<u16> {
+        let watts = (target_hr - model.intercept) / model.slope;
+        if watts >= 30.0 && watts <= 800.0 {
+            Some(watts.round() as u16)
+        } else {
+            None
+        }
+    };
+
+    Some(PwcMarkers {
+        pwc150: pwc_at(150.0),
+        pwc170: pwc_at(170.0),
+        r_squared: model.r_squared,
+        sample_count: model.sample_count,
+    })
 }
 
 /// Build a 1-second timeseries from raw sensor readings.
@@ -807,5 +844,63 @@ mod tests {
         }
         // Only 20 paired points → None
         assert!(compute_hr_power_regression(&ts).is_none());
+    }
+
+    // --- PWC tests ---
+
+    #[test]
+    fn pwc_from_linear_model() {
+        // HR = 60 + 0.4 * Power → PWC150 = (150-60)/0.4 = 225, PWC170 = (170-60)/0.4 = 275
+        let ts: Vec<TimeseriesPoint> = (0..50)
+            .map(|i| {
+                let power = 100 + i * 2;
+                let hr = (60.0 + 0.4 * power as f64).round() as u8;
+                TimeseriesPoint {
+                    elapsed_secs: i as f64,
+                    power: Some(power as u16),
+                    heart_rate: Some(hr),
+                    cadence: None,
+                    speed: None,
+                }
+            })
+            .collect();
+
+        let pwc = compute_pwc(&ts).expect("should produce PWC markers");
+        assert_eq!(pwc.pwc150, Some(225));
+        assert_eq!(pwc.pwc170, Some(275));
+        assert!(pwc.r_squared > 0.99);
+        assert_eq!(pwc.sample_count, 50);
+    }
+
+    #[test]
+    fn pwc_returns_none_without_sufficient_data() {
+        // Only 20 paired points — below 30-point threshold for regression
+        let ts = make_timeseries(
+            &(0..20).map(|i| (100 + i * 2, 120 + (i as u8))).collect::<Vec<_>>(),
+        );
+        assert!(compute_pwc(&ts).is_none());
+    }
+
+    #[test]
+    fn pwc_out_of_range_returns_none() {
+        // Near-zero slope: HR barely changes with power → absurd PWC values
+        let ts: Vec<TimeseriesPoint> = (0..50)
+            .map(|i| {
+                let power = 100 + i * 2;
+                // HR = 150 + 0.001 * power → essentially flat
+                // PWC150 = (150 - 150) / 0.001 = 0 → below 30W min
+                // PWC170 = (170 - 150) / 0.001 = 20000 → above 800W max
+                TimeseriesPoint {
+                    elapsed_secs: i as f64,
+                    power: Some(power as u16),
+                    heart_rate: Some(150),
+                    cadence: None,
+                    speed: None,
+                }
+            })
+            .collect();
+
+        // regression will return None due to low r² (all HR values identical → slope ~0, r² ~0)
+        assert!(compute_pwc(&ts).is_none());
     }
 }
