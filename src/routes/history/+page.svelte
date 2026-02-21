@@ -1,15 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import type { SessionSummary } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
-  import ActivityModal from '$lib/components/ActivityModal.svelte';
   import { formatDuration, formatDateLong as formatDate, formatDateShort, formatTime, autoTitle } from '$lib/utils/format';
 
   let sessions = $state<SessionSummary[]>([]);
   let loading = $state(true);
   let error = $state('');
   let exportingId = $state<string | null>(null);
-  let editSession = $state<SessionSummary | null>(null);
   let viewMode = $state<'cards' | 'table'>(
     (typeof localStorage !== 'undefined' && localStorage.getItem('historyView') as 'cards' | 'table') || 'cards'
   );
@@ -25,14 +24,6 @@
       loading = false;
     }
   });
-
-  async function refreshSessions() {
-    try {
-      sessions = await api.listSessions();
-    } catch (e) {
-      error = extractError(e);
-    }
-  }
 
   function setViewMode(mode: 'cards' | 'table') {
     viewMode = mode;
@@ -153,7 +144,7 @@
     <div class="sessions">
       {#each sortedSessions as session}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div class="card" onclick={() => editSession = session} onkeydown={(e) => e.key === 'Enter' && (editSession = session)} tabindex="0" role="button">
+        <div class="card" onclick={() => goto('/history/' + session.id)} onkeydown={(e) => e.key === 'Enter' && goto('/history/' + session.id)} tabindex="0" role="button">
           <div class="card-header">
             <div class="card-title-row">
               <span class="card-title">{displayTitle(session)}</span>
@@ -243,7 +234,7 @@
         <tbody>
           {#each sortedSessions as session}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <tr class="table-row" onclick={() => editSession = session} onkeydown={(e) => e.key === 'Enter' && (editSession = session)} tabindex="0">
+            <tr class="table-row" onclick={() => goto('/history/' + session.id)} onkeydown={(e) => e.key === 'Enter' && goto('/history/' + session.id)} tabindex="0">
               <td class="col-date">{formatDateShort(session.start_time)}</td>
               <td class="col-title">{displayTitle(session)}</td>
               <td>
@@ -273,32 +264,6 @@
     </div>
   {/if}
 </div>
-
-{#if editSession}
-  <ActivityModal
-    session={editSession}
-    mode="edit"
-    onSave={async (title, activityType, rpe, notes) => {
-      try {
-        await api.updateSessionMetadata(editSession!.id, title, activityType, rpe, notes);
-        await refreshSessions();
-      } catch (e) {
-        error = extractError(e);
-      }
-      editSession = null;
-    }}
-    onDelete={async () => {
-      try {
-        await api.deleteSession(editSession!.id);
-        await refreshSessions();
-      } catch (e) {
-        error = extractError(e);
-      }
-      editSession = null;
-    }}
-    onClose={() => { editSession = null; }}
-  />
-{/if}
 
 <style>
   .page {
