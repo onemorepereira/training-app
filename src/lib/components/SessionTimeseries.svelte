@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import * as echarts from 'echarts';
   import { kmhToMph } from '$lib/stores/units';
   import type { TimeseriesPoint } from '$lib/tauri';
@@ -201,8 +201,10 @@
   }
 
   onMount(() => {
-    let observer: ResizeObserver;
+    let observer: ResizeObserver | undefined;
+    let disposed = false;
     document.fonts.ready.then(() => {
+      if (disposed) return;
       chart = echarts.init(chartEl, undefined, { renderer: 'canvas' });
       chart.setOption(getBaseOption());
 
@@ -210,11 +212,12 @@
       observer.observe(chartEl);
     });
 
-    return () => observer?.disconnect();
-  });
-
-  onDestroy(() => {
-    chart?.dispose();
+    return () => {
+      disposed = true;
+      observer?.disconnect();
+      chart?.dispose();
+      chart = null;
+    };
   });
 
   $effect(() => {
