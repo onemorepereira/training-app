@@ -212,7 +212,7 @@ impl Storage {
         .fetch_all(&self.pool)
         .await
         .map_err(AppError::Database)?;
-        Ok(rows.into_iter().map(|r| r.into()).collect())
+        rows.into_iter().map(|r| r.try_into()).collect()
     }
 
     pub async fn get_user_config(&self) -> Result<SessionConfig, AppError> {
@@ -349,7 +349,7 @@ impl Storage {
         .fetch_one(&self.pool)
         .await
         .map_err(AppError::Database)?;
-        Ok(row.into())
+        row.try_into()
     }
 
     pub fn load_sensor_data(&self, session_id: &str) -> Result<Vec<SensorReading>, AppError> {
@@ -580,13 +580,21 @@ struct SessionRow {
     notes: Option<String>,
 }
 
-impl From<SessionRow> for SessionSummary {
-    fn from(row: SessionRow) -> Self {
-        Self {
+impl TryFrom<SessionRow> for SessionSummary {
+    type Error = AppError;
+
+    fn try_from(row: SessionRow) -> Result<Self, Self::Error> {
+        let start_time = chrono::DateTime::parse_from_rfc3339(&row.start_time)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                AppError::Session(format!(
+                    "Invalid start_time '{}' for session {}: {}",
+                    row.start_time, row.id, e
+                ))
+            })?;
+        Ok(Self {
             id: row.id,
-            start_time: chrono::DateTime::parse_from_rfc3339(&row.start_time)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
+            start_time,
             duration_secs: row.duration_secs as u64,
             ftp: row.ftp.map(|v| v as u16),
             avg_power: row.avg_power.map(|v| v as u16),
@@ -602,7 +610,7 @@ impl From<SessionRow> for SessionSummary {
             activity_type: row.activity_type,
             rpe: row.rpe.map(|v| v as u8),
             notes: row.notes,
-        }
+        })
     }
 }
 
@@ -699,6 +707,27 @@ mod tests {
     async fn init_creates_tables() {
         let (_storage, _tmp) = test_storage().await;
         // Success means migrations ran without error
+    }
+
+    #[tokio::test]
+    async fn bad_start_time_returns_error() {
+        let (storage, _tmp) = test_storage().await;
+        // Insert a row with an unparseable start_time directly via SQL
+        sqlx::query(
+            "INSERT INTO sessions (id, start_time, duration_secs) VALUES (?, ?, ?)",
+        )
+        .bind("bad-time-1")
+        .bind("not-a-date")
+        .bind(60)
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+
+        let result = storage.get_session("bad-time-1").await;
+        assert!(result.is_err(), "bad start_time should propagate as error");
+
+        let result = storage.list_sessions().await;
+        assert!(result.is_err(), "bad start_time in list should propagate as error");
     }
 
     #[tokio::test]
