@@ -72,6 +72,7 @@
     { href: '/', label: 'Ride', icon: 'ride' },
     { href: '/devices', label: 'Devices', icon: 'devices' },
     { href: '/history', label: 'History', icon: 'history' },
+    { href: '/analytics', label: 'Analytics', icon: 'analytics' },
     { href: '/settings', label: 'Settings', icon: 'settings' },
   ];
 </script>
@@ -114,6 +115,10 @@
                 <rect x="4" y="14" width="3" height="6" rx="1"/>
                 <rect x="10.5" y="8" width="3" height="12" rx="1"/>
                 <rect x="17" y="4" width="3" height="16" rx="1"/>
+              </svg>
+            {:else if item.icon === 'analytics'}
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
               </svg>
             {:else if item.icon === 'settings'}
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
