@@ -21,43 +21,6 @@ export async function refreshDevices() {
   }
 }
 
-export async function scanDevices(): Promise<DeviceInfo[]> {
-  const devices = await api.scanDevices();
-  connectedDevices.set(devices);
-  return devices;
-}
-
-export async function connectDevice(deviceId: string): Promise<DeviceInfo> {
-  const updated = await api.connectDevice(deviceId);
-  connectedDevices.update((devices) =>
-    devices.map((d) => (d.id === deviceId ? updated : d))
-  );
-  return updated;
-}
-
-export async function disconnectDevice(deviceId: string): Promise<void> {
-  await api.disconnectDevice(deviceId);
-  connectedDevices.update((devices) =>
-    devices.map((d) =>
-      d.id === deviceId ? { ...d, status: 'Disconnected' as const } : d
-    )
-  );
-}
-
-export async function unlinkDevices(
-  deviceId: string,
-  deviceGroup: string | null | undefined
-): Promise<void> {
-  await api.unlinkDevices(deviceId);
-  if (deviceGroup) {
-    connectedDevices.update((devices) =>
-      devices.map((d) =>
-        d.device_group === deviceGroup ? { ...d, device_group: null } : d
-      )
-    );
-  }
-}
-
 // --- Reconnection state ---
 
 export interface ReconnectingDevice {
