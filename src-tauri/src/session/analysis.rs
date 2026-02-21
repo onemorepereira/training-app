@@ -425,6 +425,8 @@ mod tests {
             max_hr: None,
             avg_cadence: None,
             avg_speed: None,
+            work_kj: None,
+            variability_index: None,
             title: None,
             activity_type: None,
             rpe: None,

@@ -179,6 +179,24 @@ impl MetricsCalculator {
         Some(nonzero.iter().sum::<f32>() / nonzero.len() as f32)
     }
 
+    pub fn work_kj(&self) -> Option<f32> {
+        if self.power_history.len() < 2 {
+            return None;
+        }
+        let mut total_joules: f64 = 0.0;
+        for pair in self.power_history.windows(2) {
+            let dt_secs = (pair[1].0 as f64 - pair[0].0 as f64) / 1000.0;
+            total_joules += pair[0].1 as f64 * dt_secs;
+        }
+        Some((total_joules / 1000.0) as f32)
+    }
+
+    pub fn variability_index(&self) -> Option<f32> {
+        let np = self.normalized_power()?;
+        let avg = self.avg_power(usize::MAX)?;
+        Some(np / avg)
+    }
+
     pub fn power_zone(&self, ftp: u16, zones: &[u16; 6]) -> Option<u8> {
         let watts = self.current_power()?;
         let pct = (watts as f32 / ftp.max(1) as f32) * 100.0;
@@ -549,5 +567,55 @@ mod tests {
         calc.record_cadence(0.0);
         calc.record_cadence(0.0);
         assert!(calc.avg_cadence().is_none());
+    }
+
+    // --- Work (kJ) ---
+
+    #[test]
+    fn work_kj_constant_power() {
+        let mut calc = MetricsCalculator::new(200);
+        // 60 seconds at 200W = 200 * 60 / 1000 = 12.0 kJ
+        feed_constant_power(&mut calc, 200, 61, 0); // 61 readings = 60 intervals
+        let kj = calc.work_kj().unwrap();
+        assert_approx(kj, 12.0, 0.1, "60s at 200W work");
+    }
+
+    #[test]
+    fn work_kj_empty_returns_none() {
+        let calc = MetricsCalculator::new(200);
+        assert!(calc.work_kj().is_none());
+    }
+
+    #[test]
+    fn work_kj_single_reading_returns_none() {
+        let mut calc = MetricsCalculator::new(200);
+        calc.record_power(200, 1000);
+        assert!(calc.work_kj().is_none());
+    }
+
+    // --- Variability Index ---
+
+    #[test]
+    fn variability_index_constant_power_equals_one() {
+        let mut calc = MetricsCalculator::new(200);
+        feed_constant_power(&mut calc, 200, 35, 0);
+        let vi = calc.variability_index().unwrap();
+        assert_approx(vi, 1.0, 0.01, "constant power VI");
+    }
+
+    #[test]
+    fn variability_index_returns_none_without_np() {
+        let calc = MetricsCalculator::new(200);
+        assert!(calc.variability_index().is_none());
+    }
+
+    #[test]
+    fn variability_index_variable_power_exceeds_one() {
+        let mut calc = MetricsCalculator::new(200);
+        // 30s at 100W then 30s at 300W — NP > avg → VI > 1.0
+        feed_constant_power(&mut calc, 100, 30, 0);
+        feed_constant_power(&mut calc, 300, 30, 30);
+        let vi = calc.variability_index().unwrap();
+        assert!(vi > 1.0, "VI ({vi}) should exceed 1.0 for variable power");
     }
 }

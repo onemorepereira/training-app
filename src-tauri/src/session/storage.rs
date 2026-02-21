@@ -149,6 +149,14 @@ impl Storage {
         for stmt in migration_006_stmts {
             run_alter_ignore_duplicate(&pool, stmt).await?;
         }
+        // Migration 008: work (kJ) and variability index
+        let migration_008_stmts = [
+            "ALTER TABLE sessions ADD COLUMN work_kj REAL",
+            "ALTER TABLE sessions ADD COLUMN variability_index REAL",
+        ];
+        for stmt in migration_008_stmts {
+            run_alter_ignore_duplicate(&pool, stmt).await?;
+        }
         Ok(Self {
             pool,
             data_dir: data_dir.to_string(),
@@ -177,8 +185,9 @@ impl Storage {
         sqlx::query(
             "INSERT OR IGNORE INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
              normalized_power, tss, intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, \
+             work_kj, variability_index, \
              raw_file_path, title, activity_type, rpe, notes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&summary.id)
         .bind(&start_time)
@@ -193,6 +202,8 @@ impl Storage {
         .bind(max_hr)
         .bind(summary.avg_cadence)
         .bind(summary.avg_speed)
+        .bind(summary.work_kj.map(|v| v as f64))
+        .bind(summary.variability_index.map(|v| v as f64))
         .bind(&raw_file_path)
         .bind(&summary.title)
         .bind(&summary.activity_type)
@@ -214,8 +225,8 @@ impl Storage {
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, AppError> {
         let rows = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
-             intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, title, activity_type, rpe, \
-             notes FROM sessions ORDER BY start_time DESC",
+             intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
+             title, activity_type, rpe, notes FROM sessions ORDER BY start_time DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -350,8 +361,8 @@ impl Storage {
     pub async fn get_session(&self, session_id: &str) -> Result<SessionSummary, AppError> {
         let row = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
-             intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, title, activity_type, rpe, \
-             notes FROM sessions WHERE id = ?",
+             intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
+             title, activity_type, rpe, notes FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_one(&self.pool)
@@ -606,6 +617,8 @@ struct SessionRow {
     max_hr: Option<i32>,
     avg_cadence: Option<f64>,
     avg_speed: Option<f64>,
+    work_kj: Option<f64>,
+    variability_index: Option<f64>,
     title: Option<String>,
     activity_type: Option<String>,
     rpe: Option<i32>,
@@ -638,6 +651,8 @@ impl TryFrom<SessionRow> for SessionSummary {
             max_hr: row.max_hr.map(|v| v as u8),
             avg_cadence: row.avg_cadence.map(|v| v as f32),
             avg_speed: row.avg_speed.map(|v| v as f32),
+            work_kj: row.work_kj.map(|v| v as f32),
+            variability_index: row.variability_index.map(|v| v as f32),
             title: row.title,
             activity_type: row.activity_type,
             rpe: row.rpe.map(|v| v as u8),
@@ -711,6 +726,8 @@ mod tests {
             max_hr: Some(170),
             avg_cadence: Some(90.0),
             avg_speed: Some(30.0),
+            work_kj: Some(648.0),
+            variability_index: Some(1.05),
             title: None,
             activity_type: None,
             rpe: None,
@@ -801,6 +818,8 @@ mod tests {
             max_hr: None,
             avg_cadence: None,
             avg_speed: None,
+            work_kj: None,
+            variability_index: None,
             title: None,
             activity_type: None,
             rpe: None,

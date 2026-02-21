@@ -57,6 +57,8 @@ export interface SessionSummary {
   max_hr: number | null;
   avg_cadence: number | null;
   avg_speed: number | null;
+  work_kj?: number | null;
+  variability_index?: number | null;
   title?: string;
   activity_type?: string;
   rpe?: number;
