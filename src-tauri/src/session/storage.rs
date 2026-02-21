@@ -1017,6 +1017,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_sensor_data_round_trip() {
+        let (storage, _tmp) = test_storage().await;
+
+        let readings = vec![
+            SensorReading::Power {
+                watts: 250,
+                timestamp: None,
+                epoch_ms: 1000,
+                device_id: "pm-1".to_string(),
+                pedal_balance: Some(52),
+            },
+            SensorReading::HeartRate {
+                bpm: 155,
+                timestamp: None,
+                epoch_ms: 1250,
+                device_id: "hr-1".to_string(),
+            },
+            SensorReading::Cadence {
+                rpm: 90.5,
+                timestamp: None,
+                epoch_ms: 1500,
+                device_id: "cad-1".to_string(),
+            },
+            SensorReading::Speed {
+                kmh: 32.1,
+                timestamp: None,
+                epoch_ms: 1750,
+                device_id: "spd-1".to_string(),
+            },
+            SensorReading::Power {
+                watts: 0,
+                timestamp: None,
+                epoch_ms: 2000,
+                device_id: "pm-1".to_string(),
+                pedal_balance: None,
+            },
+        ];
+
+        let raw = bincode::serialize(&readings).unwrap();
+        let summary = make_summary("rt-1");
+        storage.save_session(&summary, &raw).await.unwrap();
+
+        let loaded = storage.load_sensor_data("rt-1").unwrap();
+        assert_eq!(loaded.len(), 5);
+
+        // Verify Power with pedal_balance
+        match &loaded[0] {
+            SensorReading::Power { watts, epoch_ms, device_id, pedal_balance, .. } => {
+                assert_eq!(*watts, 250);
+                assert_eq!(*epoch_ms, 1000);
+                assert_eq!(device_id, "pm-1");
+                assert_eq!(*pedal_balance, Some(52));
+            }
+            other => panic!("expected Power, got {:?}", other),
+        }
+
+        // Verify HeartRate
+        match &loaded[1] {
+            SensorReading::HeartRate { bpm, epoch_ms, device_id, .. } => {
+                assert_eq!(*bpm, 155);
+                assert_eq!(*epoch_ms, 1250);
+                assert_eq!(device_id, "hr-1");
+            }
+            other => panic!("expected HeartRate, got {:?}", other),
+        }
+
+        // Verify Cadence
+        match &loaded[2] {
+            SensorReading::Cadence { rpm, epoch_ms, device_id, .. } => {
+                assert!((rpm - 90.5).abs() < 0.01);
+                assert_eq!(*epoch_ms, 1500);
+                assert_eq!(device_id, "cad-1");
+            }
+            other => panic!("expected Cadence, got {:?}", other),
+        }
+
+        // Verify Speed
+        match &loaded[3] {
+            SensorReading::Speed { kmh, epoch_ms, device_id, .. } => {
+                assert!((kmh - 32.1).abs() < 0.01);
+                assert_eq!(*epoch_ms, 1750);
+                assert_eq!(device_id, "spd-1");
+            }
+            other => panic!("expected Speed, got {:?}", other),
+        }
+
+        // Verify Power with pedal_balance=None
+        match &loaded[4] {
+            SensorReading::Power { watts, pedal_balance, .. } => {
+                assert_eq!(*watts, 0);
+                assert_eq!(*pedal_balance, None);
+            }
+            other => panic!("expected Power, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_sensor_data_empty_round_trip() {
+        let (storage, _tmp) = test_storage().await;
+        let readings: Vec<SensorReading> = vec![];
+        let raw = bincode::serialize(&readings).unwrap();
+        let summary = make_summary("rt-empty");
+        storage.save_session(&summary, &raw).await.unwrap();
+
+        let loaded = storage.load_sensor_data("rt-empty").unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
     async fn list_devices_ordered_by_last_seen() {
         let (storage, _tmp) = test_storage().await;
         let d1 = make_device("d1", Some("Oldest"), "2024-01-01T00:00:00Z");
