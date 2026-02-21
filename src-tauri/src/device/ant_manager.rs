@@ -376,7 +376,7 @@ impl AntManager {
 
     /// Get decoded common-page metadata for a connected ANT+ device
     pub fn get_metadata(&self, device_id: &str) -> Option<AntDeviceMetadata> {
-        let meta = self.device_metadata.lock().unwrap();
+        let meta = self.device_metadata.lock().unwrap_or_else(|e| e.into_inner());
         meta.get(device_id).cloned()
     }
 
