@@ -257,6 +257,16 @@ mod tests {
         }
     }
 
+    fn power_reading_at(watts: u16, epoch_ms: u64) -> SensorReading {
+        SensorReading::Power {
+            watts,
+            timestamp: None,
+            epoch_ms,
+            device_id: "test".to_string(),
+            pedal_balance: None,
+        }
+    }
+
     fn hr_reading(bpm: u8) -> SensorReading {
         SensorReading::HeartRate {
             bpm,
@@ -436,5 +446,80 @@ mod tests {
         assert_eq!(summary.avg_power, None);
         assert_eq!(summary.max_power, None);
         assert!(delta.is_empty());
+    }
+
+    // --- NP / TSS / IF through SessionManager ---
+
+    /// Feed 35 seconds of constant power with advancing epoch_ms timestamps.
+    async fn feed_constant_power(mgr: &SessionManager, watts: u16, seconds: u64, start_sec: u64) {
+        for s in 0..seconds {
+            mgr.process_reading(power_reading_at(watts, (start_sec + s) * 1000))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_summary_includes_np_tss_if() {
+        let mgr = SessionManager::new();
+        // FTP=200 in default config
+        mgr.start_session(default_config()).await.unwrap();
+
+        // 35 seconds of constant 200W — enough for NP buffer to fill
+        feed_constant_power(&mgr, 200, 35, 0).await;
+
+        let summary = mgr.stop_session().await.unwrap();
+
+        // NP of constant 200W = 200 (cast to u16 in summary)
+        assert_eq!(summary.normalized_power, Some(200));
+        // IF = NP / FTP = 200 / 200 = 1.0
+        let if_ = summary.intensity_factor.unwrap();
+        assert!((if_ - 1.0).abs() < 0.01, "IF should be ~1.0, got {if_}");
+        // TSS is Some (not None) — value is near 0 since wall-clock elapsed ≈ 0
+        assert!(summary.tss.is_some(), "TSS should be computed when NP is available");
+    }
+
+    #[tokio::test]
+    async fn live_metrics_include_np_tss_if() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+
+        feed_constant_power(&mgr, 200, 35, 0).await;
+
+        let live = mgr.get_live_metrics().await.unwrap();
+
+        let np = live.normalized_power.unwrap();
+        assert!((np - 200.0).abs() < 0.1, "live NP should be ~200.0, got {np}");
+        let if_ = live.intensity_factor.unwrap();
+        assert!((if_ - 1.0).abs() < 0.01, "live IF should be ~1.0, got {if_}");
+        assert!(live.tss.is_some(), "live TSS should be computed when NP is available");
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_np_tss_if() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+
+        feed_constant_power(&mgr, 200, 35, 0).await;
+
+        let (_, summary, _) = mgr.snapshot_for_autosave().await.unwrap();
+
+        assert_eq!(summary.normalized_power, Some(200));
+        let if_ = summary.intensity_factor.unwrap();
+        assert!((if_ - 1.0).abs() < 0.01, "snapshot IF should be ~1.0, got {if_}");
+        assert!(summary.tss.is_some());
+    }
+
+    #[tokio::test]
+    async fn np_none_with_insufficient_readings() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+
+        // Only 25 seconds — not enough for 30-entry NP buffer
+        feed_constant_power(&mgr, 200, 25, 0).await;
+
+        let summary = mgr.stop_session().await.unwrap();
+        assert!(summary.normalized_power.is_none(), "NP should be None with <31 seconds");
+        assert!(summary.intensity_factor.is_none());
+        assert!(summary.tss.is_none());
     }
 }
