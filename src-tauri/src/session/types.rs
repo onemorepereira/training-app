@@ -52,6 +52,8 @@ pub struct SessionSummary {
     pub max_hr: Option<u8>,
     pub avg_cadence: Option<f32>,
     pub avg_speed: Option<f32>,
+    pub work_kj: Option<f32>,
+    pub variability_index: Option<f32>,
     pub title: Option<String>,
     pub activity_type: Option<String>,
     pub rpe: Option<u8>,

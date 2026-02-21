@@ -220,6 +220,8 @@ mod tests {
             max_hr: Some(170),
             avg_cadence: Some(90.0),
             avg_speed: Some(30.0),
+            work_kj: None,
+            variability_index: None,
             title: None,
             activity_type: None,
             rpe: None,
