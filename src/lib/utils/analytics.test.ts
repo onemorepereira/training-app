@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest';
 import type { SessionSummary } from '$lib/tauri';
 import {
   computePmc,
+  computeRampRate,
   computeWeeklyTrends,
   extractFtpProgression,
   toDateKey,
   weekMonday,
 } from './analytics';
+import type { PmcDay } from './analytics';
 
 /** Helper to build a minimal SessionSummary for testing. */
 function session(
@@ -268,5 +270,52 @@ describe('extractFtpProgression', () => {
       { date: '2025-01-01', ftp: 200 },
       { date: '2025-06-01', ftp: 200 },
     ]);
+  });
+});
+
+describe('computeRampRate', () => {
+  function makePmcDays(ctlValues: number[]): PmcDay[] {
+    return ctlValues.map((ctl, i) => ({
+      date: `2025-01-${String(i + 1).padStart(2, '0')}`,
+      tss: 0,
+      ctl,
+      atl: 0,
+      tsb: 0,
+    }));
+  }
+
+  it('returns null with fewer than 8 PMC days', () => {
+    expect(computeRampRate(makePmcDays([10, 11, 12, 13, 14, 15, 16]))).toBeNull();
+  });
+
+  it('returns zero ramp for flat CTL', () => {
+    const result = computeRampRate(makePmcDays([30, 30, 30, 30, 30, 30, 30, 30]));
+    expect(result).not.toBeNull();
+    assertApprox(result!.current, 0, 0.01, 'flat CTL');
+    expect(result!.classification).toBe('maintenance');
+  });
+
+  it('classifies moderate build correctly', () => {
+    // CTL goes from 20 to 24 over 7 days → delta = 4.0
+    const result = computeRampRate(makePmcDays([20, 20.5, 21, 21.5, 22, 22.5, 23, 24]));
+    expect(result).not.toBeNull();
+    assertApprox(result!.current, 4.0, 0.01, 'moderate delta');
+    expect(result!.classification).toBe('moderate');
+  });
+
+  it('classifies excessive build correctly', () => {
+    // CTL goes from 20 to 30 over 7 days → delta = 10.0
+    const result = computeRampRate(makePmcDays([20, 21, 22, 23, 24, 25, 26, 30]));
+    expect(result).not.toBeNull();
+    assertApprox(result!.current, 10.0, 0.01, 'excessive delta');
+    expect(result!.classification).toBe('excessive');
+  });
+
+  it('classifies recovery correctly', () => {
+    // CTL goes from 40 to 35 over 7 days → delta = -5.0
+    const result = computeRampRate(makePmcDays([40, 39, 38, 37, 36, 36, 35, 35]));
+    expect(result).not.toBeNull();
+    assertApprox(result!.current, -5.0, 0.01, 'recovery delta');
+    expect(result!.classification).toBe('recovery');
   });
 });
