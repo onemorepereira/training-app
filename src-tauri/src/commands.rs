@@ -23,6 +23,43 @@ fn validate_session_id(id: &str) -> Result<(), AppError> {
     }
 }
 
+/// Set device as primary for its type if no primary exists yet.
+fn auto_set_primary(
+    primaries: &mut HashMap<DeviceType, String>,
+    device_type: DeviceType,
+    device_id: &str,
+) {
+    primaries
+        .entry(device_type)
+        .or_insert_with(|| device_id.to_owned());
+}
+
+/// Remove all primary entries that reference the given device.
+fn remove_primary(primaries: &mut HashMap<DeviceType, String>, device_id: &str) {
+    primaries.retain(|_, v| v != device_id);
+}
+
+/// Validate that zone boundaries are strictly ascending.
+fn validate_zones_ascending<T: PartialOrd>(zones: &[T], label: &str) -> Result<(), AppError> {
+    for w in zones.windows(2) {
+        if w[0] >= w[1] {
+            return Err(AppError::Session(format!(
+                "{} must be strictly ascending",
+                label
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Format primary devices map for the frontend (DeviceType debug keys → string keys).
+fn format_primaries(primaries: &HashMap<DeviceType, String>) -> HashMap<String, String> {
+    primaries
+        .iter()
+        .map(|(k, v)| (format!("{:?}", k), v.clone()))
+        .collect()
+}
+
 pub struct AppState {
     pub device_manager: Arc<tokio::sync::Mutex<DeviceManager>>,
     pub session_manager: Arc<SessionManager>,
@@ -49,7 +86,7 @@ pub async fn connect_device(
     // Auto-set as primary if no primary exists for this device type
     {
         let mut primaries = state.primary_devices.lock().await;
-        primaries.entry(info.device_type).or_insert_with(|| device_id.clone());
+        auto_set_primary(&mut primaries, info.device_type, &device_id);
     }
 
     Ok(info)
@@ -62,7 +99,7 @@ pub async fn disconnect_device(
 ) -> Result<(), AppError> {
     {
         let mut primaries = state.primary_devices.lock().await;
-        primaries.retain(|_, v| v != &device_id);
+        remove_primary(&mut primaries, &device_id);
     }
     let mut dm = state.device_manager.lock().await;
     dm.clear_reconnect_target(&device_id);
@@ -149,22 +186,8 @@ pub async fn save_user_config(
     state: State<'_, AppState>,
     config: SessionConfig,
 ) -> Result<(), AppError> {
-    // Validate HR zones are strictly ascending
-    for w in config.hr_zones.windows(2) {
-        if w[0] >= w[1] {
-            return Err(AppError::Session(
-                "HR zones must be strictly ascending".into(),
-            ));
-        }
-    }
-    // Validate power zones are strictly ascending
-    for w in config.power_zones.windows(2) {
-        if w[0] >= w[1] {
-            return Err(AppError::Session(
-                "Power zones must be strictly ascending".into(),
-            ));
-        }
-    }
+    validate_zones_ascending(&config.hr_zones, "HR zones")?;
+    validate_zones_ascending(&config.power_zones, "Power zones")?;
     state
         .storage
         .save_user_config(&config)
@@ -203,11 +226,7 @@ pub async fn get_primary_devices(
     state: State<'_, AppState>,
 ) -> Result<HashMap<String, String>, AppError> {
     let primaries = state.primary_devices.lock().await;
-    let result: HashMap<String, String> = primaries
-        .iter()
-        .map(|(k, v)| (format!("{:?}", k), v.clone()))
-        .collect();
-    Ok(result)
+    Ok(format_primaries(&primaries))
 }
 
 #[tauri::command]
@@ -350,6 +369,8 @@ pub async fn fix_prerequisites(
 mod tests {
     use super::*;
 
+    // --- validate_session_id ---
+
     #[test]
     fn valid_uuid_session_id() {
         assert!(validate_session_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
@@ -383,5 +404,115 @@ mod tests {
     #[test]
     fn rejects_null_bytes() {
         assert!(validate_session_id("abc\0def").is_err());
+    }
+
+    // --- auto_set_primary ---
+
+    #[test]
+    fn auto_set_primary_first_device_becomes_primary() {
+        let mut primaries = HashMap::new();
+        auto_set_primary(&mut primaries, DeviceType::Power, "dev-1");
+        assert_eq!(primaries[&DeviceType::Power], "dev-1");
+    }
+
+    #[test]
+    fn auto_set_primary_does_not_overwrite_existing() {
+        let mut primaries = HashMap::new();
+        auto_set_primary(&mut primaries, DeviceType::Power, "dev-1");
+        auto_set_primary(&mut primaries, DeviceType::Power, "dev-2");
+        assert_eq!(primaries[&DeviceType::Power], "dev-1");
+    }
+
+    #[test]
+    fn auto_set_primary_different_types_independent() {
+        let mut primaries = HashMap::new();
+        auto_set_primary(&mut primaries, DeviceType::Power, "pm-1");
+        auto_set_primary(&mut primaries, DeviceType::HeartRate, "hr-1");
+        assert_eq!(primaries[&DeviceType::Power], "pm-1");
+        assert_eq!(primaries[&DeviceType::HeartRate], "hr-1");
+    }
+
+    // --- remove_primary ---
+
+    #[test]
+    fn remove_primary_clears_matching_entry() {
+        let mut primaries = HashMap::from([
+            (DeviceType::Power, "dev-1".to_owned()),
+            (DeviceType::HeartRate, "hr-1".to_owned()),
+        ]);
+        remove_primary(&mut primaries, "dev-1");
+        assert!(!primaries.contains_key(&DeviceType::Power));
+        assert_eq!(primaries[&DeviceType::HeartRate], "hr-1");
+    }
+
+    #[test]
+    fn remove_primary_noop_for_unknown_device() {
+        let mut primaries = HashMap::from([(DeviceType::Power, "dev-1".to_owned())]);
+        remove_primary(&mut primaries, "nonexistent");
+        assert_eq!(primaries.len(), 1);
+    }
+
+    #[test]
+    fn remove_primary_clears_all_types_for_same_device() {
+        // Edge case: same device_id registered under two types
+        let mut primaries = HashMap::from([
+            (DeviceType::Power, "multi-dev".to_owned()),
+            (DeviceType::CadenceSpeed, "multi-dev".to_owned()),
+        ]);
+        remove_primary(&mut primaries, "multi-dev");
+        assert!(primaries.is_empty());
+    }
+
+    // --- validate_zones_ascending ---
+
+    #[test]
+    fn ascending_hr_zones_valid() {
+        assert!(validate_zones_ascending(&[100u8, 120, 140, 160, 180], "HR zones").is_ok());
+    }
+
+    #[test]
+    fn equal_adjacent_zones_rejected() {
+        assert!(validate_zones_ascending(&[100u8, 120, 120, 160, 180], "HR zones").is_err());
+    }
+
+    #[test]
+    fn descending_zones_rejected() {
+        assert!(validate_zones_ascending(&[100u16, 200, 150, 300, 400, 500], "Power zones").is_err());
+    }
+
+    #[test]
+    fn single_zone_boundary_valid() {
+        assert!(validate_zones_ascending(&[100u8], "HR zones").is_ok());
+    }
+
+    #[test]
+    fn two_equal_zones_rejected() {
+        assert!(validate_zones_ascending(&[150u16, 150], "Power zones").is_err());
+    }
+
+    #[test]
+    fn error_message_includes_label() {
+        let err = validate_zones_ascending(&[5u8, 3], "HR zones").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("HR zones"), "expected label in error: {msg}");
+    }
+
+    // --- format_primaries ---
+
+    #[test]
+    fn format_primaries_empty_map() {
+        let primaries = HashMap::new();
+        assert!(format_primaries(&primaries).is_empty());
+    }
+
+    #[test]
+    fn format_primaries_uses_debug_key_format() {
+        let primaries = HashMap::from([
+            (DeviceType::HeartRate, "hr-1".to_owned()),
+            (DeviceType::FitnessTrainer, "trainer-1".to_owned()),
+        ]);
+        let result = format_primaries(&primaries);
+        assert_eq!(result["HeartRate"], "hr-1");
+        assert_eq!(result["FitnessTrainer"], "trainer-1");
     }
 }
