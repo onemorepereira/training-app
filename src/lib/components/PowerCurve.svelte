@@ -11,7 +11,7 @@
   let { powerCurve, ftp = null }: Props = $props();
 
   let chartEl: HTMLDivElement;
-  let chart: echarts.ECharts | null = null;
+  let chart = $state<echarts.ECharts | null>(null);
 
   function formatDuration(secs: number): string {
     if (secs < 60) return `${secs}s`;

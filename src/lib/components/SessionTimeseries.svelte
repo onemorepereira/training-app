@@ -13,7 +13,7 @@
   let { timeseries, smoothing = 1, units = 'metric' }: Props = $props();
 
   let chartEl: HTMLDivElement;
-  let chart: echarts.ECharts | null = null;
+  let chart = $state<echarts.ECharts | null>(null);
 
   const COLORS = {
     power: '#ff4d6d',
