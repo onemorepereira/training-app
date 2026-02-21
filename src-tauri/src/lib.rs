@@ -242,16 +242,28 @@ pub fn run() {
                     let session_mgr = session_manager.clone();
                     let storage_clone = storage.clone();
                     tokio::spawn(async move {
+                        let mut accumulated_log: Vec<crate::device::types::SensorReading> = Vec::new();
+                        let mut current_session_id: Option<String> = None;
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                            if let Some((session_id, summary, sensor_log)) =
+                            if let Some((session_id, summary, delta)) =
                                 session_mgr.snapshot_for_autosave().await
                             {
+                                // Reset accumulator if session changed
+                                if current_session_id.as_deref() != Some(&session_id) {
+                                    accumulated_log.clear();
+                                    current_session_id = Some(session_id.clone());
+                                }
+                                accumulated_log.extend(delta);
                                 if let Err(e) =
-                                    storage_clone.write_autosave(&session_id, &summary, &sensor_log)
+                                    storage_clone.write_autosave(&session_id, &summary, &accumulated_log)
                                 {
                                     log::warn!("Autosave failed: {}", e);
                                 }
+                            } else {
+                                // No active session — reset accumulator
+                                accumulated_log.clear();
+                                current_session_id = None;
                             }
                         }
                     });
