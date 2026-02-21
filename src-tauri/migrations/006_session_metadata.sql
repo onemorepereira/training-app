@@ -1,0 +1,4 @@
+ALTER TABLE sessions ADD COLUMN title TEXT;
+ALTER TABLE sessions ADD COLUMN activity_type TEXT;
+ALTER TABLE sessions ADD COLUMN rpe INTEGER;
+ALTER TABLE sessions ADD COLUMN notes TEXT;

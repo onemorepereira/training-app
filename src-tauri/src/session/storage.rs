@@ -62,6 +62,16 @@ impl From<LegacySensorReading> for SensorReading {
     }
 }
 
+/// Execute an ALTER TABLE statement, ignoring "duplicate column" errors (expected
+/// on re-run) but propagating all other errors (disk full, corruption, malformed SQL).
+async fn run_alter_ignore_duplicate(pool: &SqlitePool, stmt: &str) -> Result<(), AppError> {
+    match sqlx::raw_sql(stmt).execute(pool).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(AppError::Database(e)),
+    }
+}
+
 pub struct Storage {
     pool: SqlitePool,
     data_dir: String,
@@ -85,7 +95,8 @@ impl Storage {
             .execute(&pool)
             .await
             .map_err(AppError::Database)?;
-        // Run each ALTER TABLE individually, ignoring "duplicate column" errors on re-run
+        // Run each ALTER TABLE individually, ignoring "duplicate column" errors on
+        // re-run but propagating real failures (disk full, corruption, etc.)
         let migration_002_stmts = [
             "ALTER TABLE user_config ADD COLUMN units TEXT NOT NULL DEFAULT 'metric'",
             "ALTER TABLE user_config ADD COLUMN power_zone_1 INTEGER NOT NULL DEFAULT 55",
@@ -96,7 +107,7 @@ impl Storage {
             "ALTER TABLE user_config ADD COLUMN power_zone_6 INTEGER NOT NULL DEFAULT 150",
         ];
         for stmt in migration_002_stmts {
-            let _ = sqlx::raw_sql(stmt).execute(&pool).await;
+            run_alter_ignore_duplicate(&pool, stmt).await?;
         }
         let migration_003_stmts = [
             "ALTER TABLE user_config ADD COLUMN date_of_birth TEXT",
@@ -105,12 +116,10 @@ impl Storage {
             "ALTER TABLE user_config ADD COLUMN max_hr INTEGER",
         ];
         for stmt in migration_003_stmts {
-            let _ = sqlx::raw_sql(stmt).execute(&pool).await;
+            run_alter_ignore_duplicate(&pool, stmt).await?;
         }
         // Migration 004: store FTP used in each session for audit trail
-        let _ = sqlx::raw_sql("ALTER TABLE sessions ADD COLUMN ftp INTEGER")
-            .execute(&pool)
-            .await;
+        run_alter_ignore_duplicate(&pool, "ALTER TABLE sessions ADD COLUMN ftp INTEGER").await?;
         // Migration 005: device metadata for cross-transport deduplication
         let migration_005_stmts = [
             "ALTER TABLE known_devices ADD COLUMN device_group TEXT",
@@ -119,7 +128,7 @@ impl Storage {
             "ALTER TABLE known_devices ADD COLUMN serial_number TEXT",
         ];
         for stmt in migration_005_stmts {
-            let _ = sqlx::raw_sql(stmt).execute(&pool).await;
+            run_alter_ignore_duplicate(&pool, stmt).await?;
         }
         // Migration 006: activity metadata on sessions
         let migration_006_stmts = [
@@ -129,7 +138,7 @@ impl Storage {
             "ALTER TABLE sessions ADD COLUMN notes TEXT",
         ];
         for stmt in migration_006_stmts {
-            let _ = sqlx::raw_sql(stmt).execute(&pool).await;
+            run_alter_ignore_duplicate(&pool, stmt).await?;
         }
         Ok(Self {
             pool,
