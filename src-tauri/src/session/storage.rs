@@ -6,6 +6,7 @@ use std::str::FromStr;
 use super::types::{SessionConfig, SessionSummary};
 use serde::Deserialize;
 
+use crate::commands::validate_session_id;
 use crate::device::types::{ConnectionStatus, DeviceInfo, DeviceType, SensorReading, Transport};
 use crate::error::AppError;
 
@@ -470,6 +471,12 @@ impl Storage {
 
             let sensor_bytes = &data[4 + json_len..];
 
+            if validate_session_id(&summary.id).is_err() {
+                warn!("Autosave {} has invalid session ID, skipping", name_str);
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+
             match self.save_session(&summary, sensor_bytes).await {
                 Ok(()) => {
                     info!("Recovered autosaved session {}", summary.id);
@@ -817,7 +824,8 @@ mod tests {
     #[tokio::test]
     async fn autosave_write_and_recover() {
         let (storage, _tmp) = test_storage().await;
-        let summary = make_summary("autosave-1");
+        let sid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let summary = make_summary(sid);
         let sensor_log: Vec<SensorReading> = vec![SensorReading::Power {
             watts: 200,
             timestamp: None,
@@ -827,13 +835,13 @@ mod tests {
         }];
 
         storage
-            .write_autosave("autosave-1", &summary, &sensor_log)
+            .write_autosave(sid, &summary, &sensor_log)
             .unwrap();
 
         // Verify autosave file exists
         let autosave_path = std::path::Path::new(storage.data_dir())
             .join("sessions")
-            .join(".autosave_autosave-1.bin");
+            .join(format!(".autosave_{}.bin", sid));
         assert!(autosave_path.exists());
 
         // Recover
@@ -843,10 +851,34 @@ mod tests {
         // Verify session is in DB
         let sessions = storage.list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "autosave-1");
+        assert_eq!(sessions[0].id, sid);
 
         // Verify autosave file is gone
         assert!(!autosave_path.exists());
+    }
+
+    #[tokio::test]
+    async fn autosave_recovery_rejects_path_traversal_id() {
+        let (storage, _tmp) = test_storage().await;
+        // Craft a valid autosave file on disk but with a malicious session ID in the JSON
+        let bad_id = "../../etc/passwd";
+        let summary = make_summary(bad_id);
+        let json_bytes = serde_json::to_vec(&summary).unwrap();
+        let json_len = (json_bytes.len() as u32).to_le_bytes();
+        let mut data = Vec::new();
+        data.extend_from_slice(&json_len);
+        data.extend_from_slice(&json_bytes);
+
+        let sessions_dir = std::path::Path::new(storage.data_dir()).join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(sessions_dir.join(".autosave_crafted.bin"), &data).unwrap();
+
+        let count = storage.recover_autosaved_sessions().await.unwrap();
+        assert_eq!(count, 0, "should reject autosave with path-traversal ID");
+
+        // Verify no session saved to DB
+        let sessions = storage.list_sessions().await.unwrap();
+        assert!(sessions.is_empty());
     }
 
     #[tokio::test]
