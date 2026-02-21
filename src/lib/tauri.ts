@@ -13,6 +13,7 @@ export interface DeviceInfo {
   model_number?: string | null;
   serial_number?: string | null;
   device_group?: string | null;
+  in_range?: boolean;
 }
 
 export interface SensorReading {

@@ -1,6 +1,6 @@
 use btleplug::api::Peripheral as _;
 use log::{info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -31,6 +31,9 @@ pub struct DeviceManager {
     ant: Option<AntManager>,
     /// True if AntManager was ever successfully initialized (for panic recovery)
     ant_was_available: bool,
+    /// True after a failed ANT+ USB probe; prevents repeated USB enumeration.
+    /// Reset on successful ANT+ init or on user-initiated scan.
+    ant_probe_failed: bool,
     trainer_backends: HashMap<String, TrainerBackend>,
     /// Tracks currently connected devices so rescanning doesn't lose them
     connected_devices: HashMap<String, DeviceInfo>,
@@ -49,6 +52,7 @@ impl DeviceManager {
             ble: None,
             ant: None,
             ant_was_available: false,
+            ant_probe_failed: false,
             trainer_backends: HashMap::new(),
             connected_devices: HashMap::new(),
             storage: None,
@@ -67,21 +71,31 @@ impl DeviceManager {
         if let Some(ref a) = ant {
             self.ant_metadata = Some(a.metadata_store());
             self.ant_was_available = true;
+            self.ant_probe_failed = false;
         }
         self.ant = ant;
     }
 
     /// Ensure ANT+ is available, re-initializing if it was lost due to a panic.
+    /// Skips USB enumeration if a previous probe already found no stick
+    /// (the flag is reset on user-initiated scan via `scan_all()`).
     async fn ensure_ant(&mut self) {
-        if self.ant.is_none() {
-            if self.ant_was_available {
-                warn!("ANT+ manager was lost (panic?), attempting re-initialization");
-            }
-            let ant = tokio::task::spawn_blocking(|| AntManager::try_new())
-                .await
-                .unwrap_or(None);
-            self.set_ant(ant);
+        if self.ant.is_some() {
+            return;
         }
+        if self.ant_probe_failed {
+            return;
+        }
+        if self.ant_was_available {
+            warn!("ANT+ manager was lost (panic?), attempting re-initialization");
+        }
+        let ant = tokio::task::spawn_blocking(|| AntManager::try_new())
+            .await
+            .unwrap_or(None);
+        if ant.is_none() {
+            self.ant_probe_failed = true;
+        }
+        self.set_ant(ant);
     }
 
     /// Return known devices from storage, overlaid with current connection state.
@@ -115,8 +129,10 @@ impl DeviceManager {
     /// Scan for devices on all available transports.
     /// Always includes currently-connected devices in the results.
     /// Loads known devices from storage as a base layer.
+    /// BLE and ANT+ scans run concurrently to minimize total scan time.
     pub async fn scan_all(&mut self) -> Result<Vec<DeviceInfo>, AppError> {
         let mut discovered: HashMap<String, DeviceInfo> = HashMap::new();
+        let mut scan_found: HashSet<String> = HashSet::new();
 
         // Load known devices from storage as base layer
         if let Some(ref storage) = self.storage {
@@ -135,21 +151,37 @@ impl DeviceManager {
             }
         }
 
-        // BLE scan
+        // Start BLE scan
         if let Some(ref ble) = self.ble {
             if let Err(e) = ble.start_scan().await {
                 log::warn!("[ble] Scan start failed: {}", e);
             }
         }
 
-        // Sleep during scan (releases lock for callers)
+        // Kick off ANT+ probe+scan concurrently while BLE scans.
+        // User-initiated scan always retries ANT+ (reset probe failure cache).
+        self.ant_probe_failed = false;
+        let ant_taken = self.ant.take();
+        let ant_task = tokio::task::spawn_blocking(move || {
+            let ant = ant_taken.or_else(AntManager::try_new);
+            if let Some(mut ant_mgr) = ant {
+                let result = ant_mgr.scan();
+                (Some(ant_mgr), result.ok())
+            } else {
+                (None, None)
+            }
+        });
+
+        // Sleep during BLE scan (ANT+ runs concurrently on blocking thread)
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
+        // Collect BLE results
         if let Some(ref ble) = self.ble {
             let _ = ble.stop_scan().await;
             match ble.get_discovered_devices().await {
                 Ok(devices) => {
                     for d in devices {
+                        scan_found.insert(d.id.clone());
                         discovered.insert(d.id.clone(), d);
                     }
                 }
@@ -157,41 +189,41 @@ impl DeviceManager {
             }
         }
 
-        // ANT+ scan (blocking -- runs in spawn_blocking)
-        self.ensure_ant().await;
-
-        if self.ant.is_some() {
-            // ANT scan is blocking; move the manager to a blocking thread and back
-            let mut ant_taken = self.ant.take().unwrap();
-            match tokio::task::spawn_blocking(move || {
-                let result = ant_taken.scan();
-                (ant_taken, result)
-            })
-            .await
-            {
-                Ok((ant_back, scan_result)) => {
-                    // ALWAYS put the AntManager back first
-                    self.set_ant(Some(ant_back));
-                    match scan_result {
-                        Ok(devices) => {
-                            for d in devices {
-                                discovered.insert(d.id.clone(), d);
-                            }
-                        }
-                        Err(e) => log::warn!("[ant+] Scan failed: {}", e),
+        // Collect ANT+ results (may already be done if it finished during BLE sleep)
+        match ant_task.await {
+            Ok((ant_back, ant_devices)) => {
+                if let Some(ant) = ant_back {
+                    self.set_ant(Some(ant));
+                } else {
+                    self.ant_probe_failed = true;
+                }
+                if let Some(devices) = ant_devices {
+                    for d in devices {
+                        scan_found.insert(d.id.clone());
+                        discovered.insert(d.id.clone(), d);
                     }
                 }
-                Err(e) => {
-                    // spawn_blocking panicked — AntManager is lost, will reinit next scan
-                    log::error!("[ant+] Scan task panicked: {}", e);
-                }
             }
+            Err(e) => {
+                // spawn_blocking panicked — AntManager is lost, will reinit next scan
+                log::error!("[ant+] Scan task panicked: {}", e);
+            }
+        }
+
+        // Connected devices are always considered in range
+        for id in self.connected_devices.keys() {
+            scan_found.insert(id.clone());
         }
 
         // Merge: connected devices always appear (with Connected status),
         // plus any newly discovered devices not already connected
         for (id, info) in &self.connected_devices {
             discovered.insert(id.clone(), info.clone());
+        }
+
+        // Mark in_range based on whether the device was found in this scan
+        for (id, info) in &mut discovered {
+            info.in_range = scan_found.contains(id);
         }
 
         // Annotate ANT+ devices with metadata from common data pages
