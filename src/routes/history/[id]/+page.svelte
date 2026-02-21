@@ -51,26 +51,31 @@
     const sessionId = $page.params.id;
     if (!sessionId) return;
 
+    let cancelled = false;
     loading = true;
     analysisLoading = true;
 
     // Load session summary (fast) and config for units
     Promise.all([api.getSession(sessionId), api.getUserConfig()])
       .then(([sess, cfg]) => {
+        if (cancelled) return;
         session = sess;
         units = cfg.units;
         loading = false;
       })
       .catch((e) => {
+        if (cancelled) return;
         error = extractError(e);
         loading = false;
       });
 
     // Load analysis (slower, file I/O + computation)
     api.getSessionAnalysis(sessionId)
-      .then((a) => { analysis = a; })
-      .catch((e) => { error = extractError(e); })
-      .finally(() => { analysisLoading = false; });
+      .then((a) => { if (!cancelled) analysis = a; })
+      .catch((e) => { if (!cancelled) error = extractError(e); })
+      .finally(() => { if (!cancelled) analysisLoading = false; });
+
+    return () => { cancelled = true; };
   });
 
   async function exportFit() {
