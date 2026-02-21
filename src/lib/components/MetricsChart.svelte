@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import * as echarts from 'echarts';
   import { metricHistory } from '$lib/stores/sensor';
   import { get } from 'svelte/store';
@@ -145,8 +145,10 @@
   }
 
   onMount(() => {
-    let observer: ResizeObserver;
+    let observer: ResizeObserver | undefined;
+    let disposed = false;
     document.fonts.ready.then(() => {
+      if (disposed) return;
       chart = echarts.init(chartEl, undefined, { renderer: 'canvas' });
       chart.setOption(getBaseOption());
 
@@ -154,11 +156,12 @@
       observer.observe(chartEl);
     });
 
-    return () => observer?.disconnect();
-  });
-
-  onDestroy(() => {
-    chart?.dispose();
+    return () => {
+      disposed = true;
+      observer?.disconnect();
+      chart?.dispose();
+      chart = null;
+    };
   });
 
   // Keep axis label in sync with unit system, even with no data
