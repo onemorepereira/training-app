@@ -325,7 +325,8 @@ pub async fn export_session_fit(
     let fit_path = std::path::Path::new(state.storage.data_dir())
         .join("sessions")
         .join(format!("{}.fit", session_id));
-    std::fs::write(&fit_path, &fit_data)
+    tokio::fs::write(&fit_path, &fit_data)
+        .await
         .map_err(|e| AppError::Serialization(format!("Failed to write FIT file: {}", e)))?;
 
     Ok(fit_path.to_string_lossy().to_string())
