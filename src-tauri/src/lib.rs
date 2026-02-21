@@ -256,7 +256,7 @@ pub fn run() {
                                 }
                                 accumulated_log.extend(delta);
                                 if let Err(e) =
-                                    storage_clone.write_autosave(&session_id, &summary, &accumulated_log)
+                                    storage_clone.write_autosave(&session_id, &summary, &accumulated_log).await
                                 {
                                     log::warn!("Autosave failed: {}", e);
                                 }
