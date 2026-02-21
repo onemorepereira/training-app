@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import type { SessionSummary } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
-  import { computePmc, computeWeeklyTrends, extractFtpProgression } from '$lib/utils/analytics';
+  import { computePmc, computeWeeklyTrends, extractFtpProgression, computeRampRate } from '$lib/utils/analytics';
   import MetricCard from '$lib/components/MetricCard.svelte';
   import PmcChart from '$lib/components/PmcChart.svelte';
   import TrendChart from '$lib/components/TrendChart.svelte';
@@ -34,6 +34,17 @@
     const latest = withFtp.sort((a, b) => b.start_time.localeCompare(a.start_time))[0];
     return latest.ftp;
   });
+  let rampRate = $derived(computeRampRate(pmcData));
+  let rampAccent = $derived.by(() => {
+    if (!rampRate) return '';
+    switch (rampRate.classification) {
+      case 'moderate': return '#4caf50';
+      case 'aggressive': return '#ff9800';
+      case 'excessive': return '#f44336';
+      default: return '#70708a';
+    }
+  });
+
   let thisWeekTss = $derived.by(() => {
     if (weeklyData.length === 0) return null;
     const lastBucket = weeklyData[weeklyData.length - 1];
@@ -69,6 +80,13 @@
       <MetricCard label="Form" value={currentTsb} unit="TSB" size="sm" accent="#4caf50" />
       <MetricCard label="FTP" value={currentFtp} unit="W" size="sm" />
       <MetricCard label="Week TSS" value={thisWeekTss} size="sm" />
+      <MetricCard
+        label="Ramp"
+        value={rampRate ? Math.round(rampRate.current * 10) / 10 : null}
+        unit="CTL/wk"
+        size="sm"
+        accent={rampAccent}
+      />
     </div>
 
     <section class="chart-section">
@@ -162,7 +180,7 @@
 
   .summary-cards {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
     gap: var(--space-md);
     margin-bottom: var(--space-xl);
   }
