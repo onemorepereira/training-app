@@ -12,9 +12,6 @@
 
   let { children } = $props();
   let navCollapsed = $state(false);
-  let unlistenDisconnect: (() => void) | null = null;
-  let unlistenReconnecting: (() => void) | null = null;
-  let unlistenReconnected: (() => void) | null = null;
   let onKeydown: ((e: KeyboardEvent) => void) | null = null;
   let onToggleFullscreen: (() => void) | null = null;
 
@@ -26,22 +23,31 @@
       unitSystem.set(cfg.units);
     }).catch(() => {});
 
-    // Global device connection event listeners
-    listen<string>('device_disconnected', (event) => {
-      handleDeviceDisconnected(event.payload);
-    }).then((fn) => { unlistenDisconnect = fn; });
+    // Global device connection event listeners — store promises so cleanup
+    // can unlisten even if the component unmounts before they resolve.
+    const listenPromises: Promise<() => void>[] = [];
 
-    listen<{ device_id: string; device_type: string; attempt: number }>(
-      'device_reconnecting',
-      (event) => {
-        handleDeviceReconnecting(event.payload);
-      }
-    ).then((fn) => { unlistenReconnecting = fn; });
+    listenPromises.push(
+      listen<string>('device_disconnected', (event) => {
+        handleDeviceDisconnected(event.payload);
+      })
+    );
 
-    listen<string>('device_reconnected', (event) => {
-      handleDeviceReconnected(event.payload);
-      refreshDevices();
-    }).then((fn) => { unlistenReconnected = fn; });
+    listenPromises.push(
+      listen<{ device_id: string; device_type: string; attempt: number }>(
+        'device_reconnecting',
+        (event) => {
+          handleDeviceReconnecting(event.payload);
+        }
+      )
+    );
+
+    listenPromises.push(
+      listen<string>('device_reconnected', (event) => {
+        handleDeviceReconnected(event.payload);
+        refreshDevices();
+      })
+    );
 
     onKeydown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -56,9 +62,7 @@
     return () => {
       stopSensorListening();
       destroyAutoSession();
-      unlistenDisconnect?.();
-      unlistenReconnecting?.();
-      unlistenReconnected?.();
+      listenPromises.forEach((p) => p.then((fn) => fn()));
       if (onKeydown) window.removeEventListener('keydown', onKeydown);
       if (onToggleFullscreen) window.removeEventListener('toggle-fullscreen', onToggleFullscreen);
     };
