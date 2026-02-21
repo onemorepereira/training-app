@@ -500,7 +500,7 @@ impl Storage {
         rpe: Option<u8>,
         notes: Option<String>,
     ) -> Result<(), AppError> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE sessions SET \
                title = COALESCE(?, title), \
                activity_type = COALESCE(?, activity_type), \
@@ -516,6 +516,9 @@ impl Storage {
         .execute(&self.pool)
         .await
         .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::Session(format!("Session not found: {}", session_id)));
+        }
         Ok(())
     }
 
@@ -1000,6 +1003,17 @@ mod tests {
 
         storage.delete_session("del-1").await.unwrap();
         assert!(storage.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_metadata_nonexistent_session_returns_error() {
+        let (storage, _tmp) = test_storage().await;
+        let result = storage
+            .update_session_metadata("no-such-id", Some("Title".into()), None, None, None)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Session not found"), "expected 'Session not found', got: {}", err);
     }
 
     #[tokio::test]
