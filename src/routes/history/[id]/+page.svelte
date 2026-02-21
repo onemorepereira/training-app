@@ -180,6 +180,10 @@
       <MetricCard label="Work" value={session.work_kj != null ? Math.round(session.work_kj) : null} unit="kJ" size="sm" />
       <MetricCard label="VI" value={session.variability_index != null ? session.variability_index.toFixed(2) : null} size="sm" />
       <MetricCard label="FTP" value={session.ftp} unit="W" size="sm" />
+      {#if analysis?.pwc}
+        <MetricCard label="PWC150" value={analysis.pwc.pwc150} unit="W" size="sm" />
+        <MetricCard label="PWC170" value={analysis.pwc.pwc170} unit="W" size="sm" />
+      {/if}
     </div>
 
     <!-- Actions -->
