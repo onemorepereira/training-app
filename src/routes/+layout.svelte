@@ -82,12 +82,10 @@
     <nav class="nav-rail">
       <div class="rail-logo">
         <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="5" cy="18" r="3"/>
-          <circle cx="19" cy="18" r="3"/>
-          <path d="M12 2l-3.5 7H15l-2 6"/>
-          <line x1="8" y1="18" x2="16" y2="18"/>
-          <line x1="12" y1="9" x2="19" y2="18"/>
-          <line x1="5" y1="18" x2="8.5" y2="9"/>
+          <circle cx="18.5" cy="17.5" r="3.5"/>
+          <circle cx="5.5" cy="17.5" r="3.5"/>
+          <circle cx="15" cy="5" r="1"/>
+          <path d="M12 17.5V14l-3-3 4-3 2 3h2"/>
         </svg>
       </div>
       <div class="rail-links">
@@ -100,15 +98,18 @@
           >
             {#if item.icon === 'ride'}
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="4 14 8 10 12 14 16 8 20 12"/>
+                <path d="m12 14 4-4"/>
+                <path d="M3.34 19a10 10 0 1 1 17.32 0"/>
               </svg>
             {:else if item.icon === 'devices'}
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 20v-6"/>
-                <path d="M12 10c-3.3 0-6-2.7-6-6"/>
-                <path d="M12 10c3.3 0 6-2.7 6-6"/>
-                <path d="M12 10c-1.7 0-3-1.3-3-3"/>
-                <path d="M12 10c1.7 0 3-1.3 3-3"/>
+                <path d="M4.9 16.1C1 12.2 1 5.8 4.9 1.9"/>
+                <path d="M7.8 4.7a6.14 6.14 0 0 0-.8 7.5"/>
+                <circle cx="12" cy="9" r="2"/>
+                <path d="M16.2 4.8c2 2 2.26 5.11.8 7.47"/>
+                <path d="M19.1 1.9a9.96 9.96 0 0 1 0 14.1"/>
+                <path d="M9.5 18h5"/>
+                <path d="m8 22 4-11 4 11"/>
               </svg>
             {:else if item.icon === 'history'}
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">

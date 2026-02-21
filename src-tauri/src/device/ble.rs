@@ -107,6 +107,7 @@ impl BleManager {
                 model_number: None,
                 serial_number: None,
                 device_group: None,
+                in_range: true,
             };
             discovered.insert(id, (peripheral, info.clone()));
             devices.push(info);
@@ -174,6 +175,7 @@ impl BleManager {
                 model_number: None,
                 serial_number: None,
                 device_group: None,
+                in_range: true,
             };
 
             // Cache in discovered for future use

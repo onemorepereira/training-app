@@ -67,6 +67,14 @@ pub struct DeviceInfo {
     pub serial_number: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_group: Option<String>,
+    /// Whether the device was found during the most recent scan.
+    /// Defaults to `true` (optimistic before any scan has run).
+    #[serde(default = "default_true")]
+    pub in_range: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
