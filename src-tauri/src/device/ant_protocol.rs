@@ -307,11 +307,60 @@ mod tests {
     #[test]
     fn test_decode_fec_trainer_page_0x19() {
         let decoder = AntDecoder::new();
-        // Page 0x19, event=5, cadence=90, accum_power=100, instant_power=250
-        let data: [u8; 8] = [0x19, 5, 90, 0, 100, 0, 250, 0x00];
-        // instant_power at bytes 5-6 masked to 12 bits: 250
+        // Page 0x19: event=5, cadence=90, accum_power_lo=100, accum_power_hi=0
+        // instant_power bytes [5..6] LE: 0x00FA = 250, masked to 12 bits = 250
+        let data: [u8; 8] = [0x19, 5, 90, 0, 100, 0xFA, 0x00, 0x00];
         let readings = decoder.decode_fec_trainer(&data, "test");
-        assert_eq!(readings.len(), 2); // cadence + power
+        assert_eq!(readings.len(), 2, "should produce cadence + power");
+
+        // First reading: cadence = data[2] = 90 RPM
+        match &readings[0] {
+            SensorReading::Cadence { rpm, .. } => {
+                assert!((rpm - 90.0).abs() < 0.01, "cadence should be 90 RPM, got {}", rpm);
+            }
+            other => panic!("expected Cadence, got {:?}", other),
+        }
+
+        // Second reading: instant_power = u16 LE [0xFA, 0x00] & 0x0FFF = 250W
+        match &readings[1] {
+            SensorReading::Power { watts, pedal_balance, .. } => {
+                assert_eq!(*watts, 250, "power should be 250W");
+                assert_eq!(*pedal_balance, None, "FE-C has no pedal balance");
+            }
+            other => panic!("expected Power, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_fec_trainer_page_0x19_cadence_0xff_omitted() {
+        let decoder = AntDecoder::new();
+        // cadence=0xFF means invalid/unavailable → should be omitted
+        let data: [u8; 8] = [0x19, 5, 0xFF, 0, 100, 0xC8, 0x00, 0x00];
+        let readings = decoder.decode_fec_trainer(&data, "test");
+        assert_eq!(readings.len(), 1, "0xFF cadence should be omitted");
+        match &readings[0] {
+            SensorReading::Power { watts, .. } => {
+                // 0x00C8 & 0x0FFF = 200W
+                assert_eq!(*watts, 200);
+            }
+            other => panic!("expected Power, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_fec_trainer_page_0x19_power_12bit_mask() {
+        let decoder = AntDecoder::new();
+        // Test that upper 4 bits of byte[6] are masked off
+        // bytes [5..6] LE: [0xFF, 0xFF] → 0xFFFF & 0x0FFF = 4095W
+        let data: [u8; 8] = [0x19, 5, 80, 0, 0, 0xFF, 0xFF, 0x00];
+        let readings = decoder.decode_fec_trainer(&data, "test");
+        assert_eq!(readings.len(), 2);
+        match &readings[1] {
+            SensorReading::Power { watts, .. } => {
+                assert_eq!(*watts, 4095, "12-bit mask should cap at 4095");
+            }
+            other => panic!("expected Power, got {:?}", other),
+        }
     }
 
     // ---- decode_cadence gap tests ----
