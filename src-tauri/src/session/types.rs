@@ -52,13 +52,9 @@ pub struct SessionSummary {
     pub max_hr: Option<u8>,
     pub avg_cadence: Option<f32>,
     pub avg_speed: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub rpe: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
 
