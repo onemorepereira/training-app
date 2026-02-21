@@ -9,7 +9,7 @@
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import MetricCard from '$lib/components/MetricCard.svelte';
   import { formatDuration, formatDateLong, formatTime, autoTitle } from '$lib/utils/format';
-  import { unitSystem, formatSpeed, speedUnit, kmhToMph } from '$lib/stores/units';
+  import { formatSpeed } from '$lib/stores/units';
 
   let session = $state<SessionSummary | null>(null);
   let analysis = $state<SessionAnalysis | null>(null);

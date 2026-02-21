@@ -2,10 +2,11 @@
   import { onMount, onDestroy } from 'svelte';
   import * as echarts from 'echarts';
   import { metricHistory } from '$lib/stores/sensor';
+  import { get } from 'svelte/store';
   import { unitSystem, kmhToMph, speedUnit } from '$lib/stores/units';
 
   let chartEl: HTMLDivElement;
-  let chart: echarts.ECharts | null = null;
+  let chart = $state<echarts.ECharts | null>(null);
 
   const COLORS = {
     power: '#ff4d6d',
@@ -65,7 +66,7 @@
         },
         {
           type: 'value',
-          name: `rpm / km/h`,
+          name: `rpm / ${get(unitSystem) === 'imperial' ? 'mph' : 'km/h'}`,
           nameTextStyle: { color: '#70708a', fontSize: 10 },
           min: 0,
           max: 150,
