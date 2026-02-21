@@ -74,7 +74,6 @@ pub enum SensorReading {
         device_id: String,
         /// Right pedal contribution %. Present when pedal differentiation is reported.
         /// ~50% = combined (L+R), ~100% = right pedal only.
-        #[serde(skip_serializing_if = "Option::is_none")]
         pedal_balance: Option<u8>,
     },
     HeartRate {

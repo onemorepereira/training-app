@@ -248,7 +248,7 @@
 
 <style>
   .page {
-    max-width: 960px;
+    max-width: 100%;
     padding-bottom: var(--space-3xl);
   }
 
@@ -443,12 +443,12 @@
 
   .timeseries-wrap {
     position: relative;
-    height: 300px;
+    height: 400px;
   }
 
   .panel-wrap {
     position: relative;
-    height: 260px;
+    height: 350px;
   }
 
   .chart-skeleton, .chart-empty {

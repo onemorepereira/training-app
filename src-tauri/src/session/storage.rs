@@ -4,8 +4,63 @@ use std::path::Path;
 use std::str::FromStr;
 
 use super::types::{SessionConfig, SessionSummary};
+use serde::Deserialize;
+
 use crate::device::types::{ConnectionStatus, DeviceInfo, DeviceType, SensorReading, Transport};
 use crate::error::AppError;
+
+/// Legacy sensor reading format: Power variant lacked pedal_balance field because
+/// #[serde(skip_serializing_if)] silently dropped it from bincode output.
+#[derive(Deserialize)]
+enum LegacySensorReading {
+    Power {
+        watts: u16,
+        epoch_ms: u64,
+        #[serde(default)]
+        device_id: String,
+    },
+    HeartRate {
+        bpm: u8,
+        epoch_ms: u64,
+        #[serde(default)]
+        device_id: String,
+    },
+    Cadence {
+        rpm: f32,
+        epoch_ms: u64,
+        #[serde(default)]
+        device_id: String,
+    },
+    Speed {
+        kmh: f32,
+        epoch_ms: u64,
+        #[serde(default)]
+        device_id: String,
+    },
+}
+
+impl From<LegacySensorReading> for SensorReading {
+    fn from(legacy: LegacySensorReading) -> Self {
+        match legacy {
+            LegacySensorReading::Power { watts, epoch_ms, device_id } => SensorReading::Power {
+                watts,
+                timestamp: None,
+                epoch_ms,
+                device_id,
+                pedal_balance: None,
+            },
+            LegacySensorReading::HeartRate { bpm, epoch_ms, device_id } => {
+                SensorReading::HeartRate { bpm, timestamp: None, epoch_ms, device_id }
+            }
+            LegacySensorReading::Cadence { rpm, epoch_ms, device_id } => {
+                SensorReading::Cadence { rpm, timestamp: None, epoch_ms, device_id }
+            }
+            LegacySensorReading::Speed { kmh, epoch_ms, device_id } => {
+                SensorReading::Speed { kmh, timestamp: None, epoch_ms, device_id }
+            }
+        }
+    }
+}
 
 pub struct Storage {
     pool: SqlitePool,
@@ -291,9 +346,21 @@ impl Storage {
             .join(format!("{}.bin", session_id));
         let data = std::fs::read(&raw_file)
             .map_err(|e| AppError::Serialization(format!("Failed to read sensor data: {}", e)))?;
-        let readings: Vec<SensorReading> = bincode::deserialize(&data)
-            .map_err(|e| AppError::Serialization(format!("Failed to deserialize sensor data: {}", e)))?;
-        Ok(readings)
+
+        // Try current format first; fall back to legacy format (before pedal_balance
+        // was added to Power). The old code used #[serde(skip_serializing_if)] on
+        // pedal_balance which is broken with bincode — it omitted the field during
+        // serialization but the deserializer always expected it.
+        bincode::deserialize::<Vec<SensorReading>>(&data).or_else(|_| {
+            let legacy: Vec<LegacySensorReading> = bincode::deserialize(&data)
+                .map_err(|e| {
+                    AppError::Serialization(format!(
+                        "Failed to deserialize sensor data: {}",
+                        e
+                    ))
+                })?;
+            Ok(legacy.into_iter().map(SensorReading::from).collect())
+        })
     }
 
     pub fn data_dir(&self) -> &str {
