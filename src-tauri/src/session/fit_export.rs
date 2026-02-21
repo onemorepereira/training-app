@@ -150,6 +150,7 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
                 rec.extend_from_slice(&last_speed.to_le_bytes());
                 w.write_data(1, &rec);
             }
+            SensorReading::TrainerCommand { .. } => {}
         }
     }
 

@@ -128,6 +128,49 @@ export interface SessionAnalysis {
   hr_zone_distribution: ZoneBucket[];
 }
 
+export type ZoneMode = 'Power' | 'HeartRate';
+
+export interface ZoneTarget {
+  mode: ZoneMode;
+  zone: number;
+  lower_bound: number;
+  upper_bound: number;
+  duration_secs: number | null;
+}
+
+export interface ZoneControlStatus {
+  active: boolean;
+  mode: ZoneMode | null;
+  target_zone: number | null;
+  lower_bound: number | null;
+  upper_bound: number | null;
+  commanded_power: number | null;
+  time_in_zone_secs: number;
+  elapsed_secs: number;
+  duration_secs: number | null;
+  paused: boolean;
+  phase: string;
+  safety_note: string | null;
+}
+
+export type StopReason =
+  | 'UserStopped'
+  | 'DurationComplete'
+  | 'SafetyStop'
+  | 'TrainerDisconnected'
+  | 'SensorLost';
+
+export interface ZoneRideConfig {
+  mode: ZoneMode;
+  zone: number;
+  lower_bound: number;
+  upper_bound: number;
+  duration_secs: number | null;
+  time_in_zone_secs: number;
+  commanded_power_series: number[];
+  time_to_zone_secs: number | null;
+}
+
 export interface PrereqStatus {
   udev_rules: boolean;
   bluez_installed: boolean;
@@ -191,6 +234,15 @@ export const api = {
       notes,
     }),
   deleteSession: (sessionId: string) => invoke<void>('delete_session', { sessionId }),
+  startZoneControl: (target: ZoneTarget) => invoke<void>('start_zone_control', { target }),
+  stopZoneControl: () => invoke<StopReason | null>('stop_zone_control'),
+  pauseZoneControl: () => invoke<void>('pause_zone_control'),
+  resumeZoneControl: () => invoke<void>('resume_zone_control'),
+  getZoneControlStatus: () => invoke<ZoneControlStatus>('get_zone_control_status'),
+  estimateInitialPower: (targetHr: number) => invoke<number | null>('estimate_initial_power', { targetHr }),
+  saveZoneRideConfig: (sessionId: string, zoneConfig: string) =>
+    invoke<void>('save_zone_ride_config', { sessionId, zoneConfig }),
+  getZoneRideConfig: (sessionId: string) => invoke<string | null>('get_zone_ride_config', { sessionId }),
   checkPrerequisites: () => invoke<PrereqStatus>('check_prerequisites'),
   fixPrerequisites: () => invoke<FixResult>('fix_prerequisites'),
 };

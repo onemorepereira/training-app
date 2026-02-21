@@ -3,6 +3,8 @@
   import MetricCard from '$lib/components/MetricCard.svelte';
   import MetricsChart from '$lib/components/MetricsChart.svelte';
   import TrainerControl from '$lib/components/TrainerControl.svelte';
+  import ZoneRideBuilder from '$lib/components/ZoneRideBuilder.svelte';
+  import ZoneRideStatus from '$lib/components/ZoneRideStatus.svelte';
   import ConnectionHealth from '$lib/components/ConnectionHealth.svelte';
   import { currentPower, currentHR, currentCadence, currentSpeed, liveMetrics } from '$lib/stores/sensor';
   import { sessionActive, sessionPaused, sessionId, dashboardView } from '$lib/stores/session';
@@ -10,21 +12,62 @@
   import { trainerConnected } from '$lib/stores/devices';
   import { unitSystem, formatSpeed, speedUnit } from '$lib/stores/units';
   import { trainerError } from '$lib/stores/trainer';
-  import { api, extractError, type SessionSummary } from '$lib/tauri';
+  import { get } from 'svelte/store';
+  import { zoneActive, zoneStatus, startZoneRide, stopZoneRide, pauseZoneRide, resumeZoneRide, stopZonePolling } from '$lib/stores/zoneRide';
+  import { api, extractError, type SessionSummary, type SessionConfig, type ZoneTarget, type ZoneRideConfig } from '$lib/tauri';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import { formatDuration } from '$lib/utils/format';
 
   let error = $state('');
   let postRideSession = $state<SessionSummary | null>(null);
+  let showZoneBuilder = $state(false);
+  let userConfig = $state<SessionConfig | null>(null);
+
+  let zoneBand = $derived.by(() => {
+    const s = $zoneStatus;
+    if (!s?.active || s.lower_bound == null || s.upper_bound == null) return null;
+    return { lower: s.lower_bound, upper: s.upper_bound };
+  });
+
+  // Load user config for zone builder
+  $effect(() => {
+    api.getUserConfig().then((c) => { userConfig = c; }).catch(() => {});
+  });
 
   async function toggleSession() {
     error = '';
     try {
       if ($sessionActive) {
+        // Snapshot zone status before stopping (stopZoneRide clears the store)
+        const zoneSnap = get(zoneStatus);
+        if ($zoneActive) {
+          try { await stopZoneRide(); } catch { /* best-effort */ }
+        }
+        const currentSessionId = $sessionId;
         const result = await api.stopSession();
         sessionActive.set(false);
         sessionId.set(null);
         sessionPaused.set(false);
+        showZoneBuilder = false;
+        stopZonePolling();
+
+        // Persist zone ride config if zone ride was active
+        if (zoneSnap?.active && currentSessionId) {
+          try {
+            const zoneConfig: ZoneRideConfig = {
+              mode: zoneSnap.mode!,
+              zone: zoneSnap.target_zone ?? 0,
+              lower_bound: zoneSnap.lower_bound ?? 0,
+              upper_bound: zoneSnap.upper_bound ?? 0,
+              duration_secs: zoneSnap.duration_secs ?? null,
+              time_in_zone_secs: zoneSnap.time_in_zone_secs,
+              commanded_power_series: zoneSnap.commanded_power != null ? [zoneSnap.commanded_power] : [],
+              time_to_zone_secs: null,
+            };
+            await api.saveZoneRideConfig(currentSessionId, JSON.stringify(zoneConfig));
+          } catch { /* best-effort, don't block session save */ }
+        }
+
         if (result) {
           postRideSession = result;
         }
@@ -44,11 +87,32 @@
     try {
       if ($sessionPaused) {
         await api.resumeSession();
+        if ($zoneActive) await resumeZoneRide();
         sessionPaused.set(false);
       } else {
         await api.pauseSession();
+        if ($zoneActive) await pauseZoneRide();
         sessionPaused.set(true);
       }
+    } catch (e) {
+      error = extractError(e);
+    }
+  }
+
+  async function handleStartZoneRide(target: ZoneTarget) {
+    error = '';
+    try {
+      await startZoneRide(target);
+      showZoneBuilder = false;
+    } catch (e) {
+      error = extractError(e);
+    }
+  }
+
+  async function handleStopZoneRide() {
+    error = '';
+    try {
+      await stopZoneRide();
     } catch (e) {
       error = extractError(e);
     }
@@ -101,7 +165,7 @@
       </div>
     {:else}
       <div class="chart-section">
-        <MetricsChart />
+        <MetricsChart {zoneBand} />
       </div>
     {/if}
   </div>
@@ -166,9 +230,23 @@
       </label>
       {#if $trainerConnected}
         <div class="controls-divider"></div>
-        <TrainerControl />
+        {#if $zoneActive}
+          <ZoneRideStatus onStop={handleStopZoneRide} />
+        {:else}
+          <TrainerControl />
+          <button class="btn-zone-toggle" onclick={() => { showZoneBuilder = !showZoneBuilder; }}>
+            {showZoneBuilder ? 'Hide' : 'Zone'}
+          </button>
+        {/if}
       {/if}
     </div>
+    {#if showZoneBuilder && !$zoneActive && $trainerConnected && userConfig}
+      <ZoneRideBuilder
+        config={userConfig}
+        trainerConnected={$trainerConnected}
+        onStart={handleStartZoneRide}
+      />
+    {/if}
   </div>
 
   {#if $trainerError}
@@ -438,6 +516,25 @@
     font-size: var(--text-sm);
     font-weight: 600;
     color: var(--text-secondary);
+  }
+
+  .btn-zone-toggle {
+    padding: var(--space-xs) var(--space-md);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-body);
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    letter-spacing: 0.04em;
+  }
+
+  .btn-zone-toggle:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-soft);
   }
 
   .trainer-error {

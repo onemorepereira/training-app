@@ -4,3 +4,4 @@ pub mod manager;
 pub mod metrics;
 pub mod storage;
 pub mod types;
+pub mod zone_control;
