@@ -244,10 +244,49 @@ mod tests {
     }
 
     #[test]
-    fn fit_crc_not_zero() {
-        let data = b"Hello FIT world";
+    fn fit_crc16_empty_is_zero() {
+        assert_eq!(fit_crc16(&[]), 0x0000);
+    }
+
+    #[test]
+    fn fit_crc16_check_value() {
+        // CRC-16/ARC standard check value: CRC of "123456789" = 0xBB3D
+        let crc = fit_crc16(b"123456789");
+        assert_eq!(crc, 0xBB3D);
+    }
+
+    #[test]
+    fn fit_crc16_self_check_yields_zero() {
+        // CRC-16/ARC property: CRC over (data || crc_le) == 0
+        let data = b"some payload";
         let crc = fit_crc16(data);
-        assert_ne!(crc, 0);
+        let mut extended = data.to_vec();
+        extended.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(fit_crc16(&extended), 0);
+    }
+
+    #[test]
+    fn fit_header_crc_matches_recomputed() {
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let stored_crc = u16::from_le_bytes([data[12], data[13]]);
+        let recomputed = fit_crc16(&data[0..12]);
+        assert_eq!(stored_crc, recomputed);
+    }
+
+    #[test]
+    fn fit_file_crc_matches_recomputed() {
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let len = data.len();
+        let stored_crc = u16::from_le_bytes([data[len - 2], data[len - 1]]);
+        let recomputed = fit_crc16(&data[..len - 2]);
+        assert_eq!(stored_crc, recomputed);
+    }
+
+    #[test]
+    fn fit_file_crc_self_check_yields_zero() {
+        // CRC over entire file including appended CRC should be 0
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        assert_eq!(fit_crc16(&data), 0);
     }
 
     #[test]
