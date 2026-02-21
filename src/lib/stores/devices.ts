@@ -87,6 +87,7 @@ export function handleDeviceReconnected(deviceId: string) {
     devices.map((d) => (d.id === deviceId ? { ...d, status: 'Connected' as const } : d))
   );
 
+  const ts = Date.now();
   reconnectingDevices.update((d) => ({
     ...d,
     [deviceId]: {
@@ -95,15 +96,18 @@ export function handleDeviceReconnected(deviceId: string) {
       device_type: d[deviceId]?.device_type ?? '',
       attempt: d[deviceId]?.attempt ?? 0,
       status: 'reconnected',
-      timestamp: Date.now(),
+      timestamp: ts,
     },
   }));
-  // Auto-clear after 3s
+  // Auto-clear after 3s, only if no newer reconnect has occurred
   setTimeout(() => {
     reconnectingDevices.update((d) => {
-      const next = { ...d };
-      delete next[deviceId];
-      return next;
+      if (d[deviceId]?.timestamp <= ts) {
+        const next = { ...d };
+        delete next[deviceId];
+        return next;
+      }
+      return d;
     });
   }, 3000);
 }
