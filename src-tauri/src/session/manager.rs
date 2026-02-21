@@ -352,4 +352,89 @@ mod tests {
         mgr.stop_session().await;
         assert!(!mgr.is_active().await);
     }
+
+    // --- snapshot_for_autosave ---
+
+    #[tokio::test]
+    async fn snapshot_no_session_returns_none() {
+        let mgr = SessionManager::new();
+        assert!(mgr.snapshot_for_autosave().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_session_id_and_summary() {
+        let mgr = SessionManager::new();
+        let id = mgr.start_session(default_config()).await.unwrap();
+
+        mgr.process_reading(power_reading(200)).await;
+        mgr.process_reading(power_reading(300)).await;
+
+        let (snap_id, summary, delta) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(snap_id, id);
+        assert_eq!(summary.avg_power, Some(250));
+        assert_eq!(summary.max_power, Some(300));
+        assert_eq!(delta.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_stop_session() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        mgr.process_reading(power_reading(200)).await;
+
+        // Snapshot should not stop the session
+        let _ = mgr.snapshot_for_autosave().await.unwrap();
+        assert!(mgr.is_active().await);
+
+        // Can still process readings after snapshot
+        mgr.process_reading(power_reading(400)).await;
+        let summary = mgr.stop_session().await.unwrap();
+        assert_eq!(summary.max_power, Some(400));
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_delta_only() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+
+        mgr.process_reading(power_reading(100)).await;
+        mgr.process_reading(power_reading(200)).await;
+
+        // First snapshot: all 2 readings
+        let (_, _, delta1) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(delta1.len(), 2);
+
+        // Add one more reading — second snapshot returns only the new one
+        mgr.process_reading(power_reading(300)).await;
+        let (_, _, delta2) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(delta2.len(), 1);
+
+        // No new readings — empty delta
+        let (_, _, delta3) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(delta3.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_while_paused_still_works() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+
+        mgr.process_reading(power_reading(200)).await;
+        mgr.pause_session().await;
+
+        let (_, summary, delta) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(summary.avg_power, Some(200));
+        assert_eq!(delta.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_no_readings() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+
+        let (_, summary, delta) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(summary.avg_power, None);
+        assert_eq!(summary.max_power, None);
+        assert!(delta.is_empty());
+    }
 }
