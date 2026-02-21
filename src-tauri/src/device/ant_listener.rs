@@ -92,7 +92,7 @@ pub fn listen_ant_channel(
         // Update last-data timestamp for connection watchdog (every page, not just common)
         let page_num = data[0];
         {
-            let mut store = metadata_store.lock().unwrap();
+            let mut store = metadata_store.lock().unwrap_or_else(|e| e.into_inner());
             let meta = store.entry(device_id.clone()).or_default();
             meta.last_data_received = Some(std::time::Instant::now());
 

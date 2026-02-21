@@ -436,7 +436,7 @@ impl DeviceManager {
 
         // Check ANT+ staleness via last_data_received timestamps
         if let Some(ref meta_store) = self.ant_metadata {
-            let meta = meta_store.lock().unwrap();
+            let meta = meta_store.lock().unwrap_or_else(|e| e.into_inner());
             let ant_ids: Vec<String> = self
                 .connected_devices
                 .keys()
@@ -651,7 +651,7 @@ impl DeviceManager {
     /// Annotate ANT+ devices with metadata from common data pages.
     fn annotate_ant_metadata(&self, devices: &mut HashMap<String, DeviceInfo>) {
         if let Some(ref meta_store) = self.ant_metadata {
-            let meta = meta_store.lock().unwrap();
+            let meta = meta_store.lock().unwrap_or_else(|e| e.into_inner());
             for (id, info) in devices.iter_mut() {
                 if id.starts_with("ant:") {
                     if let Some(m) = meta.get(id) {
