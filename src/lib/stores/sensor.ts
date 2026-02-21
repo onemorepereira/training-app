@@ -64,6 +64,7 @@ export async function startSensorListening() {
 }
 
 export function stopSensorListening() {
+  initializing = false;
   if (unlistenFn) {
     unlistenFn();
     unlistenFn = null;
