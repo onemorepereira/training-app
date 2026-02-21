@@ -136,6 +136,28 @@ export function computeWeeklyTrends(sessions: SessionSummary[]): WeekBucket[] {
     }));
 }
 
+export interface RampRate {
+  current: number; // CTL delta over 7 days
+  classification:
+    | 'recovery'
+    | 'maintenance'
+    | 'moderate'
+    | 'aggressive'
+    | 'excessive';
+}
+
+export function computeRampRate(pmcData: PmcDay[]): RampRate | null {
+  if (pmcData.length < 8) return null;
+  const current = pmcData[pmcData.length - 1].ctl - pmcData[pmcData.length - 8].ctl;
+  let classification: RampRate['classification'];
+  if (current < -2) classification = 'recovery';
+  else if (current < 2) classification = 'maintenance';
+  else if (current < 5) classification = 'moderate';
+  else if (current < 8) classification = 'aggressive';
+  else classification = 'excessive';
+  return { current, classification };
+}
+
 /** Extract FTP change points: emit when FTP value changes from previous. Always emit first and last. */
 export function extractFtpProgression(sessions: SessionSummary[]): FtpPoint[] {
   const sorted = [...sessions]
