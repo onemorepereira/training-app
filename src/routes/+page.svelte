@@ -198,7 +198,8 @@
   <ConnectionHealth />
 
   <div class="dash-controls">
-    <div class="controls-bar">
+    <!-- Session controls -->
+    <div class="session-row">
       <div class="session-btn-wrap">
         {#if $autoSessionCountdown != null && !$sessionActive}
           <span class="countdown-badge">Starting in {$autoSessionCountdown}...</span>
@@ -228,24 +229,34 @@
         <input type="checkbox" bind:checked={$autoSessionEnabled} />
         <span class="auto-toggle-label">Auto</span>
       </label>
-      {#if $trainerConnected}
-        <div class="controls-divider"></div>
-        {#if $zoneActive}
-          <ZoneRideStatus onStop={handleStopZoneRide} />
-        {:else}
+    </div>
+
+    <!-- Trainer controls -->
+    {#if $trainerConnected}
+      {#if $zoneActive}
+        <ZoneRideStatus onStop={handleStopZoneRide} />
+      {:else}
+        <div class="trainer-row">
           <TrainerControl />
-          <button class="btn-zone-toggle" onclick={() => { showZoneBuilder = !showZoneBuilder; }}>
-            {showZoneBuilder ? 'Hide' : 'Zone'}
+          <button
+            class="btn-zone-toggle"
+            class:active={showZoneBuilder}
+            onclick={() => { showZoneBuilder = !showZoneBuilder; }}
+            aria-label="Toggle zone ride panel"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            Zone
           </button>
+        </div>
+        {#if showZoneBuilder && userConfig}
+          <ZoneRideBuilder
+            config={userConfig}
+            trainerConnected={$trainerConnected}
+            onStart={handleStartZoneRide}
+            onClose={() => { showZoneBuilder = false; }}
+          />
         {/if}
       {/if}
-    </div>
-    {#if showZoneBuilder && !$zoneActive && $trainerConnected && userConfig}
-      <ZoneRideBuilder
-        config={userConfig}
-        trainerConnected={$trainerConnected}
-        onStart={handleStartZoneRide}
-      />
     {/if}
   </div>
 
@@ -379,24 +390,33 @@
   }
 
   .dash-controls {
-    border-top: 1px solid var(--border-subtle);
-    padding: var(--space-md) 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
   }
 
-  .controls-bar {
+  .session-row {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: var(--space-md);
     flex-wrap: wrap;
-    position: relative;
+    padding: var(--space-md) var(--space-lg);
   }
 
-  .controls-divider {
-    width: 1px;
-    height: 28px;
-    background: var(--border-default);
-    flex-shrink: 0;
+  .trainer-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-md);
+    flex-wrap: wrap;
+    padding: var(--space-sm) var(--space-lg);
+    border-top: 1px solid var(--border-subtle);
+    background: var(--bg-elevated);
   }
 
   .error {
@@ -519,6 +539,9 @@
   }
 
   .btn-zone-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     padding: var(--space-xs) var(--space-md);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-sm);
@@ -535,6 +558,16 @@
     border-color: var(--accent);
     color: var(--accent);
     background: var(--accent-soft);
+  }
+
+  .btn-zone-toggle.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .btn-zone-toggle svg {
+    opacity: 0.7;
   }
 
   .trainer-error {
