@@ -167,7 +167,7 @@ impl Storage {
         // a file without a row is invisible (data loss on crash).
         let ftp = summary.ftp.map(|v| v as i32);
         sqlx::query(
-            "INSERT INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
+            "INSERT OR IGNORE INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
              normalized_power, tss, intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, \
              raw_file_path, title, activity_type, rpe, notes) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -194,9 +194,11 @@ impl Storage {
         .await
         .map_err(AppError::Database)?;
         // Write raw data file after DB row exists
-        std::fs::create_dir_all(raw_file.parent().unwrap())
+        tokio::fs::create_dir_all(raw_file.parent().unwrap())
+            .await
             .map_err(|e| AppError::Database(sqlx::Error::Io(e)))?;
-        std::fs::write(&raw_file, raw_data)
+        tokio::fs::write(&raw_file, raw_data)
+            .await
             .map_err(|e| AppError::Database(sqlx::Error::Io(e)))?;
         Ok(())
     }
@@ -380,14 +382,15 @@ impl Storage {
     /// Write an autosave checkpoint for a running session.
     /// Format: 4-byte JSON-length (LE) + JSON summary + bincode sensor_log.
     /// Uses atomic write (write tmp → rename) to avoid corruption.
-    pub fn write_autosave(
+    pub async fn write_autosave(
         &self,
         session_id: &str,
         summary: &SessionSummary,
         sensor_log: &[SensorReading],
     ) -> Result<(), AppError> {
         let sessions_dir = Path::new(&self.data_dir).join("sessions");
-        std::fs::create_dir_all(&sessions_dir)
+        tokio::fs::create_dir_all(&sessions_dir)
+            .await
             .map_err(|e| AppError::Serialization(format!("Failed to create sessions dir: {}", e)))?;
 
         let json_bytes = serde_json::to_vec(summary)
@@ -404,9 +407,11 @@ impl Storage {
         let tmp_path = sessions_dir.join(format!(".autosave_{}.tmp", session_id));
         let final_path = sessions_dir.join(format!(".autosave_{}.bin", session_id));
 
-        std::fs::write(&tmp_path, &data)
+        tokio::fs::write(&tmp_path, &data)
+            .await
             .map_err(|e| AppError::Serialization(format!("Failed to write autosave tmp: {}", e)))?;
-        std::fs::rename(&tmp_path, &final_path)
+        tokio::fs::rename(&tmp_path, &final_path)
+            .await
             .map_err(|e| AppError::Serialization(format!("Failed to rename autosave: {}", e)))?;
 
         Ok(())
@@ -778,6 +783,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_session_duplicate_id_is_ignored() {
+        let (storage, _tmp) = test_storage().await;
+        let summary = make_summary("dup-1");
+        storage.save_session(&summary, b"first").await.unwrap();
+
+        // Second save with same ID should succeed (INSERT OR IGNORE)
+        storage.save_session(&summary, b"second").await.unwrap();
+
+        // Only one row should exist
+        let sessions = storage.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[tokio::test]
     async fn get_default_config() {
         let (storage, _tmp) = test_storage().await;
         let config = storage.get_user_config().await.unwrap();
@@ -868,6 +887,7 @@ mod tests {
 
         storage
             .write_autosave(sid, &summary, &sensor_log)
+            .await
             .unwrap();
 
         // Verify autosave file exists
@@ -921,6 +941,7 @@ mod tests {
 
         storage
             .write_autosave("cleanup-1", &summary, &sensor_log)
+            .await
             .unwrap();
 
         let autosave_path = std::path::Path::new(storage.data_dir())

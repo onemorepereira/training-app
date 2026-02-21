@@ -188,8 +188,10 @@
     session={postRideSession}
     mode="post-ride"
     onSave={async (title, activityType, rpe, notes) => {
+      const id = postRideSession?.id;
+      if (!id) return;
       try {
-        await api.updateSessionMetadata(postRideSession!.id, title, activityType, rpe, notes);
+        await api.updateSessionMetadata(id, title, activityType, rpe, notes);
       } catch (e) {
         error = extractError(e);
       }

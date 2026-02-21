@@ -672,9 +672,19 @@ impl DeviceManager {
         }
     }
 
-    /// Get the first connected trainer device ID (for command routing)
+    /// Get the connected trainer device ID (for command routing).
+    /// Cross-references trainer_backends with connected_devices to return
+    /// only a trainer that is actually Connected, avoiding stale entries
+    /// left behind during reconnect.
     pub fn connected_trainer_id(&self) -> Option<String> {
-        self.trainer_backends.keys().next().cloned()
+        self.trainer_backends
+            .keys()
+            .find(|id| {
+                self.connected_devices
+                    .get(*id)
+                    .is_some_and(|info| info.status == ConnectionStatus::Connected)
+            })
+            .cloned()
     }
 }
 
