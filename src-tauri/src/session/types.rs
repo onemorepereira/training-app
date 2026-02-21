@@ -54,6 +54,7 @@ pub struct SessionSummary {
     pub avg_speed: Option<f32>,
     pub work_kj: Option<f32>,
     pub variability_index: Option<f32>,
+    pub distance_km: Option<f32>,
     pub title: Option<String>,
     pub activity_type: Option<String>,
     pub rpe: Option<u8>,

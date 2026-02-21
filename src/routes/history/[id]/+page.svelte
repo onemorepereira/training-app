@@ -177,6 +177,14 @@
         unit={units === 'imperial' ? 'mph' : 'km/h'}
         size="sm"
       />
+      <MetricCard
+        label="Distance"
+        value={session.distance_km != null
+          ? (units === 'imperial' ? (session.distance_km * 0.621371).toFixed(1) : session.distance_km.toFixed(1))
+          : null}
+        unit={units === 'imperial' ? 'mi' : 'km'}
+        size="sm"
+      />
       <MetricCard label="Work" value={session.work_kj != null ? Math.round(session.work_kj) : null} unit="kJ" size="sm" />
       <MetricCard label="VI" value={session.variability_index != null ? session.variability_index.toFixed(2) : null} size="sm" />
       <MetricCard label="FTP" value={session.ftp} unit="W" size="sm" />

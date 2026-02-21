@@ -427,6 +427,7 @@ mod tests {
             avg_speed: None,
             work_kj: None,
             variability_index: None,
+            distance_km: None,
             title: None,
             activity_type: None,
             rpe: None,

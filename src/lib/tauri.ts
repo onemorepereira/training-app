@@ -59,6 +59,7 @@ export interface SessionSummary {
   avg_speed: number | null;
   work_kj?: number | null;
   variability_index?: number | null;
+  distance_km?: number | null;
   title?: string;
   activity_type?: string;
   rpe?: number;
