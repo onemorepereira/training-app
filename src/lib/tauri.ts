@@ -124,11 +124,19 @@ export interface ZoneBucket {
   percentage: number;
 }
 
+export interface PwcMarkers {
+  pwc150: number | null;
+  pwc170: number | null;
+  r_squared: number;
+  sample_count: number;
+}
+
 export interface SessionAnalysis {
   timeseries: TimeseriesPoint[];
   power_curve: PowerCurvePoint[];
   power_zone_distribution: ZoneBucket[];
   hr_zone_distribution: ZoneBucket[];
+  pwc: PwcMarkers | null;
 }
 
 export type ZoneMode = 'Power' | 'HeartRate';
