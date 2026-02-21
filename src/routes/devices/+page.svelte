@@ -4,18 +4,23 @@
   import SetupBanner from '$lib/components/SetupBanner.svelte';
   import { listen } from '@tauri-apps/api/event';
   import { onMount, onDestroy } from 'svelte';
-  import { connectedDevices } from '$lib/stores/devices';
+  import {
+    connectedDevices,
+    refreshDevices,
+    scanDevices as storeScan,
+    connectDevice as storeConnect,
+    disconnectDevice as storeDisconnect,
+    unlinkDevices as storeUnlink,
+  } from '$lib/stores/devices';
   import { get } from 'svelte/store';
   import { unitSystem, formatSpeed } from '$lib/stores/units';
 
-  let devices = $state<DeviceInfo[]>([]);
   let scanning = $state(false);
   let error = $state('');
   let sensorPreview = $state<Record<string, string>>({});
   let primaryDevices = $state<Record<string, string>>({});
   let pedalLabels = $state<Record<string, string>>({});
   let unlisten: (() => void) | null = null;
-  let unsubDevices: (() => void) | null = null;
 
   let detailModal = $state<DeviceDetails | null>(null);
   let detailLoading = $state('');
@@ -29,30 +34,11 @@
     }
   });
 
-  function syncStore() {
-    connectedDevices.set(devices);
-  }
-
   onMount(async () => {
-    try {
-      devices = await api.getKnownDevices();
-      syncStore();
-    } catch { /* no known devices yet */ }
+    await refreshDevices();
     try {
       primaryDevices = await api.getPrimaryDevices();
     } catch { /* no primaries yet */ }
-
-    // Subscribe to global store updates (disconnect/reconnect events handled in layout)
-    unsubDevices = connectedDevices.subscribe((storeDevices) => {
-      // Merge store status changes into local devices array
-      for (const sd of storeDevices) {
-        const idx = devices.findIndex((d) => d.id === sd.id);
-        if (idx >= 0 && devices[idx].status !== sd.status) {
-          devices[idx] = { ...devices[idx], status: sd.status };
-          devices = [...devices];
-        }
-      }
-    });
 
     unlisten = await listen<SensorReading>('sensor_reading', (event) => {
       const r = event.payload;
@@ -77,14 +63,13 @@
     });
   });
 
-  onDestroy(() => { unlisten?.(); unsubDevices?.(); });
+  onDestroy(() => { unlisten?.(); });
 
   async function scan() {
     scanning = true;
     error = '';
     try {
-      devices = await api.scanDevices();
-      syncStore();
+      await storeScan();
     } catch (e) {
       error = extractError(e);
     } finally {
@@ -101,16 +86,11 @@
       disconnectingIds = new Set([...disconnectingIds, device.id]);
     }
     try {
-      if (!isConnect) {
-        await api.disconnectDevice(device.id);
-        device.status = 'Disconnected';
+      if (isConnect) {
+        await storeConnect(device.id);
       } else {
-        const updated = await api.connectDevice(device.id);
-        const idx = devices.findIndex((d) => d.id === device.id);
-        if (idx >= 0) devices[idx] = updated;
+        await storeDisconnect(device.id);
       }
-      devices = [...devices];
-      syncStore();
     } catch (e) {
       error = extractError(e);
     } finally {
@@ -140,14 +120,7 @@
   async function unlinkDevice(device: DeviceInfo) {
     error = '';
     try {
-      await api.unlinkDevices(device.id);
-      // Clear device_group locally for immediate UI update
-      for (const d of devices) {
-        if (d.device_group === device.device_group) {
-          d.device_group = null;
-        }
-      }
-      devices = [...devices];
+      await storeUnlink(device.id, device.device_group);
     } catch (e) {
       error = extractError(e);
     }
@@ -207,7 +180,7 @@
     // First, merge devices by device_group
     const groupMap = new Map<string, DeviceInfo[]>();
     const ungrouped: DeviceInfo[] = [];
-    for (const d of devices) {
+    for (const d of $connectedDevices) {
       if (d.device_group) {
         const list = groupMap.get(d.device_group) ?? [];
         list.push(d);
@@ -281,7 +254,7 @@
     <div class="error">{error}</div>
   {/if}
 
-  {#if devices.length === 0 && !scanning}
+  {#if $connectedDevices.length === 0 && !scanning}
     <div class="empty-state">
       <div class="empty-icon">
         <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
