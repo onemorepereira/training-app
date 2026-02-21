@@ -564,4 +564,62 @@ mod tests {
         let ts = build_timeseries(&[], 60);
         assert!(ts.is_empty());
     }
+
+    // --- compute_analysis FTP fallback ---
+
+    #[test]
+    fn compute_analysis_uses_session_ftp_when_present() {
+        // Session FTP=250, config FTP=200 (default) → zones should use 250
+        let readings = vec![
+            power_reading(250, 1000),
+            power_reading(250, 2000),
+        ];
+        let session = test_session(2, 250);
+        let config = test_config();
+
+        let analysis = compute_analysis(&readings, &session, &config);
+
+        // 250W at FTP=250 → 100% FTP → zone 4 (threshold: 90-105%)
+        // Power zones [55, 75, 90, 105, 120, 150] → Z4 is 90-105% FTP
+        let z4 = analysis.power_zone_distribution.iter().find(|z| z.zone == 4);
+        assert!(z4.is_some(), "should have zone 4 bucket");
+        assert!(z4.unwrap().percentage > 0.0, "zone 4 should have time");
+    }
+
+    #[test]
+    fn compute_analysis_falls_back_to_config_ftp_when_session_ftp_is_none() {
+        let readings = vec![
+            power_reading(200, 1000),
+            power_reading(200, 2000),
+        ];
+        // Session has ftp=None
+        let mut session = test_session(2, 200);
+        session.ftp = None;
+        let config = test_config(); // default FTP=200
+
+        let analysis = compute_analysis(&readings, &session, &config);
+
+        // 200W at FTP=200 → 100% FTP → zone 4
+        let z4 = analysis.power_zone_distribution.iter().find(|z| z.zone == 4);
+        assert!(z4.is_some(), "should have zone 4 bucket using config FTP");
+        assert!(z4.unwrap().percentage > 0.0, "zone 4 should have time with config FTP fallback");
+    }
+
+    #[test]
+    fn compute_analysis_session_ftp_overrides_config_ftp() {
+        // Session FTP=100, config FTP=200 → 200W = 200% of session FTP → zone 7
+        let readings = vec![
+            power_reading(200, 1000),
+            power_reading(200, 2000),
+        ];
+        let session = test_session(2, 100);
+        let config = test_config(); // FTP=200
+
+        let analysis = compute_analysis(&readings, &session, &config);
+
+        // 200W at FTP=100 → 200% FTP → zone 7 (>150%)
+        let z7 = analysis.power_zone_distribution.iter().find(|z| z.zone == 7);
+        assert!(z7.is_some(), "should have zone 7 bucket");
+        assert!(z7.unwrap().percentage > 0.0, "200W at FTP=100 should be zone 7");
+    }
 }
