@@ -393,20 +393,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_includes_all_readings() {
+    async fn snapshot_returns_delta_only() {
         let mgr = SessionManager::new();
         mgr.start_session(default_config()).await.unwrap();
 
         mgr.process_reading(power_reading(100)).await;
         mgr.process_reading(power_reading(200)).await;
 
-        let (_, _, log1) = mgr.snapshot_for_autosave().await.unwrap();
-        assert_eq!(log1.len(), 2);
+        // First snapshot: all 2 readings
+        let (_, _, delta1) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(delta1.len(), 2);
 
-        // Add more readings — snapshot should include all accumulated readings
+        // Add one more reading — second snapshot returns only the new one
         mgr.process_reading(power_reading(300)).await;
-        let (_, _, log2) = mgr.snapshot_for_autosave().await.unwrap();
-        assert_eq!(log2.len(), 3);
+        let (_, _, delta2) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(delta2.len(), 1);
+
+        // No new readings — empty delta
+        let (_, _, delta3) = mgr.snapshot_for_autosave().await.unwrap();
+        assert_eq!(delta3.len(), 0);
     }
 
     #[tokio::test]
