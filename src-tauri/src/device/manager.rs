@@ -407,23 +407,24 @@ impl DeviceManager {
         // Check BLE peripherals via is_connected()
         if let Some(ref ble) = self.ble {
             let connected_arc = ble.get_connected();
-            let connected = connected_arc.lock().await;
-            let ble_ids: Vec<String> = self
-                .connected_devices
-                .keys()
-                .filter(|id| !id.starts_with("ant:"))
-                .cloned()
-                .collect();
-            for id in ble_ids {
-                if let Some(peripheral) = connected.get(&id) {
-                    if !peripheral.is_connected().await.unwrap_or(false) {
-                        if let Some(info) = self.connected_devices.get(&id) {
-                            disconnected.push(info.clone());
-                        }
+
+            // Collect peripherals to check, then drop the lock before async I/O
+            let to_check: Vec<(String, btleplug::platform::Peripheral)> = {
+                let connected = connected_arc.lock().await;
+                self.connected_devices
+                    .keys()
+                    .filter(|id| !id.starts_with("ant:"))
+                    .filter_map(|id| connected.get(id).map(|p| (id.clone(), p.clone())))
+                    .collect()
+            };
+
+            for (id, peripheral) in to_check {
+                if !peripheral.is_connected().await.unwrap_or(false) {
+                    if let Some(info) = self.connected_devices.get(&id) {
+                        disconnected.push(info.clone());
                     }
                 }
             }
-            drop(connected);
 
             // Remove from BLE connected map
             if !disconnected.is_empty() {
