@@ -3,6 +3,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;
 
+use super::analysis::PowerCurvePoint;
 use super::types::{SessionConfig, SessionSummary};
 use serde::Deserialize;
 
@@ -163,6 +164,18 @@ impl Storage {
             "ALTER TABLE sessions ADD COLUMN distance_km REAL",
         )
         .await?;
+        // Power curve cache table (idempotent CREATE IF NOT EXISTS)
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS session_power_curves (
+                session_id TEXT NOT NULL,
+                duration_secs INTEGER NOT NULL,
+                watts INTEGER NOT NULL,
+                PRIMARY KEY (session_id, duration_secs)
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(AppError::Database)?;
         Ok(Self {
             pool,
             data_dir: data_dir.to_string(),
@@ -554,7 +567,7 @@ impl Storage {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<(), AppError> {
-        // Delete file first, then DB row. A row without a file is visible in
+        // Delete file first, then DB rows. A row without a file is visible in
         // history (gracefully handleable). A file without a row is an orphan
         // that wastes disk space silently forever.
         let path = Path::new(&self.data_dir)
@@ -564,6 +577,11 @@ impl Storage {
             std::fs::remove_file(&path)
                 .map_err(|e| AppError::Session(format!("Failed to delete session file: {}", e)))?;
         }
+        sqlx::query("DELETE FROM session_power_curves WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::Database)?;
         sqlx::query("DELETE FROM sessions WHERE id = ?")
             .bind(session_id)
             .execute(&self.pool)
@@ -594,6 +612,75 @@ impl Storage {
                 .await
                 .map_err(AppError::Database)?;
         Ok(row.and_then(|(v,)| v))
+    }
+
+    pub async fn save_power_curve(
+        &self,
+        session_id: &str,
+        curve: &[PowerCurvePoint],
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+        for point in curve {
+            sqlx::query(
+                "INSERT OR REPLACE INTO session_power_curves (session_id, duration_secs, watts) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(session_id)
+            .bind(point.duration_secs as i32)
+            .bind(point.watts as i32)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        }
+        tx.commit().await.map_err(AppError::Database)?;
+        Ok(())
+    }
+
+    pub async fn get_best_power_curve(
+        &self,
+        after_date: Option<&str>,
+    ) -> Result<Vec<PowerCurvePoint>, AppError> {
+        let rows: Vec<(i32, i32)> = if let Some(date) = after_date {
+            sqlx::query_as(
+                "SELECT pc.duration_secs, MAX(pc.watts) as watts \
+                 FROM session_power_curves pc \
+                 JOIN sessions s ON s.id = pc.session_id \
+                 WHERE s.start_time >= ? \
+                 GROUP BY pc.duration_secs \
+                 ORDER BY pc.duration_secs",
+            )
+            .bind(date)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(AppError::Database)?
+        } else {
+            sqlx::query_as(
+                "SELECT duration_secs, MAX(watts) as watts \
+                 FROM session_power_curves \
+                 GROUP BY duration_secs \
+                 ORDER BY duration_secs",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(AppError::Database)?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(d, w)| PowerCurvePoint {
+                duration_secs: d as u32,
+                watts: w as u16,
+            })
+            .collect())
+    }
+
+    pub async fn has_power_curve(&self, session_id: &str) -> Result<bool, AppError> {
+        let row: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM session_power_curves WHERE session_id = ? LIMIT 1")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(AppError::Database)?;
+        Ok(row.is_some())
     }
 
     pub async fn list_known_devices(&self) -> Result<Vec<DeviceInfo>, AppError> {
@@ -1236,6 +1323,90 @@ mod tests {
 
         let loaded = storage.load_sensor_data("rt-empty").unwrap();
         assert!(loaded.is_empty());
+    }
+
+    // --- Power curve storage tests ---
+
+    #[tokio::test]
+    async fn save_and_get_power_curve() {
+        let (storage, _tmp) = test_storage().await;
+        let summary = make_summary("pc-1");
+        storage.save_session(&summary, b"raw").await.unwrap();
+
+        let curve = vec![
+            PowerCurvePoint { duration_secs: 1, watts: 400 },
+            PowerCurvePoint { duration_secs: 5, watts: 350 },
+            PowerCurvePoint { duration_secs: 60, watts: 280 },
+        ];
+        storage.save_power_curve("pc-1", &curve).await.unwrap();
+
+        let best = storage.get_best_power_curve(None).await.unwrap();
+        assert_eq!(best.len(), 3);
+        assert_eq!(best[0].duration_secs, 1);
+        assert_eq!(best[0].watts, 400);
+        assert_eq!(best[2].duration_secs, 60);
+        assert_eq!(best[2].watts, 280);
+    }
+
+    #[tokio::test]
+    async fn best_power_curve_takes_max_across_sessions() {
+        let (storage, _tmp) = test_storage().await;
+
+        let s1 = make_summary("pc-max-1");
+        storage.save_session(&s1, b"raw").await.unwrap();
+        storage.save_power_curve("pc-max-1", &[
+            PowerCurvePoint { duration_secs: 1, watts: 400 },
+            PowerCurvePoint { duration_secs: 60, watts: 250 },
+        ]).await.unwrap();
+
+        let s2 = make_summary("pc-max-2");
+        storage.save_session(&s2, b"raw").await.unwrap();
+        storage.save_power_curve("pc-max-2", &[
+            PowerCurvePoint { duration_secs: 1, watts: 350 },
+            PowerCurvePoint { duration_secs: 60, watts: 300 },
+        ]).await.unwrap();
+
+        let best = storage.get_best_power_curve(None).await.unwrap();
+        // 1s: max(400, 350) = 400
+        let p1 = best.iter().find(|p| p.duration_secs == 1).unwrap();
+        assert_eq!(p1.watts, 400);
+        // 60s: max(250, 300) = 300
+        let p60 = best.iter().find(|p| p.duration_secs == 60).unwrap();
+        assert_eq!(p60.watts, 300);
+    }
+
+    #[tokio::test]
+    async fn has_power_curve_detects_presence() {
+        let (storage, _tmp) = test_storage().await;
+        let summary = make_summary("pc-has-1");
+        storage.save_session(&summary, b"raw").await.unwrap();
+
+        assert!(!storage.has_power_curve("pc-has-1").await.unwrap());
+
+        storage.save_power_curve("pc-has-1", &[
+            PowerCurvePoint { duration_secs: 1, watts: 300 },
+        ]).await.unwrap();
+
+        assert!(storage.has_power_curve("pc-has-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_power_curves() {
+        let (storage, _tmp) = test_storage().await;
+        let summary = make_summary("pc-del-1");
+        storage.save_session(&summary, b"raw").await.unwrap();
+        storage.save_power_curve("pc-del-1", &[
+            PowerCurvePoint { duration_secs: 1, watts: 400 },
+            PowerCurvePoint { duration_secs: 5, watts: 350 },
+        ]).await.unwrap();
+
+        assert!(storage.has_power_curve("pc-del-1").await.unwrap());
+
+        storage.delete_session("pc-del-1").await.unwrap();
+
+        assert!(!storage.has_power_curve("pc-del-1").await.unwrap());
+        let best = storage.get_best_power_curve(None).await.unwrap();
+        assert!(best.is_empty());
     }
 
     #[tokio::test]

@@ -337,6 +337,8 @@ pub fn run() {
             commands::estimate_initial_power,
             commands::save_zone_ride_config,
             commands::get_zone_ride_config,
+            commands::get_best_power_curve,
+            commands::backfill_power_curves,
             commands::check_prerequisites,
             commands::fix_prerequisites,
         ])

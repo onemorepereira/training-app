@@ -7,7 +7,7 @@ use crate::device::manager::DeviceManager;
 use crate::device::types::{DeviceDetails, DeviceInfo, DeviceType, SensorReading};
 use crate::error::AppError;
 use crate::prerequisites;
-use crate::session::analysis::{self, SessionAnalysis};
+use crate::session::analysis::{self, PowerCurvePoint, SessionAnalysis};
 use crate::session::fit_export;
 use crate::session::manager::SessionManager;
 use crate::session::storage::Storage;
@@ -126,6 +126,19 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSu
             .map_err(|e| AppError::Serialization(e.to_string()))?;
         state.storage.save_session(summary, &raw_data).await?;
         state.storage.remove_autosave(&summary.id);
+
+        // Save power curve in background
+        let storage = state.storage.clone();
+        let session_id = summary.id.clone();
+        let readings = sensor_log.clone();
+        tokio::spawn(async move {
+            let curve = analysis::compute_power_curve_from_readings(&readings);
+            if !curve.is_empty() {
+                if let Err(e) = storage.save_power_curve(&session_id, &curve).await {
+                    log::warn!("Failed to save power curve: {}", e);
+                }
+            }
+        });
     }
 
     Ok(result.map(|(summary, _)| summary))
@@ -460,6 +473,54 @@ pub async fn get_zone_ride_config(
 ) -> Result<Option<String>, AppError> {
     validate_session_id(&session_id)?;
     state.storage.get_zone_config(&session_id).await
+}
+
+#[tauri::command]
+pub async fn get_best_power_curve(
+    state: State<'_, AppState>,
+    period: String,
+) -> Result<Vec<PowerCurvePoint>, AppError> {
+    let after_date = match period.as_str() {
+        "30d" => {
+            let dt = chrono::Utc::now() - chrono::Duration::days(30);
+            Some(dt.to_rfc3339())
+        }
+        "90d" => {
+            let dt = chrono::Utc::now() - chrono::Duration::days(90);
+            Some(dt.to_rfc3339())
+        }
+        _ => None,
+    };
+    state
+        .storage
+        .get_best_power_curve(after_date.as_deref())
+        .await
+}
+
+#[tauri::command]
+pub async fn backfill_power_curves(state: State<'_, AppState>) -> Result<u32, AppError> {
+    let sessions = state.storage.list_sessions().await?;
+    let mut filled = 0u32;
+    for session in &sessions {
+        if state.storage.has_power_curve(&session.id).await? {
+            continue;
+        }
+        let storage = state.storage.clone();
+        let sid = session.id.clone();
+        let curve = tokio::task::spawn_blocking(move || {
+            let readings = storage.load_sensor_data(&sid)?;
+            Ok::<_, AppError>(analysis::compute_power_curve_from_readings(&readings))
+        })
+        .await
+        .map_err(|e| AppError::Session(format!("Backfill failed: {}", e)))??;
+
+        if curve.is_empty() {
+            continue;
+        }
+        state.storage.save_power_curve(&session.id, &curve).await?;
+        filled += 1;
+    }
+    Ok(filled)
 }
 
 #[tauri::command]
