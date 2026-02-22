@@ -13,7 +13,6 @@ use log::Record;
 use session::manager::SessionManager;
 use session::storage::Storage;
 use session::zone_control::controller::ZoneController;
-use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WindowEvent};
@@ -136,8 +135,6 @@ pub fn run() {
                 }
 
                 let session_manager = Arc::new(SessionManager::new());
-                let primary_devices: Arc<std::sync::RwLock<HashMap<crate::device::types::DeviceType, String>>> =
-                    Arc::new(std::sync::RwLock::new(HashMap::new()));
 
                 // I6: Spawn a single global processor task that handles ALL sensor readings.
                 // This replaces the per-device processor tasks that caused duplicate processing.
@@ -165,7 +162,7 @@ pub fn run() {
                 let storage = Arc::new(storage);
                 let mut device_manager = DeviceManager::new();
                 device_manager.set_storage(storage.clone());
-                device_manager.set_primary_devices(primary_devices.clone());
+                let primary_devices = device_manager.primaries_handle();
 
                 let device_manager = Arc::new(tokio::sync::Mutex::new(device_manager));
 
