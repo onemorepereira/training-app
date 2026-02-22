@@ -9,7 +9,7 @@ use super::types::{
     CharacteristicInfo, ConnectionStatus, DeviceDetails, DeviceInfo, DeviceType, ServiceInfo,
     Transport,
 };
-use crate::error::AppError;
+use crate::error::{AppError, BleError};
 
 const HEART_RATE_SERVICE: BtUuid = BtUuid::from_u128(0x0000180D_0000_1000_8000_00805f9b34fb);
 const CYCLING_POWER_SERVICE: BtUuid = BtUuid::from_u128(0x00001818_0000_1000_8000_00805f9b34fb);
@@ -35,15 +35,15 @@ impl BleManager {
     pub async fn new() -> Result<Self, AppError> {
         let manager = Manager::new()
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to create BLE manager: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to create BLE manager: {}", e)))?;
         let adapters = manager
             .adapters()
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to get adapters: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to get adapters: {}", e)))?;
         let adapter = adapters
             .into_iter()
             .next()
-            .ok_or_else(|| AppError::Ble("No BLE adapter found".into()))?;
+            .ok_or_else(|| BleError::NoAdapter)?;
         Ok(Self {
             adapter,
             discovered: Arc::new(Mutex::new(HashMap::new())),
@@ -55,14 +55,16 @@ impl BleManager {
         self.adapter
             .start_scan(ScanFilter::default())
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to start scan: {}", e)))
+            .map_err(|e| BleError::Btleplug(format!("Failed to start scan: {}", e)))?;
+        Ok(())
     }
 
     pub async fn stop_scan(&self) -> Result<(), AppError> {
         self.adapter
             .stop_scan()
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to stop scan: {}", e)))
+            .map_err(|e| BleError::Btleplug(format!("Failed to stop scan: {}", e)))?;
+        Ok(())
     }
 
     pub async fn get_discovered_devices(&self) -> Result<Vec<DeviceInfo>, AppError> {
@@ -70,7 +72,7 @@ impl BleManager {
             .adapter
             .peripherals()
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to get peripherals: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to get peripherals: {}", e)))?;
 
         let mut devices = Vec::new();
         let mut discovered = self.discovered.lock().await;
@@ -85,7 +87,7 @@ impl BleManager {
             let properties = peripheral
                 .properties()
                 .await
-                .map_err(|e| AppError::Ble(format!("Failed to get properties: {}", e)))?;
+                .map_err(|e| BleError::Btleplug(format!("Failed to get properties: {}", e)))?;
             let Some(properties) = properties else {
                 continue;
             };
@@ -132,23 +134,21 @@ impl BleManager {
             peripheral
                 .connect()
                 .await
-                .map_err(|e| AppError::Ble(format!("Failed to connect: {}", e)))?;
+                .map_err(|e| BleError::Btleplug(format!("Failed to connect: {}", e)))?;
             peripheral
                 .discover_services()
                 .await
-                .map_err(|e| AppError::Ble(format!("Failed to discover services: {}", e)))?;
+                .map_err(|e| BleError::Btleplug(format!("Failed to discover services: {}", e)))?;
 
             let properties = peripheral.properties().await
-                .map_err(|e| AppError::Ble(format!("Failed to get properties: {}", e)))?;
+                .map_err(|e| BleError::Btleplug(format!("Failed to get properties: {}", e)))?;
             let props = properties.unwrap_or_default();
 
             // Classify from actual GATT services (post-connection), not advertisement data
             let gatt_services: Vec<BtUuid> = peripheral.services().iter().map(|s| s.uuid).collect();
             let device_type = classify_device(&gatt_services)
                 .or_else(|| classify_device(&props.services))
-                .ok_or_else(|| AppError::Ble(format!(
-                    "Device {} has no recognized services", device_id
-                )))?;
+                .ok_or_else(|| BleError::UnrecognizedDevice(device_id.to_string()))?;
 
             let battery_level = {
                 let chars = peripheral.characteristics();
@@ -201,11 +201,11 @@ impl BleManager {
                 fresh
                     .connect()
                     .await
-                    .map_err(|e2| AppError::Ble(format!("Failed to connect after rescan: {}", e2)))?;
+                    .map_err(|e2| BleError::Btleplug(format!("Failed to connect after rescan: {}", e2)))?;
                 fresh
                     .discover_services()
                     .await
-                    .map_err(|e2| AppError::Ble(format!("Failed to discover services: {}", e2)))?;
+                    .map_err(|e2| BleError::Btleplug(format!("Failed to discover services: {}", e2)))?;
 
                 let battery_level = {
                     let chars = fresh.characteristics();
@@ -232,12 +232,12 @@ impl BleManager {
                     .insert(device_id.to_string(), fresh);
                 return Ok(info);
             }
-            return Err(AppError::Ble(format!("Failed to connect: {}", e)));
+            return Err(BleError::Btleplug(format!("Failed to connect: {}", e)).into());
         }
         peripheral
             .discover_services()
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to discover services: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to discover services: {}", e)))?;
 
         let battery_level = {
             let chars = peripheral.characteristics();
@@ -280,7 +280,7 @@ impl BleManager {
         self.adapter
             .start_scan(ScanFilter::default())
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to start scan: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to start scan: {}", e)))?;
         tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
         let _ = self.adapter.stop_scan().await;
 
@@ -302,7 +302,7 @@ impl BleManager {
             peripheral
                 .disconnect()
                 .await
-                .map_err(|e| AppError::Ble(format!("Failed to disconnect: {}", e)))?;
+                .map_err(|e| BleError::Btleplug(format!("Failed to disconnect: {}", e)))?;
         }
         Ok(())
     }
@@ -320,7 +320,7 @@ impl BleManager {
             .ok_or_else(|| AppError::DeviceNotFound(device_id.to_string()))?;
 
         let properties = peripheral.properties().await
-            .map_err(|e| AppError::Ble(format!("Failed to get properties: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to get properties: {}", e)))?;
         let props = properties.unwrap_or_default();
         let characteristics = peripheral.characteristics();
 

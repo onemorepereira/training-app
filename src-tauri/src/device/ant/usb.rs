@@ -1,7 +1,7 @@
 use rusb::{DeviceHandle, GlobalContext};
 use std::time::Duration;
 
-use crate::error::AppError;
+use crate::error::{AntError, AppError};
 
 const GARMIN_VENDOR_ID: u16 = 0x0FCF;
 const ANTUSB_M_PRODUCT_ID: u16 = 0x1009;
@@ -56,12 +56,12 @@ impl AntUsb {
     /// Find and open the first ANT USB stick
     pub fn open() -> Result<Self, AppError> {
         let devices = rusb::devices()
-            .map_err(|e| AppError::AntPlus(format!("Failed to enumerate USB: {}", e)))?;
+            .map_err(|e| AntError::Usb(format!("Failed to enumerate USB: {}", e)))?;
 
         for device in devices.iter() {
             let desc = device
                 .device_descriptor()
-                .map_err(|e| AppError::AntPlus(format!("Failed to read descriptor: {}", e)))?;
+                .map_err(|e| AntError::Usb(format!("Failed to read descriptor: {}", e)))?;
 
             if desc.vendor_id() == GARMIN_VENDOR_ID
                 && (desc.product_id() == ANTUSB_M_PRODUCT_ID
@@ -69,31 +69,31 @@ impl AntUsb {
             {
                 let handle = device
                     .open()
-                    .map_err(|e| AppError::AntPlus(format!("Failed to open ANT stick: {}", e)))?;
+                    .map_err(|e| AntError::Usb(format!("Failed to open ANT stick: {}", e)))?;
 
                 // Detach kernel driver if attached
                 if handle.kernel_driver_active(0).unwrap_or(false) {
                     handle.detach_kernel_driver(0).map_err(|e| {
-                        AppError::AntPlus(format!("Failed to detach kernel driver: {}", e))
+                        AntError::Usb(format!("Failed to detach kernel driver: {}", e))
                     })?;
                 }
 
                 handle.claim_interface(0).map_err(|e| {
-                    AppError::AntPlus(format!("Failed to claim interface: {}", e))
+                    AntError::Usb(format!("Failed to claim interface: {}", e))
                 })?;
 
                 // Find bulk endpoints
                 let config = device
                     .active_config_descriptor()
-                    .map_err(|e| AppError::AntPlus(format!("Failed to get config: {}", e)))?;
+                    .map_err(|e| AntError::Usb(format!("Failed to get config: {}", e)))?;
                 let interface = config
                     .interfaces()
                     .next()
-                    .ok_or_else(|| AppError::AntPlus("No interfaces found".into()))?;
+                    .ok_or_else(|| AntError::Usb("No interfaces found".into()))?;
                 let setting = interface
                     .descriptors()
                     .next()
-                    .ok_or_else(|| AppError::AntPlus("No interface descriptors".into()))?;
+                    .ok_or_else(|| AntError::Usb("No interface descriptors".into()))?;
 
                 let mut ep_in = 0u8;
                 let mut ep_out = 0u8;
@@ -105,19 +105,19 @@ impl AntUsb {
                 }
 
                 if ep_in == 0 || ep_out == 0 {
-                    return Err(AppError::AntPlus("Could not find bulk endpoints".into()));
+                    return Err(AntError::Usb("Could not find bulk endpoints".into()).into());
                 }
 
                 handle
                     .reset()
-                    .map_err(|e| AppError::AntPlus(format!("Failed to reset: {}", e)))?;
+                    .map_err(|e| AntError::Usb(format!("Failed to reset: {}", e)))?;
 
                 // Re-claim after reset
                 if handle.kernel_driver_active(0).unwrap_or(false) {
                     let _ = handle.detach_kernel_driver(0);
                 }
                 handle.claim_interface(0).map_err(|e| {
-                    AppError::AntPlus(format!("Failed to reclaim after reset: {}", e))
+                    AntError::Usb(format!("Failed to reclaim after reset: {}", e))
                 })?;
 
                 return Ok(Self {
@@ -128,7 +128,7 @@ impl AntUsb {
             }
         }
 
-        Err(AppError::AntPlus("No ANT USB stick found".into()))
+        Err(AntError::NoUsbStick.into())
     }
 
     /// Send a raw ANT message
@@ -136,7 +136,7 @@ impl AntUsb {
         let packet = encode_message(msg);
         self.handle
             .write_bulk(self.endpoint_out, &packet, USB_TIMEOUT)
-            .map_err(|e| AppError::AntPlus(format!("USB write failed: {}", e)))?;
+            .map_err(|e| AntError::Usb(format!("USB write failed: {}", e)))?;
         Ok(())
     }
 
@@ -151,7 +151,7 @@ impl AntUsb {
             Ok(n) if n >= 4 => decode_all_messages(&buf[..n]),
             Ok(_) => Ok(Vec::new()),
             Err(rusb::Error::Timeout) => Ok(Vec::new()),
-            Err(e) => Err(AppError::AntPlus(format!("USB read failed: {}", e))),
+            Err(e) => Err(AntError::Usb(format!("USB read failed: {}", e)).into()),
         }
     }
 
