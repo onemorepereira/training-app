@@ -1,5 +1,5 @@
-use super::ant_channel::send_acknowledged;
-use super::ant_usb::AntUsb;
+use super::ant::channel::send_acknowledged;
+use super::ant::usb::AntUsb;
 use crate::error::AppError;
 
 /// Encode target power page (0x31). Power in 0.25W resolution: watts * 4.

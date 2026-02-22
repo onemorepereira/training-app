@@ -1,6 +1,6 @@
 use log::debug;
 
-use super::types::SensorReading;
+use crate::device::types::SensorReading;
 
 /// Default wheel circumference in mm (700x25c)
 pub const DEFAULT_WHEEL_CIRCUMFERENCE_MM: u32 = 2105;
