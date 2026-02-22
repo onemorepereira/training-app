@@ -214,7 +214,6 @@ export const api = {
   stopSession: () => invoke<SessionSummary | null>('stop_session'),
   pauseSession: () => invoke<void>('pause_session'),
   resumeSession: () => invoke<void>('resume_session'),
-  getLiveMetrics: () => invoke<LiveMetrics | null>('get_live_metrics'),
   listSessions: () => invoke<SessionSummary[]>('list_sessions'),
   getSession: (sessionId: string) => invoke<SessionSummary>('get_session', { sessionId }),
   getSessionAnalysis: (sessionId: string) => invoke<SessionAnalysis>('get_session_analysis', { sessionId }),

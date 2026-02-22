@@ -11,7 +11,7 @@ use crate::session::analysis::{self, PowerCurvePoint, SessionAnalysis};
 use crate::session::fit_export;
 use crate::session::manager::SessionManager;
 use crate::session::storage::Storage;
-use crate::session::types::{LiveMetrics, SessionConfig, SessionSummary};
+use crate::session::types::{SessionConfig, SessionSummary};
 use crate::session::analysis::{compute_hr_power_regression, TimeseriesPoint};
 use crate::session::zone_control::controller::ZoneController;
 use crate::session::zone_control::types::{StopReason, ZoneControlStatus, ZoneMode, ZoneTarget};
@@ -169,11 +169,6 @@ pub async fn pause_session(state: State<'_, AppState>) -> Result<(), AppError> {
 pub async fn resume_session(state: State<'_, AppState>) -> Result<(), AppError> {
     state.session_manager.resume_session().await;
     Ok(())
-}
-
-#[tauri::command]
-pub async fn get_live_metrics(state: State<'_, AppState>) -> Result<Option<LiveMetrics>, AppError> {
-    Ok(state.session_manager.get_live_metrics().await)
 }
 
 #[tauri::command]
