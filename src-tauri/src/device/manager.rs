@@ -23,8 +23,7 @@ enum TrainerBackend {
     Fec { usb: Arc<AntUsb>, channel: u8 },
 }
 
-/// ANT+ staleness threshold: device considered disconnected after 10s without data
-const ANT_STALE_SECS: u64 = 10;
+use crate::config;
 
 /// Unified device manager wrapping BLE and ANT+ transports
 pub struct DeviceManager {
@@ -231,7 +230,7 @@ impl DeviceManager {
         });
 
         // Sleep during BLE scan (ANT+ runs concurrently on blocking thread)
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(config::BLE_SCAN_DURATION_SECS)).await;
 
         // Collect BLE results
         if let Some(ref ble) = self.ble {
@@ -518,7 +517,7 @@ impl DeviceManager {
             for id in ant_ids {
                 if let Some(ts) = last_seen.get(&id) {
                     if let Some(elapsed) = super::ant_listener::atomic_elapsed(ts) {
-                        if elapsed > std::time::Duration::from_secs(ANT_STALE_SECS) {
+                        if elapsed > std::time::Duration::from_secs(config::ANT_STALE_SECS) {
                             if let Some(info) = self.connected_devices.get(&id) {
                                 disconnected.push(info.clone());
                             }

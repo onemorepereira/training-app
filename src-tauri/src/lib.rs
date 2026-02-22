@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod device;
 mod error;
 mod prerequisites;
@@ -179,7 +180,7 @@ pub fn run() {
                     let sensor_tx_clone = sensor_tx.clone();
                     tokio::spawn(async move {
                         loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(config::CONNECTION_CHECK_INTERVAL_SECS)).await;
 
                             let disconnected = {
                                 let mut dm = dm.lock().await;
@@ -220,7 +221,7 @@ pub fn run() {
                                 let _ =
                                     handle.emit("device_reconnecting", &serde_json::json!({
                                         "device_id": info.id,
-                                        "device_type": format!("{:?}", info.device_type),
+                                        "device_type": info.device_type.as_str(),
                                         "attempt": attempt,
                                     }));
                             }
@@ -236,7 +237,7 @@ pub fn run() {
                         let mut accumulated_log: Vec<crate::device::types::SensorReading> = Vec::new();
                         let mut current_session_id: Option<String> = None;
                         loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(config::AUTOSAVE_INTERVAL_SECS)).await;
                             if let Some((session_id, summary, delta)) =
                                 session_mgr.snapshot_for_autosave().await
                             {
@@ -266,7 +267,7 @@ pub fn run() {
                     let handle = app_handle.clone();
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(
-                            tokio::time::Duration::from_millis(250),
+                            tokio::time::Duration::from_millis(config::LIVE_METRICS_PUSH_MS),
                         );
                         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         loop {
