@@ -331,6 +331,7 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn upsert_known_device(&self, device: &DeviceInfo) -> Result<(), AppError> {
         let device_type = device.device_type.as_str();
         let transport = device.transport.as_str();
@@ -366,6 +367,48 @@ impl Storage {
         .execute(&self.pool)
         .await
         .map_err(AppError::Database)?;
+        Ok(())
+    }
+
+    pub async fn upsert_known_devices_batch(&self, devices: &[DeviceInfo]) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+        for device in devices {
+            let device_type = device.device_type.as_str();
+            let transport = device.transport.as_str();
+            let last_seen = device
+                .last_seen
+                .clone()
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+            sqlx::query(
+                "INSERT INTO known_devices (id, name, device_type, transport, rssi, battery_level, \
+                 last_seen, manufacturer, model_number, serial_number, device_group) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   name = COALESCE(excluded.name, known_devices.name), \
+                   rssi = COALESCE(excluded.rssi, known_devices.rssi), \
+                   battery_level = COALESCE(excluded.battery_level, known_devices.battery_level), \
+                   last_seen = excluded.last_seen, \
+                   manufacturer = COALESCE(excluded.manufacturer, known_devices.manufacturer), \
+                   model_number = COALESCE(excluded.model_number, known_devices.model_number), \
+                   serial_number = COALESCE(excluded.serial_number, known_devices.serial_number), \
+                   device_group = COALESCE(excluded.device_group, known_devices.device_group)",
+            )
+            .bind(&device.id)
+            .bind(&device.name)
+            .bind(&device_type)
+            .bind(&transport)
+            .bind(device.rssi.map(|v| v as i32))
+            .bind(device.battery_level.map(|v| v as i32))
+            .bind(&last_seen)
+            .bind(&device.manufacturer)
+            .bind(&device.model_number)
+            .bind(&device.serial_number)
+            .bind(&device.device_group)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        }
+        tx.commit().await.map_err(AppError::Database)?;
         Ok(())
     }
 
@@ -1407,6 +1450,35 @@ mod tests {
         assert!(!storage.has_power_curve("pc-del-1").await.unwrap());
         let best = storage.get_best_power_curve(None).await.unwrap();
         assert!(best.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_batch_coalesce_preserves() {
+        let (storage, _tmp) = test_storage().await;
+        // Insert device with name+manufacturer via single upsert
+        let mut d1 = make_device("ble-batch", Some("Kickr"), "2024-01-01T00:00:00Z");
+        d1.manufacturer = Some("Wahoo Fitness".to_string());
+        storage.upsert_known_device(&d1).await.unwrap();
+
+        // Batch-upsert with None name — COALESCE should preserve originals
+        let d2 = make_device("ble-batch", None, "2024-01-02T00:00:00Z");
+        let d3 = make_device("ble-new", Some("HRM"), "2024-01-02T00:00:00Z");
+        storage
+            .upsert_known_devices_batch(&[d2, d3])
+            .await
+            .unwrap();
+
+        let devices = storage.list_known_devices().await.unwrap();
+        assert_eq!(devices.len(), 2);
+
+        let batch_dev = devices.iter().find(|d| d.id == "ble-batch").unwrap();
+        assert_eq!(batch_dev.name, Some("Kickr".to_string()));
+        assert_eq!(batch_dev.manufacturer, Some("Wahoo Fitness".to_string()));
+        // last_seen should be updated
+        assert_eq!(batch_dev.last_seen, Some("2024-01-02T00:00:00Z".to_string()));
+
+        let new_dev = devices.iter().find(|d| d.id == "ble-new").unwrap();
+        assert_eq!(new_dev.name, Some("HRM".to_string()));
     }
 
     #[tokio::test]

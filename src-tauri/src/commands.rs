@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::broadcast;
 
 use crate::device::manager::DeviceManager;
@@ -73,14 +73,20 @@ pub struct AppState {
 }
 
 #[tauri::command]
-pub async fn scan_devices(state: State<'_, AppState>) -> Result<Vec<DeviceInfo>, AppError> {
+pub async fn scan_devices(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<DeviceInfo>, AppError> {
     let mut dm = state.device_manager.lock().await;
-    dm.scan_all().await
+    let devices = dm.scan_all().await?;
+    let _ = app.emit("device_list_updated", &devices);
+    Ok(devices)
 }
 
 #[tauri::command]
 pub async fn connect_device(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     device_id: String,
 ) -> Result<DeviceInfo, AppError> {
     let tx = state.sensor_tx.clone();
@@ -93,12 +99,16 @@ pub async fn connect_device(
         auto_set_primary(&mut primaries, info.device_type, &device_id);
     }
 
+    let all = dm.list_current().await;
+    let _ = app.emit("device_list_updated", &all);
+
     Ok(info)
 }
 
 #[tauri::command]
 pub async fn disconnect_device(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     device_id: String,
 ) -> Result<(), AppError> {
     {
@@ -107,7 +117,12 @@ pub async fn disconnect_device(
     }
     let mut dm = state.device_manager.lock().await;
     dm.clear_reconnect_target(&device_id);
-    dm.disconnect(&device_id).await
+    dm.disconnect(&device_id).await?;
+
+    let all = dm.list_current().await;
+    let _ = app.emit("device_list_updated", &all);
+
+    Ok(())
 }
 
 #[tauri::command]
