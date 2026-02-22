@@ -1,6 +1,6 @@
 use log::{info, warn};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -46,6 +46,10 @@ pub struct AntManager {
     connected: HashMap<String, ActiveConnection>,
     /// Metadata from ANT+ Common Data Pages, keyed by device_id
     device_metadata: Arc<Mutex<HashMap<String, AntDeviceMetadata>>>,
+    /// Lock-free last-data-received timestamps for the connection watchdog.
+    /// Each device gets an Arc<AtomicI64> storing nanos since Instant epoch.
+    /// Written by listeners on every ANT+ page without locking.
+    last_seen: Arc<Mutex<HashMap<String, Arc<AtomicI64>>>>,
 }
 
 impl AntManager {
@@ -99,6 +103,7 @@ impl AntManager {
             discovered: HashMap::new(),
             connected: HashMap::new(),
             device_metadata: Arc::new(Mutex::new(HashMap::new())),
+            last_seen: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -315,8 +320,15 @@ impl AntManager {
         let did = device_id.to_string();
         let metadata = self.device_metadata.clone();
 
+        // Create lock-free timestamp for this device's watchdog heartbeat
+        let last_seen_ts = Arc::new(AtomicI64::new(0));
+        {
+            let mut ls = self.last_seen.lock().unwrap();
+            ls.insert(device_id.to_string(), last_seen_ts.clone());
+        }
+
         let listener_handle = tokio::task::spawn_blocking(move || {
-            listen_ant_channel(data_rx, device_type, tx, stop_clone, did, metadata, dtype_id);
+            listen_ant_channel(data_rx, device_type, tx, stop_clone, did, metadata, dtype_id, last_seen_ts);
         });
 
         let info = DeviceInfo {
@@ -385,6 +397,11 @@ impl AntManager {
     /// Get a clone of the metadata store Arc (for the connection watchdog)
     pub fn metadata_store(&self) -> Arc<Mutex<HashMap<String, AntDeviceMetadata>>> {
         self.device_metadata.clone()
+    }
+
+    /// Get a clone of the lock-free last-seen timestamp store (for the connection watchdog)
+    pub fn last_seen_store(&self) -> Arc<Mutex<HashMap<String, Arc<AtomicI64>>>> {
+        self.last_seen.clone()
     }
 
     /// Get the USB handle and channel number for a connected FE-C device (for trainer control)

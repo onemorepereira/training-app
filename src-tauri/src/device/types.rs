@@ -163,8 +163,6 @@ pub struct AntDeviceMetadata {
     pub serial_number: Option<u32>,
     pub battery_level: Option<u8>,
     pub battery_voltage: Option<f32>,
-    /// Updated on every received ANT+ data page (for connection watchdog)
-    pub last_data_received: Option<Instant>,
 }
 
 impl SensorReading {

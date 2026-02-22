@@ -1,6 +1,7 @@
 use btleplug::api::Peripheral as _;
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -40,6 +41,8 @@ pub struct DeviceManager {
     storage: Option<Arc<Storage>>,
     /// Cached ANT+ metadata store (survives take/put-back of AntManager)
     ant_metadata: Option<Arc<StdMutex<HashMap<String, AntDeviceMetadata>>>>,
+    /// Lock-free ANT+ last-seen timestamps (survives take/put-back of AntManager)
+    ant_last_seen: Option<Arc<StdMutex<HashMap<String, Arc<AtomicI64>>>>>,
     /// BLE listener task handles (keyed by device_id)
     listener_handles: HashMap<String, JoinHandle<()>>,
     /// Auto-reconnect engine for dropped devices
@@ -57,6 +60,7 @@ impl DeviceManager {
             connected_devices: HashMap::new(),
             storage: None,
             ant_metadata: None,
+            ant_last_seen: None,
             listener_handles: HashMap::new(),
             reconnect: ReconnectManager::new(),
         }
@@ -70,6 +74,7 @@ impl DeviceManager {
     fn set_ant(&mut self, ant: Option<AntManager>) {
         if let Some(ref a) = ant {
             self.ant_metadata = Some(a.metadata_store());
+            self.ant_last_seen = Some(a.last_seen_store());
             self.ant_was_available = true;
             self.ant_probe_failed = false;
         }
@@ -467,9 +472,9 @@ impl DeviceManager {
             }
         }
 
-        // Check ANT+ staleness via last_data_received timestamps
-        if let Some(ref meta_store) = self.ant_metadata {
-            let meta = meta_store.lock().unwrap_or_else(|e| e.into_inner());
+        // Check ANT+ staleness via lock-free last-seen timestamps
+        if let Some(ref last_seen_store) = self.ant_last_seen {
+            let last_seen = last_seen_store.lock().unwrap_or_else(|e| e.into_inner());
             let ant_ids: Vec<String> = self
                 .connected_devices
                 .keys()
@@ -477,15 +482,15 @@ impl DeviceManager {
                 .cloned()
                 .collect();
             for id in ant_ids {
-                if let Some(m) = meta.get(&id) {
-                    if let Some(last) = m.last_data_received {
-                        if last.elapsed() > std::time::Duration::from_secs(ANT_STALE_SECS) {
+                if let Some(ts) = last_seen.get(&id) {
+                    if let Some(elapsed) = super::ant_listener::atomic_elapsed(ts) {
+                        if elapsed > std::time::Duration::from_secs(ANT_STALE_SECS) {
                             if let Some(info) = self.connected_devices.get(&id) {
                                 disconnected.push(info.clone());
                             }
                         }
                     }
-                    // No last_data_received yet → just connected, give it time
+                    // No timestamp yet (0) → just connected, give it time
                 }
             }
         }

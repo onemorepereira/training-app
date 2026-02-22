@@ -120,7 +120,7 @@ pub fn run() {
 
             log::info!("Logging to {}", log_dir.display());
 
-            let (sensor_tx, _) = broadcast::channel(256);
+            let (sensor_tx, _) = broadcast::channel(1024);
             let app_handle = app.handle().clone();
 
             let state = tauri::async_runtime::block_on(async {

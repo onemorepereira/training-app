@@ -1,11 +1,33 @@
 use log::{info, warn};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use super::ant_protocol::{AntDecoder, DEFAULT_WHEEL_CIRCUMFERENCE_MM};
 use super::types::{AntDeviceMetadata, DeviceType, SensorReading};
+
+/// Monotonic reference epoch for lock-free timestamps.
+/// All `last_seen` values are stored as nanos elapsed since this instant.
+static EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Store the current time as nanos-since-EPOCH into an AtomicI64.
+pub fn atomic_now(ts: &AtomicI64) {
+    let nanos = EPOCH.elapsed().as_nanos() as i64;
+    ts.store(nanos, Ordering::Relaxed);
+}
+
+/// Read an AtomicI64 timestamp and return how long ago it was, or None if never set (0).
+pub fn atomic_elapsed(ts: &AtomicI64) -> Option<std::time::Duration> {
+    let nanos = ts.load(Ordering::Relaxed);
+    if nanos == 0 {
+        return None;
+    }
+    let now_nanos = EPOCH.elapsed().as_nanos() as i64;
+    let elapsed_nanos = (now_nanos - nanos).max(0) as u64;
+    Some(std::time::Duration::from_nanos(elapsed_nanos))
+}
 
 /// Decode ANT+ Common Data Page 80: Manufacturer's Information
 /// Byte 3: HW revision
@@ -64,6 +86,7 @@ pub fn listen_ant_channel(
     device_id: String,
     metadata_store: Arc<Mutex<HashMap<String, AntDeviceMetadata>>>,
     device_type_id: u8,
+    last_seen: Arc<AtomicI64>,
 ) {
     let mut decoder = AntDecoder::new();
 
@@ -89,23 +112,21 @@ pub fn listen_ant_channel(
             Err(_) => continue,
         };
 
-        // Update last-data timestamp for connection watchdog (every page, not just common)
+        // Update last-data timestamp for connection watchdog (lock-free, every page)
         let page_num = data[0];
-        {
+        atomic_now(&last_seen);
+
+        // Decode ANT+ Common Data Pages — only lock metadata for these rare pages
+        if page_num == 0x50 || page_num == 0x51 || page_num == 0x52 {
             let mut store = metadata_store.lock().unwrap_or_else(|e| e.into_inner());
             let meta = store.entry(device_id.clone()).or_default();
-            meta.last_data_received = Some(std::time::Instant::now());
-
-            // Decode ANT+ Common Data Pages (broadcast by all ANT+ devices)
-            if page_num == 0x50 || page_num == 0x51 || page_num == 0x52 {
-                match page_num {
-                    0x50 => decode_common_page_80(&data, meta),
-                    0x51 => decode_common_page_81(&data, meta),
-                    0x52 => decode_common_page_82(&data, meta),
-                    _ => {}
-                }
-                continue;
+            match page_num {
+                0x50 => decode_common_page_80(&data, meta),
+                0x51 => decode_common_page_81(&data, meta),
+                0x52 => decode_common_page_82(&data, meta),
+                _ => {}
             }
+            continue;
         }
 
         let readings: Vec<SensorReading> = match device_type {
