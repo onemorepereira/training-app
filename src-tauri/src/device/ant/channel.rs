@@ -1,5 +1,5 @@
-use super::ant_usb::*;
-use super::types::DeviceType;
+use super::usb::*;
+use crate::device::types::DeviceType;
 use crate::error::AppError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

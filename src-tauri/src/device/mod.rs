@@ -1,8 +1,4 @@
-pub mod ant_channel;
-pub mod ant_listener;
-pub mod ant_manager;
-pub mod ant_protocol;
-pub mod ant_usb;
+pub mod ant;
 pub mod ble;
 pub mod dedup;
 pub mod fec;

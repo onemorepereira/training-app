@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-use super::ant_protocol::{AntDecoder, DEFAULT_WHEEL_CIRCUMFERENCE_MM};
-use super::types::{is_dominated, AntDeviceMetadata, DeviceType, SensorReading};
+use super::protocol::{AntDecoder, DEFAULT_WHEEL_CIRCUMFERENCE_MM};
+use crate::device::types::{is_dominated, AntDeviceMetadata, DeviceType, SensorReading};
 
 /// Monotonic reference epoch for lock-free timestamps.
 /// All `last_seen` values are stored as nanos elapsed since this instant.

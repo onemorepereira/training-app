@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use super::ant_channel::*;
-use super::ant_listener::listen_ant_channel;
-use super::ant_usb::*;
-use super::types::*;
+use super::channel::*;
+use super::listener::listen_ant_channel;
+use super::usb::*;
+use crate::device::types::*;
 use crate::error::AppError;
 
 /// Information about a discovered ANT+ device

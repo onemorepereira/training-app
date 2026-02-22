@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use super::ant_manager::AntManager;
-use super::ant_usb::AntUsb;
+use super::ant::manager::AntManager;
+use super::ant::usb::AntUsb;
 use super::ble::BleManager;
 use super::dedup::compute_device_groups;
 use super::fec::FecController;
@@ -516,7 +516,7 @@ impl DeviceManager {
                 .collect();
             for id in ant_ids {
                 if let Some(ts) = last_seen.get(&id) {
-                    if let Some(elapsed) = super::ant_listener::atomic_elapsed(ts) {
+                    if let Some(elapsed) = super::ant::listener::atomic_elapsed(ts) {
                         if elapsed > std::time::Duration::from_secs(config::ANT_STALE_SECS) {
                             if let Some(info) = self.connected_devices.get(&id) {
                                 disconnected.push(info.clone());
