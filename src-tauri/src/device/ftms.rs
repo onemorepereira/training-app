@@ -5,7 +5,7 @@ use log::{info, warn};
 use tokio::time::{sleep, timeout, Duration};
 
 use super::protocol::FTMS_CONTROL_POINT;
-use crate::error::AppError;
+use crate::error::{AppError, BleError};
 
 const REQUEST_CONTROL: u8 = 0x00;
 const SET_TARGET_RESISTANCE: u8 = 0x04;
@@ -66,7 +66,7 @@ impl TrainerController {
             .iter()
             .find(|c| c.uuid == FTMS_CONTROL_POINT)
             .cloned()
-            .ok_or_else(|| AppError::Ble("FTMS Control Point not found".into()))?;
+            .ok_or_else(|| BleError::CharacteristicNotFound("FTMS Control Point".into()))?;
         Ok(Self {
             peripheral,
             control_point,
@@ -87,7 +87,7 @@ impl TrainerController {
             self.peripheral
                 .subscribe(&self.control_point)
                 .await
-                .map_err(|e| AppError::Ble(format!("Failed to subscribe to FTMS CP: {}", e)))?;
+                .map_err(|e| BleError::Btleplug(format!("Failed to subscribe to FTMS CP: {}", e)))?;
             self.indications_enabled = true;
             info!("FTMS: indications enabled on Control Point");
             // Give the trainer time to process the CCCD write
@@ -151,13 +151,13 @@ impl TrainerController {
             .peripheral
             .notifications()
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to get notification stream: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to get notification stream: {}", e)))?;
 
         // Write the command
         self.peripheral
             .write(&self.control_point, data, WriteType::WithResponse)
             .await
-            .map_err(|e| AppError::Ble(format!("Failed to write FTMS control: {}", e)))?;
+            .map_err(|e| BleError::Btleplug(format!("Failed to write FTMS control: {}", e)))?;
 
         // Wait up to 2s for the control point indication response
         let indication = timeout(Duration::from_secs(2), async {
@@ -185,10 +185,10 @@ impl TrainerController {
                         0x05 => "Control not permitted",
                         _ => "Unknown error",
                     };
-                    return Err(AppError::Ble(format!(
+                    return Err(BleError::Btleplug(format!(
                         "Trainer rejected command 0x{:02X}: {}",
                         op_code, msg
-                    )));
+                    )).into());
                 }
             }
             Ok(None) => {

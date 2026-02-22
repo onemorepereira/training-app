@@ -1,11 +1,41 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+pub enum BleError {
+    #[error("BLE not initialized")]
+    NotInitialized,
+    #[error("No BLE adapter found")]
+    NoAdapter,
+    #[error("No recognized services on device {0}")]
+    UnrecognizedDevice(String),
+    #[error("Characteristic not found: {0}")]
+    CharacteristicNotFound(String),
+    #[error("{0}")]
+    Btleplug(String),
+}
+
+#[derive(Error, Debug)]
+pub enum AntError {
+    #[error("No ANT+ USB stick found")]
+    NoUsbStick,
+    #[error("All ANT+ channels in use ({0})")]
+    NoFreeChannel(String),
+    #[error("Not supported: {0}")]
+    NotSupported(String),
+    #[error("ANT+ task panicked: {0}")]
+    TaskPanicked(String),
+    #[error("{0}")]
+    Usb(String),
+    #[error("{0}")]
+    Channel(String),
+}
+
+#[derive(Error, Debug)]
 pub enum AppError {
     #[error("BLE error: {0}")]
-    Ble(String),
+    Ble(#[from] BleError),
     #[error("ANT+ error: {0}")]
-    AntPlus(String),
+    AntPlus(#[from] AntError),
     #[error("Device not found: {0}")]
     DeviceNotFound(String),
     #[error("Database error: {0}")]

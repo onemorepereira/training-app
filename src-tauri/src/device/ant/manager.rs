@@ -10,7 +10,7 @@ use super::channel::*;
 use super::listener::listen_ant_channel;
 use super::usb::*;
 use crate::device::types::*;
-use crate::error::AppError;
+use crate::error::{AntError, AppError};
 
 /// Information about a discovered ANT+ device
 #[derive(Debug, Clone)]
@@ -117,11 +117,11 @@ impl AntManager {
                 return Ok(ch);
             }
         }
-        Err(AppError::AntPlus(format!(
-            "All ANT+ channels in use ({} connected, {} reserved for scanning)",
+        Err(AntError::NoFreeChannel(format!(
+            "{} connected, {} reserved for scanning",
             used.len(),
             reserved
-        )))
+        )).into())
     }
 
     /// Scan for ANT+ devices. Opens wildcard channels for each profile,

@@ -15,7 +15,7 @@ use super::ftms::TrainerController;
 use super::listener::listen_to_device;
 use super::reconnect::ReconnectManager;
 use super::types::*;
-use crate::error::AppError;
+use crate::error::{AntError, AppError, BleError};
 use crate::session::storage::Storage;
 
 enum TrainerBackend {
@@ -132,7 +132,7 @@ impl DeviceManager {
         let mut ant = self
             .ant
             .take()
-            .ok_or_else(|| AppError::AntPlus("No ANT+ USB stick found".into()))?;
+            .ok_or_else(|| AppError::from(AntError::NoUsbStick))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let r = f(&mut ant);
@@ -150,7 +150,7 @@ impl DeviceManager {
                 // ant is already None from take(); ant_was_available remains true
                 // so ensure_ant() will reinit on next use.
                 log::error!("[ant+] Blocking task panicked: {}", e);
-                Err(AppError::AntPlus(format!("ANT+ task panicked: {}", e)))
+                Err(AntError::TaskPanicked(format!("{}", e)).into())
             }
         }
     }
@@ -328,7 +328,7 @@ impl DeviceManager {
         if self.ble.is_none() {
             match BleManager::new().await {
                 Ok(mgr) => self.ble = Some(mgr),
-                Err(e) => return Err(AppError::Ble(format!("BLE init failed: {}", e))),
+                Err(e) => return Err(BleError::Btleplug(format!("BLE init failed: {}", e)).into()),
             }
         }
         let ble = self.ble.as_ref().unwrap();
@@ -462,7 +462,7 @@ impl DeviceManager {
             let ble = self
                 .ble
                 .as_ref()
-                .ok_or_else(|| AppError::Ble("BLE not initialized".into()))?;
+                .ok_or_else(|| BleError::NotInitialized)?;
             ble.disconnect_device(device_id).await?;
         }
         info!("[{}] Disconnected", device_id);
@@ -601,7 +601,7 @@ impl DeviceManager {
                     fec.set_target_power(w)
                 })
                 .await
-                .map_err(|e| AppError::AntPlus(format!("FEC task failed: {}", e)))?
+                .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?
             }
             None => Err(AppError::Session("No trainer connected".into())),
         };
@@ -625,7 +625,7 @@ impl DeviceManager {
                     fec.set_resistance(lvl)
                 })
                 .await
-                .map_err(|e| AppError::AntPlus(format!("FEC task failed: {}", e)))?
+                .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?
             }
             None => Err(AppError::Session("No trainer connected".into())),
         };
@@ -654,7 +654,7 @@ impl DeviceManager {
                     fec.set_simulation(grade, crr, cw)
                 })
                 .await
-                .map_err(|e| AppError::AntPlus(format!("FEC task failed: {}", e)))?
+                .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?
             }
             None => Err(AppError::Session("No trainer connected".into())),
         };
@@ -668,7 +668,7 @@ impl DeviceManager {
         match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => controller.start().await,
             Some(TrainerBackend::Fec { .. }) => {
-                Err(AppError::AntPlus("Start/stop not supported for ANT+ trainers".into()))
+                Err(AntError::NotSupported("start/stop for ANT+ trainers".into()).into())
             }
             None => Err(AppError::Session("No trainer connected".into())),
         }
@@ -678,7 +678,7 @@ impl DeviceManager {
         match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => controller.stop().await,
             Some(TrainerBackend::Fec { .. }) => {
-                Err(AppError::AntPlus("Start/stop not supported for ANT+ trainers".into()))
+                Err(AntError::NotSupported("start/stop for ANT+ trainers".into()).into())
             }
             None => Err(AppError::Session("No trainer connected".into())),
         }
@@ -724,7 +724,7 @@ impl DeviceManager {
             })
         } else {
             let ble = self.ble.as_ref()
-                .ok_or_else(|| AppError::Ble("BLE not initialized".into()))?;
+                .ok_or_else(|| BleError::NotInitialized)?;
             ble.get_device_details(device_id).await
         }
     }

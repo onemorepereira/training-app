@@ -1,6 +1,6 @@
 use super::usb::*;
 use crate::device::types::DeviceType;
-use crate::error::AppError;
+use crate::error::{AntError, AppError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -268,19 +268,19 @@ pub fn poll_response(
                 if code == RESPONSE_NO_ERROR {
                     return Ok(());
                 } else {
-                    return Err(AppError::AntPlus(format!(
+                    return Err(AntError::Channel(format!(
                         "ANT ch{} command {:#x} failed with code {:#x}",
                         channel_number, expected_msg_id, code
-                    )));
+                    )).into());
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    Err(AppError::AntPlus(format!(
+    Err(AntError::Channel(format!(
         "Timeout waiting for ch{} response to {:#x}",
         channel_number, expected_msg_id
-    )))
+    )).into())
 }
 
 /// Wait for a channel response by reading directly from USB.
@@ -296,17 +296,17 @@ fn wait_for_response_direct(usb: &AntUsb, expected_msg_id: u8) -> Result<(), App
                     if code == RESPONSE_NO_ERROR {
                         return Ok(());
                     } else {
-                        return Err(AppError::AntPlus(format!(
+                        return Err(AntError::Channel(format!(
                             "ANT command {:#x} failed with code {:#x}",
                             expected_msg_id, code
-                        )));
+                        )).into());
                     }
                 }
             }
         }
     }
-    Err(AppError::AntPlus(format!(
+    Err(AntError::Channel(format!(
         "Timeout waiting for response to {:#x}",
         expected_msg_id
-    )))
+    )).into())
 }
