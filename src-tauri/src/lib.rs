@@ -220,7 +220,7 @@ pub fn run() {
                                 let _ =
                                     handle.emit("device_reconnecting", &serde_json::json!({
                                         "device_id": info.id,
-                                        "device_type": format!("{:?}", info.device_type),
+                                        "device_type": info.device_type.as_str(),
                                         "attempt": attempt,
                                     }));
                             }
