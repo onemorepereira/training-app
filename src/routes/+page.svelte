@@ -229,6 +229,12 @@
         <input type="checkbox" bind:checked={$autoSessionEnabled} />
         <span class="auto-toggle-label">Auto</span>
       </label>
+      {#if $zoneActive}
+        <span class="zone-active-badge">
+          <span class="zone-active-dot"></span>
+          Zone Ride
+        </span>
+      {/if}
     </div>
 
     <!-- Trainer controls -->
@@ -536,6 +542,29 @@
     font-size: var(--text-sm);
     font-weight: 600;
     color: var(--text-secondary);
+  }
+
+  .zone-active-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: var(--space-xs) var(--space-md);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    animation: slide-up 200ms ease;
+  }
+
+  .zone-active-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 2s ease-in-out infinite;
   }
 
   .btn-zone-toggle {
