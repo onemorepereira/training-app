@@ -120,7 +120,7 @@ pub fn open_channel(
         std::thread::sleep(Duration::from_millis(200));
         // Drain close-related responses
         {
-            let mut queue = response_queue.lock().unwrap();
+            let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.retain(|msg| {
                 !(msg.msg_id == MSG_CHANNEL_RESPONSE && msg.data.first() == Some(&ch))
             });
@@ -132,7 +132,7 @@ pub fn open_channel(
         std::thread::sleep(Duration::from_millis(100));
         // Drain unassign response
         {
-            let mut queue = response_queue.lock().unwrap();
+            let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.retain(|msg| {
                 !(msg.msg_id == MSG_CHANNEL_RESPONSE && msg.data.first() == Some(&ch))
             });
@@ -208,7 +208,7 @@ pub fn close_channel(
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         {
-            let mut queue = response_queue.lock().unwrap();
+            let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(pos) = queue.iter().position(|msg| {
                 msg.msg_id == MSG_CHANNEL_RESPONSE
                     && msg.data.len() >= 3
@@ -256,7 +256,7 @@ pub fn poll_response(
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         {
-            let mut queue = response_queue.lock().unwrap();
+            let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(pos) = queue.iter().position(|msg| {
                 msg.msg_id == MSG_CHANNEL_RESPONSE
                     && msg.data.len() >= 3
