@@ -10,8 +10,16 @@ pub const LIVE_METRICS_PUSH_MS: u64 = 250;
 /// BLE scan duration — how long a BLE scan runs before returning results.
 pub const BLE_SCAN_DURATION_SECS: u64 = 3;
 
-/// ANT+ staleness threshold — device considered disconnected after this many seconds without data.
-pub const ANT_STALE_SECS: u64 = 10;
+/// Device disconnect timeout — ANT+ device considered lost after this many seconds
+/// without data. Intentionally longer than READING_FRESHNESS_SECS: we stop using
+/// stale data for metrics quickly (5s) but give the device more time (10s) before
+/// triggering disconnect/reconnect logic.
+pub const DEVICE_DISCONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Reading freshness window — readings older than this are ignored by the session
+/// metrics engine. Shorter than DEVICE_DISCONNECT_TIMEOUT_SECS so metrics stay
+/// responsive even while the watchdog still considers the device connected.
+pub const READING_FRESHNESS_SECS: u64 = 5;
 
 /// Reconnect initial backoff — delay before first reconnect attempt.
 pub const RECONNECT_INITIAL_BACKOFF_MS: u64 = 2000;
