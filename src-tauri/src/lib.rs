@@ -176,7 +176,6 @@ pub fn run() {
                 // the auto-reconnect engine.
                 {
                     let dm = device_manager.clone();
-                    let primaries = primary_devices.clone();
                     let handle = app_handle.clone();
                     let sensor_tx_clone = sensor_tx.clone();
                     tokio::spawn(async move {
@@ -189,14 +188,6 @@ pub fn run() {
                             };
 
                             if !disconnected.is_empty() {
-                                // Clean up primaries
-                                {
-                                    let mut p = primaries.write().unwrap();
-                                    let ids: Vec<String> =
-                                        disconnected.iter().map(|i| i.id.clone()).collect();
-                                    p.retain(|_, v| !ids.contains(v));
-                                }
-
                                 // Emit disconnect events to frontend
                                 for info in &disconnected {
                                     let _ = handle.emit("device_disconnected", &info.id);
@@ -218,9 +209,6 @@ pub fn run() {
 
                             for info in &reconnected {
                                 let _ = handle.emit("device_reconnected", &info.id);
-                                let mut p = primaries.write().unwrap();
-                                p.entry(info.device_type)
-                                    .or_insert_with(|| info.id.clone());
                             }
 
                             if !reconnected.is_empty() {

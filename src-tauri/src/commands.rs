@@ -26,22 +26,6 @@ pub(crate) fn validate_session_id(id: &str) -> Result<(), AppError> {
     }
 }
 
-/// Set device as primary for its type if no primary exists yet.
-fn auto_set_primary(
-    primaries: &mut HashMap<DeviceType, String>,
-    device_type: DeviceType,
-    device_id: &str,
-) {
-    primaries
-        .entry(device_type)
-        .or_insert_with(|| device_id.to_owned());
-}
-
-/// Remove all primary entries that reference the given device.
-fn remove_primary(primaries: &mut HashMap<DeviceType, String>, device_id: &str) {
-    primaries.retain(|_, v| v != device_id);
-}
-
 /// Validate that zone boundaries are strictly ascending.
 fn validate_zones_ascending<T: PartialOrd>(zones: &[T], label: &str) -> Result<(), AppError> {
     for w in zones.windows(2) {
@@ -93,12 +77,6 @@ pub async fn connect_device(
     let mut dm = state.device_manager.lock().await;
     let info = dm.connect(&device_id, tx).await?;
 
-    // Auto-set as primary if no primary exists for this device type
-    {
-        let mut primaries = state.primary_devices.write().unwrap();
-        auto_set_primary(&mut primaries, info.device_type, &device_id);
-    }
-
     let all = dm.list_current().await;
     let _ = app.emit("device_list_updated", &all);
 
@@ -111,10 +89,6 @@ pub async fn disconnect_device(
     app: tauri::AppHandle,
     device_id: String,
 ) -> Result<(), AppError> {
-    {
-        let mut primaries = state.primary_devices.write().unwrap();
-        remove_primary(&mut primaries, &device_id);
-    }
     let mut dm = state.device_manager.lock().await;
     dm.clear_reconnect_target(&device_id);
     dm.disconnect(&device_id).await?;
@@ -606,63 +580,6 @@ mod tests {
     #[test]
     fn rejects_null_bytes() {
         assert!(validate_session_id("abc\0def").is_err());
-    }
-
-    // --- auto_set_primary ---
-
-    #[test]
-    fn auto_set_primary_first_device_becomes_primary() {
-        let mut primaries = HashMap::new();
-        auto_set_primary(&mut primaries, DeviceType::Power, "dev-1");
-        assert_eq!(primaries[&DeviceType::Power], "dev-1");
-    }
-
-    #[test]
-    fn auto_set_primary_does_not_overwrite_existing() {
-        let mut primaries = HashMap::new();
-        auto_set_primary(&mut primaries, DeviceType::Power, "dev-1");
-        auto_set_primary(&mut primaries, DeviceType::Power, "dev-2");
-        assert_eq!(primaries[&DeviceType::Power], "dev-1");
-    }
-
-    #[test]
-    fn auto_set_primary_different_types_independent() {
-        let mut primaries = HashMap::new();
-        auto_set_primary(&mut primaries, DeviceType::Power, "pm-1");
-        auto_set_primary(&mut primaries, DeviceType::HeartRate, "hr-1");
-        assert_eq!(primaries[&DeviceType::Power], "pm-1");
-        assert_eq!(primaries[&DeviceType::HeartRate], "hr-1");
-    }
-
-    // --- remove_primary ---
-
-    #[test]
-    fn remove_primary_clears_matching_entry() {
-        let mut primaries = HashMap::from([
-            (DeviceType::Power, "dev-1".to_owned()),
-            (DeviceType::HeartRate, "hr-1".to_owned()),
-        ]);
-        remove_primary(&mut primaries, "dev-1");
-        assert!(!primaries.contains_key(&DeviceType::Power));
-        assert_eq!(primaries[&DeviceType::HeartRate], "hr-1");
-    }
-
-    #[test]
-    fn remove_primary_noop_for_unknown_device() {
-        let mut primaries = HashMap::from([(DeviceType::Power, "dev-1".to_owned())]);
-        remove_primary(&mut primaries, "nonexistent");
-        assert_eq!(primaries.len(), 1);
-    }
-
-    #[test]
-    fn remove_primary_clears_all_types_for_same_device() {
-        // Edge case: same device_id registered under two types
-        let mut primaries = HashMap::from([
-            (DeviceType::Power, "multi-dev".to_owned()),
-            (DeviceType::CadenceSpeed, "multi-dev".to_owned()),
-        ]);
-        remove_primary(&mut primaries, "multi-dev");
-        assert!(primaries.is_empty());
     }
 
     // --- validate_zones_ascending ---
