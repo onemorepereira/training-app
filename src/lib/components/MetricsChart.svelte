@@ -165,7 +165,12 @@
   onMount(() => {
     let observer: ResizeObserver | undefined;
     let disposed = false;
-    document.fonts.ready.then(() => {
+
+    // Use rAF to ensure the container has been laid out before initializing
+    // echarts. The previous `document.fonts.ready` approach could fire before
+    // the browser had assigned dimensions to the container, giving echarts a
+    // 0×0 canvas that never painted.
+    requestAnimationFrame(() => {
       if (disposed) return;
       chart = echarts.init(chartEl, undefined, { renderer: 'canvas' });
       chart.setOption(getBaseOption());
@@ -196,6 +201,13 @@
     const history = $metricHistory;
     const units = $unitSystem;
     if (!chart || history.length === 0) return;
+
+    // Ensure echarts knows the container's current size (handles cases where
+    // the chart was initialised before the container had its final dimensions).
+    const w = chartEl?.clientWidth ?? 0;
+    const h = chartEl?.clientHeight ?? 0;
+    if (w === 0 || h === 0) return;
+    chart.resize({ width: w, height: h });
 
     const now = history[history.length - 1].t;
     const labels = history.map((e) => formatRelativeTime(e.t, now));

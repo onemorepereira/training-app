@@ -183,6 +183,13 @@ export interface ZoneRideConfig {
   time_to_zone_secs: number | null;
 }
 
+export type SimProfile = 'SteadyState' | 'Intervals' | 'Ramp' | 'Stochastic';
+
+export interface SimStatusResponse {
+  status: 'Stopped' | 'Running';
+  profile: SimProfile;
+}
+
 export interface PrereqStatus {
   udev_rules: boolean;
   bluez_installed: boolean;
@@ -259,4 +266,7 @@ export const api = {
   backfillPowerCurves: () => invoke<number>('backfill_power_curves'),
   checkPrerequisites: () => invoke<PrereqStatus>('check_prerequisites'),
   fixPrerequisites: () => invoke<FixResult>('fix_prerequisites'),
+  simStart: (profile: SimProfile) => invoke<void>('sim_start', { profile }),
+  simStop: () => invoke<void>('sim_stop'),
+  simStatus: () => invoke<SimStatusResponse>('sim_status'),
 };
