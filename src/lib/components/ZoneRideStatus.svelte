@@ -33,6 +33,13 @@
     return z ? `Z${z} ${m}` : m;
   });
 
+  let modeDescription = $derived.by(() => {
+    if (!$zoneStatus) return '';
+    const z = $zoneStatus.target_zone;
+    const m = $zoneStatus.mode === 'HeartRate' ? 'HR' : 'Power';
+    return z ? `${m} Zone ${z}` : m;
+  });
+
   let remaining = $derived.by(() => {
     if (!$zoneStatus?.duration_secs) return null;
     const left = $zoneStatus.duration_secs - $zoneStatus.elapsed_secs;
@@ -47,6 +54,11 @@
 
 {#if $zoneStatus?.active}
   <div class="zone-status" style="--zone-color: {zoneColor}">
+    <div class="status-header">
+      <span class="ride-type-label">ADAPTIVE ZONE</span>
+      <span class="ride-target-label">{modeDescription}</span>
+    </div>
+
     {#if progress != null}
       <div class="progress-track">
         <div class="progress-fill" style="width: {progress}%"></div>
@@ -73,14 +85,20 @@
       <span class="status-sep"></span>
 
       <span class="time-stat">
+        <span class="time-label">Elapsed</span>
+        <span class="time-value">{formatDuration($zoneStatus.elapsed_secs)}</span>
+      </span>
+
+      <span class="time-stat">
         <span class="time-label">In zone</span>
         <span class="time-value">{formatDuration($zoneStatus.time_in_zone_secs)}</span>
       </span>
 
-      {#if remaining != null}
+      {#if remaining != null && $zoneStatus.duration_secs}
         <span class="time-stat">
           <span class="time-label">Left</span>
           <span class="time-value">{formatDuration(remaining)}</span>
+          <span class="time-total">/ {formatDuration($zoneStatus.duration_secs)}</span>
         </span>
       {/if}
 
@@ -112,6 +130,27 @@
   @keyframes slide-up {
     from { opacity: 0; transform: translateY(4px); }
     to { opacity: 1; transform: translateY(0); }
+  }
+
+  .status-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--space-xs) var(--space-md);
+    border-bottom: 1px solid color-mix(in srgb, var(--zone-color) 15%, var(--border-subtle));
+  }
+
+  .ride-type-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: var(--zone-color);
+  }
+
+  .ride-target-label {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    color: var(--text-muted);
   }
 
   .progress-track {
@@ -211,6 +250,14 @@
     font-variant-numeric: tabular-nums;
     font-weight: 700;
     color: var(--text-primary);
+  }
+
+  .time-total {
+    font-family: var(--font-data);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    font-weight: 500;
   }
 
   .cmd-power {
