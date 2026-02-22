@@ -2,10 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::types::DeviceInfo;
-
-const INITIAL_BACKOFF_MS: u64 = 2000;
-const MAX_BACKOFF_MS: u64 = 30000;
-const BACKOFF_MULTIPLIER: u64 = 2;
+use crate::config;
 
 struct ReconnectTarget {
     info: DeviceInfo,
@@ -35,8 +32,8 @@ impl ReconnectManager {
             info.id.clone(),
             ReconnectTarget {
                 info,
-                next_retry: Instant::now() + Duration::from_millis(INITIAL_BACKOFF_MS),
-                backoff_ms: INITIAL_BACKOFF_MS,
+                next_retry: Instant::now() + Duration::from_millis(config::RECONNECT_INITIAL_BACKOFF_MS),
+                backoff_ms: config::RECONNECT_INITIAL_BACKOFF_MS,
                 attempts: 0,
             },
         );
@@ -58,7 +55,7 @@ impl ReconnectManager {
                 due.push(target.info.clone());
                 target.attempts += 1;
                 target.backoff_ms =
-                    (target.backoff_ms * BACKOFF_MULTIPLIER).min(MAX_BACKOFF_MS);
+                    (target.backoff_ms * config::RECONNECT_BACKOFF_MULTIPLIER).min(config::RECONNECT_MAX_BACKOFF_MS);
                 target.next_retry = now + Duration::from_millis(target.backoff_ms);
             }
         }
