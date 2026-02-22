@@ -77,6 +77,22 @@ impl DeviceManager {
         self.primary_devices = Some(primaries);
     }
 
+    /// Set device as primary for its type if no primary exists yet.
+    fn auto_set_primary(&self, device_type: DeviceType, device_id: &str) {
+        if let Some(ref pd) = self.primary_devices {
+            let mut p = pd.write().unwrap();
+            p.entry(device_type).or_insert_with(|| device_id.to_owned());
+        }
+    }
+
+    /// Remove all primary entries that reference the given device.
+    fn remove_primary(&self, device_id: &str) {
+        if let Some(ref pd) = self.primary_devices {
+            let mut p = pd.write().unwrap();
+            p.retain(|_, v| v != device_id);
+        }
+    }
+
     /// Set AntManager and cache its metadata store
     fn set_ant(&mut self, ant: Option<AntManager>) {
         if let Some(ref a) = ant {
@@ -369,6 +385,7 @@ impl DeviceManager {
 
         self.connected_devices
             .insert(device_id.to_string(), info.clone());
+        self.auto_set_primary(info.device_type, device_id);
         Ok(info)
     }
 
@@ -414,11 +431,13 @@ impl DeviceManager {
 
         self.connected_devices
             .insert(device_id.to_string(), info.clone());
+        self.auto_set_primary(info.device_type, device_id);
         Ok(info)
     }
 
     /// Disconnect a device
     pub async fn disconnect(&mut self, device_id: &str) -> Result<(), AppError> {
+        self.remove_primary(device_id);
         if let Some(handle) = self.listener_handles.remove(device_id) {
             handle.abort();
         }
@@ -505,6 +524,7 @@ impl DeviceManager {
         // Clean up internal state for all disconnected devices
         for info in &disconnected {
             warn!("[{}] Connection watchdog: {:?} disconnected", info.id, info.device_type);
+            self.remove_primary(&info.id);
             self.connected_devices.remove(&info.id);
             self.trainer_backends.remove(&info.id);
             if let Some(handle) = self.listener_handles.remove(&info.id) {
@@ -536,6 +556,7 @@ impl DeviceManager {
                 Ok(new_info) => {
                     log::info!("[{}] Reconnected on attempt {}", info.id, attempt);
                     self.reconnect.remove(&info.id);
+                    self.auto_set_primary(new_info.device_type, &new_info.id);
                     reconnected.push(new_info);
                 }
                 Err(e) => {
