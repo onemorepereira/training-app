@@ -48,7 +48,7 @@ pub struct DeviceManager {
     /// Auto-reconnect engine for dropped devices
     reconnect: ReconnectManager,
     /// Shared primary-device map; listeners check this before sending readings
-    primary_devices: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
+    primary_devices: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>,
 }
 
 impl DeviceManager {
@@ -65,7 +65,7 @@ impl DeviceManager {
             ant_last_seen: None,
             listener_handles: HashMap::new(),
             reconnect: ReconnectManager::new(),
-            primary_devices: None,
+            primary_devices: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -73,24 +73,21 @@ impl DeviceManager {
         self.storage = Some(storage);
     }
 
-    pub fn set_primary_devices(&mut self, primaries: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>) {
-        self.primary_devices = Some(primaries);
+    /// Returns a clone of the shared primary-device Arc for external consumers.
+    pub fn primaries_handle(&self) -> Arc<std::sync::RwLock<HashMap<DeviceType, String>>> {
+        self.primary_devices.clone()
     }
 
     /// Set device as primary for its type if no primary exists yet.
     fn auto_set_primary(&self, device_type: DeviceType, device_id: &str) {
-        if let Some(ref pd) = self.primary_devices {
-            let mut p = pd.write().unwrap();
-            p.entry(device_type).or_insert_with(|| device_id.to_owned());
-        }
+        let mut p = self.primary_devices.write().unwrap();
+        p.entry(device_type).or_insert_with(|| device_id.to_owned());
     }
 
     /// Remove all primary entries that reference the given device.
     fn remove_primary(&self, device_id: &str) {
-        if let Some(ref pd) = self.primary_devices {
-            let mut p = pd.write().unwrap();
-            p.retain(|_, v| v != device_id);
-        }
+        let mut p = self.primary_devices.write().unwrap();
+        p.retain(|_, v| v != device_id);
     }
 
     /// Set AntManager and cache its metadata store
@@ -368,7 +365,7 @@ impl DeviceManager {
                 let peripheral = peripheral.clone();
                 let device_type = info.device_type;
                 let did = device_id.to_string();
-                let primaries = self.primary_devices.clone();
+                let primaries = Some(self.primary_devices.clone());
                 drop(connected_lock);
 
                 let handle = tokio::spawn(async move {
@@ -417,7 +414,7 @@ impl DeviceManager {
         }
 
         let id = device_id.to_string();
-        let primaries = self.primary_devices.clone();
+        let primaries = Some(self.primary_devices.clone());
         let info = self
             .with_ant_blocking(move |ant| ant.connect(&id, tx, primaries))
             .await??;
