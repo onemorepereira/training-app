@@ -3,6 +3,8 @@ mod device;
 mod error;
 mod prerequisites;
 mod session;
+#[cfg(not(feature = "production"))]
+mod simulator;
 
 use commands::AppState;
 use device::manager::DeviceManager;
@@ -72,7 +74,7 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -285,6 +287,8 @@ pub fn run() {
                     sensor_tx,
                     primary_devices,
                     zone_controller,
+                    #[cfg(not(feature = "production"))]
+                    simulator: Arc::new(tokio::sync::Mutex::new(simulator::Simulator::new())),
                 }
             });
 
@@ -309,7 +313,12 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![
+        // Two cfg-gated invoke_handler blocks: dev includes simulator commands,
+        // production does not. These command lists must stay in sync.
+        ;
+
+        #[cfg(not(feature = "production"))]
+        let builder = builder.invoke_handler(tauri::generate_handler![
             commands::scan_devices,
             commands::connect_device,
             commands::disconnect_device,
@@ -347,7 +356,53 @@ pub fn run() {
             commands::backfill_power_curves,
             commands::check_prerequisites,
             commands::fix_prerequisites,
-        ])
+            commands::sim_start,
+            commands::sim_stop,
+            commands::sim_status,
+        ]);
+
+        #[cfg(feature = "production")]
+        let builder = builder.invoke_handler(tauri::generate_handler![
+            commands::scan_devices,
+            commands::connect_device,
+            commands::disconnect_device,
+            commands::get_known_devices,
+            commands::get_device_details,
+            commands::start_session,
+            commands::stop_session,
+            commands::pause_session,
+            commands::resume_session,
+            commands::list_sessions,
+            commands::get_session,
+            commands::get_session_analysis,
+            commands::get_user_config,
+            commands::save_user_config,
+            commands::set_trainer_power,
+            commands::set_trainer_resistance,
+            commands::set_trainer_simulation,
+            commands::start_trainer,
+            commands::stop_trainer,
+            commands::export_session_fit,
+            commands::update_session_metadata,
+            commands::delete_session,
+            commands::set_primary_device,
+            commands::get_primary_devices,
+            commands::unlink_devices,
+            commands::start_zone_control,
+            commands::stop_zone_control,
+            commands::pause_zone_control,
+            commands::resume_zone_control,
+            commands::get_zone_control_status,
+            commands::estimate_initial_power,
+            commands::save_zone_ride_config,
+            commands::get_zone_ride_config,
+            commands::get_best_power_curve,
+            commands::backfill_power_curves,
+            commands::check_prerequisites,
+            commands::fix_prerequisites,
+        ]);
+
+        builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

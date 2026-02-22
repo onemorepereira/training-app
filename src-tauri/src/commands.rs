@@ -55,6 +55,8 @@ pub struct AppState {
     pub sensor_tx: broadcast::Sender<SensorReading>,
     pub primary_devices: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>,
     pub zone_controller: Arc<tokio::sync::Mutex<ZoneController>>,
+    #[cfg(not(feature = "production"))]
+    pub simulator: Arc<tokio::sync::Mutex<crate::simulator::Simulator>>,
 }
 
 #[tauri::command]
@@ -568,6 +570,37 @@ pub async fn fix_prerequisites(
     })
     .await
     .map_err(|e| AppError::Session(format!("Prereq fix failed: {}", e)))
+}
+
+#[cfg(not(feature = "production"))]
+#[tauri::command]
+pub async fn sim_start(
+    state: State<'_, AppState>,
+    profile: crate::simulator::SimProfile,
+) -> Result<(), AppError> {
+    info!("Starting simulator: {:?}", profile);
+    let tx = state.sensor_tx.clone();
+    let mut sim = state.simulator.lock().await;
+    sim.start(profile, tx);
+    Ok(())
+}
+
+#[cfg(not(feature = "production"))]
+#[tauri::command]
+pub async fn sim_stop(state: State<'_, AppState>) -> Result<(), AppError> {
+    info!("Stopping simulator");
+    let mut sim = state.simulator.lock().await;
+    sim.stop();
+    Ok(())
+}
+
+#[cfg(not(feature = "production"))]
+#[tauri::command]
+pub async fn sim_status(
+    state: State<'_, AppState>,
+) -> Result<crate::simulator::SimStatusResponse, AppError> {
+    let sim = state.simulator.lock().await;
+    Ok(sim.status())
 }
 
 #[cfg(test)]

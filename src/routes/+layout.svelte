@@ -10,6 +10,7 @@
   import { api } from '$lib/tauri';
   import { listen } from '@tauri-apps/api/event';
   import DeviceStatus from '$lib/components/DeviceStatus.svelte';
+  import DevToolbar from '$lib/components/DevToolbar.svelte';
 
   let { children } = $props();
   let navCollapsed = $state(false);
@@ -142,6 +143,9 @@
   <main class="content">
     {@render children()}
   </main>
+  {#if import.meta.env.DEV}
+    <DevToolbar />
+  {/if}
 </div>
 
 <style>
