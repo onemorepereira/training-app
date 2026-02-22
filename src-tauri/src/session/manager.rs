@@ -9,8 +9,7 @@ use super::metrics::MetricsCalculator;
 use super::types::*;
 use crate::device::types::SensorReading;
 
-/// Data is considered stale after this many seconds without a new reading.
-const STALE_THRESHOLD_SECS: u64 = 5;
+use crate::config;
 
 pub struct SessionManager {
     current_session: Arc<Mutex<Option<ActiveSession>>>,
@@ -173,7 +172,7 @@ impl SessionManager {
     pub async fn get_live_metrics(&self) -> Option<LiveMetrics> {
         let lock = self.current_session.lock().await;
         let session = lock.as_ref()?;
-        let stale_threshold = std::time::Duration::from_secs(STALE_THRESHOLD_SECS);
+        let stale_threshold = std::time::Duration::from_secs(config::READING_FRESHNESS_SECS);
         let is_stale = |last: Option<Instant>| -> bool {
             last.is_some_and(|t| t.elapsed() > stale_threshold)
         };
