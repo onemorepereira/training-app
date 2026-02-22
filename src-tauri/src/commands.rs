@@ -40,11 +40,11 @@ fn validate_zones_ascending<T: PartialOrd>(zones: &[T], label: &str) -> Result<(
     Ok(())
 }
 
-/// Format primary devices map for the frontend (DeviceType debug keys → string keys).
+/// Format primary devices map for the frontend (DeviceType → stable string keys).
 fn format_primaries(primaries: &HashMap<DeviceType, String>) -> HashMap<String, String> {
     primaries
         .iter()
-        .map(|(k, v)| (format!("{:?}", k), v.clone()))
+        .map(|(k, v)| (k.as_str().to_owned(), v.clone()))
         .collect()
 }
 
