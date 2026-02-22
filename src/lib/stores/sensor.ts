@@ -1,7 +1,6 @@
 import { writable, get } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { SensorReading, LiveMetrics } from '$lib/tauri';
-import { api } from '$lib/tauri';
 import { sessionActive, sessionPaused } from '$lib/stores/session';
 
 export const currentPower = writable<number | null>(null);
@@ -26,16 +25,16 @@ let latestHR: number | null = null;
 let latestCadence: number | null = null;
 let latestSpeed: number | null = null;
 
-let metricsInterval: ReturnType<typeof setInterval> | null = null;
-let unlistenFn: (() => void) | null = null;
+let unlistenSensor: (() => void) | null = null;
+let unlistenMetrics: (() => void) | null = null;
 let initializing = false;
 
 export async function startSensorListening() {
-  if (unlistenFn || initializing) return;
+  if (unlistenSensor || initializing) return;
   initializing = true;
 
   try {
-    unlistenFn = await listen<SensorReading>('sensor_reading', (event) => {
+    unlistenSensor = await listen<SensorReading>('sensor_reading', (event) => {
       const reading = event.payload;
       if (reading.Power) { latestPower = reading.Power.watts; currentPower.set(latestPower); }
       if (reading.HeartRate) { latestHR = reading.HeartRate.bpm; currentHR.set(latestHR); }
@@ -50,14 +49,9 @@ export async function startSensorListening() {
       }
     });
 
-    metricsInterval = setInterval(async () => {
-      try {
-        const metrics = await api.getLiveMetrics();
-        liveMetrics.set(metrics);
-      } catch {
-        // Session may not be active
-      }
-    }, 250);
+    unlistenMetrics = await listen<LiveMetrics>('live_metrics', (event) => {
+      liveMetrics.set(event.payload);
+    });
   } finally {
     initializing = false;
   }
@@ -65,13 +59,13 @@ export async function startSensorListening() {
 
 export function stopSensorListening() {
   initializing = false;
-  if (unlistenFn) {
-    unlistenFn();
-    unlistenFn = null;
+  if (unlistenSensor) {
+    unlistenSensor();
+    unlistenSensor = null;
   }
-  if (metricsInterval) {
-    clearInterval(metricsInterval);
-    metricsInterval = null;
+  if (unlistenMetrics) {
+    unlistenMetrics();
+    unlistenMetrics = null;
   }
   liveMetrics.set(null);
   metricHistory.set([]);

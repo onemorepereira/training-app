@@ -283,6 +283,24 @@ pub fn run() {
                     });
                 }
 
+                // Live metrics push task: every 250ms, emit metrics to frontend
+                {
+                    let session_mgr = session_manager.clone();
+                    let handle = app_handle.clone();
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(
+                            tokio::time::Duration::from_millis(250),
+                        );
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            interval.tick().await;
+                            if let Some(metrics) = session_mgr.get_live_metrics().await {
+                                let _ = handle.emit("live_metrics", &metrics);
+                            }
+                        }
+                    });
+                }
+
                 let zone_controller = Arc::new(tokio::sync::Mutex::new(ZoneController::new()));
 
                 AppState {
@@ -325,7 +343,6 @@ pub fn run() {
             commands::stop_session,
             commands::pause_session,
             commands::resume_session,
-            commands::get_live_metrics,
             commands::list_sessions,
             commands::get_session,
             commands::get_session_analysis,
