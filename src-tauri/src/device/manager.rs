@@ -80,13 +80,13 @@ impl DeviceManager {
 
     /// Set device as primary for its type if no primary exists yet.
     fn auto_set_primary(&self, device_type: DeviceType, device_id: &str) {
-        let mut p = self.primary_devices.write().unwrap();
+        let mut p = self.primary_devices.write().unwrap_or_else(|e| e.into_inner());
         p.entry(device_type).or_insert_with(|| device_id.to_owned());
     }
 
     /// Remove all primary entries that reference the given device.
     fn remove_primary(&self, device_id: &str) {
-        let mut p = self.primary_devices.write().unwrap();
+        let mut p = self.primary_devices.write().unwrap_or_else(|e| e.into_inner());
         p.retain(|_, v| v != device_id);
     }
 

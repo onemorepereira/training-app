@@ -148,7 +148,7 @@ impl AntManager {
         }
         // Drain any leftover responses from cleanup
         {
-            let mut queue = self.response_queue.lock().unwrap();
+            let mut queue = self.response_queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.clear();
         }
 
@@ -176,7 +176,7 @@ impl AntManager {
 
         // Register temporary senders for scan channels so router delivers broadcast data
         let scan_receivers: Vec<(u8, std::sync::mpsc::Receiver<Vec<u8>>)> = {
-            let mut senders = self.channel_senders.lock().unwrap();
+            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
             scan_channels
                 .iter()
                 .map(|(ch, _)| {
@@ -203,7 +203,7 @@ impl AntManager {
 
             // Check the response queue for Channel ID responses
             {
-                let mut queue = self.response_queue.lock().unwrap();
+                let mut queue = self.response_queue.lock().unwrap_or_else(|e| e.into_inner());
                 let mut i = 0;
                 while i < queue.len() {
                     let msg = &queue[i];
@@ -240,7 +240,7 @@ impl AntManager {
 
         // Remove scan senders from router
         {
-            let mut senders = self.channel_senders.lock().unwrap();
+            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
             for (ch, _) in &scan_channels {
                 senders.remove(ch);
             }
@@ -310,7 +310,7 @@ impl AntManager {
         // Create mpsc channel for this device and register with router
         let (data_tx, data_rx) = std::sync::mpsc::channel();
         {
-            let mut senders = self.channel_senders.lock().unwrap();
+            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
             senders.insert(channel_number, data_tx);
         }
 
@@ -324,7 +324,7 @@ impl AntManager {
         // Create lock-free timestamp for this device's watchdog heartbeat
         let last_seen_ts = Arc::new(AtomicI64::new(0));
         {
-            let mut ls = self.last_seen.lock().unwrap();
+            let mut ls = self.last_seen.lock().unwrap_or_else(|e| e.into_inner());
             ls.insert(device_id.to_string(), last_seen_ts.clone());
         }
 
@@ -373,7 +373,7 @@ impl AntManager {
 
             // Remove the sender from the router so the listener's receiver disconnects
             {
-                let mut senders = self.channel_senders.lock().unwrap();
+                let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
                 senders.remove(&conn.channel_number);
             }
 
@@ -430,7 +430,7 @@ impl Drop for AntManager {
 
         // Remove all channel senders to unblock listeners
         {
-            let mut senders = self.channel_senders.lock().unwrap();
+            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
             senders.clear();
         }
     }
@@ -479,14 +479,14 @@ fn router_loop(
                 let channel = msg.data[0];
                 let page_data = msg.data[1..9].to_vec();
 
-                let senders = channel_senders.lock().unwrap();
+                let senders = channel_senders.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(sender) = senders.get(&channel) {
                     // If send fails, the receiver is gone (disconnected); just ignore
                     let _ = sender.send(page_data);
                 }
             } else {
                 // Channel responses, Channel IDs, etc. go to the response queue
-                let mut queue = response_queue.lock().unwrap();
+                let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
                 queue.push(msg);
 
                 // Prevent unbounded growth: keep only the most recent 256 responses

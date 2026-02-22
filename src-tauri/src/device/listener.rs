@@ -87,7 +87,7 @@ pub async fn listen_to_device(
         for reading in readings {
             if let Some(ref p) = primaries {
                 let dominated = {
-                    let guard = p.read().unwrap();
+                    let guard = p.read().unwrap_or_else(|e| e.into_inner());
                     is_dominated(&guard, &reading)
                 };
                 if dominated {
