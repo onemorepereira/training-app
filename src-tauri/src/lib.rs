@@ -211,6 +211,13 @@ pub fn run() {
                                 for info in &disconnected {
                                     let _ = handle.emit("device_disconnected", &info.id);
                                 }
+
+                                // Push updated device list
+                                {
+                                    let dm = dm.lock().await;
+                                    let all = dm.list_current().await;
+                                    let _ = handle.emit("device_list_updated", &all);
+                                }
                             }
 
                             // Attempt reconnects for devices due for retry
@@ -224,6 +231,12 @@ pub fn run() {
                                 let mut p = primaries.lock().await;
                                 p.entry(info.device_type)
                                     .or_insert_with(|| info.id.clone());
+                            }
+
+                            if !reconnected.is_empty() {
+                                let dm = dm.lock().await;
+                                let all = dm.list_current().await;
+                                let _ = handle.emit("device_list_updated", &all);
                             }
 
                             for (info, attempt) in &trying {

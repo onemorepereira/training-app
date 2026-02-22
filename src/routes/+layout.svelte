@@ -3,7 +3,8 @@
   import { page } from '$app/stores';
   import { onMount, onDestroy } from 'svelte';
   import { startSensorListening, stopSensorListening } from '$lib/stores/sensor';
-  import { refreshDevices, handleDeviceDisconnected, handleDeviceReconnecting, handleDeviceReconnected } from '$lib/stores/devices';
+  import { refreshDevices, connectedDevices, handleDeviceDisconnected, handleDeviceReconnecting, handleDeviceReconnected } from '$lib/stores/devices';
+  import type { DeviceInfo } from '$lib/tauri';
   import { initAutoSession, destroyAutoSession } from '$lib/stores/autoSession';
   import { unitSystem } from '$lib/stores/units';
   import { api } from '$lib/tauri';
@@ -45,7 +46,12 @@
     listenPromises.push(
       listen<string>('device_reconnected', (event) => {
         handleDeviceReconnected(event.payload);
-        refreshDevices();
+      })
+    );
+
+    listenPromises.push(
+      listen<DeviceInfo[]>('device_list_updated', (event) => {
+        connectedDevices.set(event.payload);
       })
     );
 

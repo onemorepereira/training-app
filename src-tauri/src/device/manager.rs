@@ -103,6 +103,39 @@ impl DeviceManager {
         self.set_ant(ant);
     }
 
+    /// Run a blocking closure with the AntManager, guaranteeing put-back even on panic.
+    /// Returns Err if no AntManager is available or if spawn_blocking panics.
+    async fn with_ant_blocking<F, R>(&mut self, f: F) -> Result<R, AppError>
+    where
+        F: FnOnce(&mut AntManager) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let mut ant = self
+            .ant
+            .take()
+            .ok_or_else(|| AppError::AntPlus("No ANT+ USB stick found".into()))?;
+
+        let result = tokio::task::spawn_blocking(move || {
+            let r = f(&mut ant);
+            (ant, r)
+        })
+        .await;
+
+        match result {
+            Ok((ant_back, r)) => {
+                self.set_ant(Some(ant_back));
+                Ok(r)
+            }
+            Err(e) => {
+                // spawn_blocking panicked — AntManager is consumed.
+                // ant is already None from take(); ant_was_available remains true
+                // so ensure_ant() will reinit on next use.
+                log::error!("[ant+] Blocking task panicked: {}", e);
+                Err(AppError::AntPlus(format!("ANT+ task panicked: {}", e)))
+            }
+        }
+    }
+
     /// Return known devices from storage, overlaid with current connection state.
     pub async fn list_current(&self) -> Vec<DeviceInfo> {
         let mut devices: HashMap<String, DeviceInfo> = HashMap::new();
@@ -245,12 +278,10 @@ impl DeviceManager {
 
         let result: Vec<DeviceInfo> = discovered.into_values().collect();
 
-        // Persist discovered devices to storage
+        // Persist discovered devices to storage (single transaction)
         if let Some(ref storage) = self.storage {
-            for device in &result {
-                if let Err(e) = storage.upsert_known_device(device).await {
-                    log::warn!("[{}] Failed to persist device: {}", device.id, e);
-                }
+            if let Err(e) = storage.upsert_known_devices_batch(&result).await {
+                log::warn!("Failed to batch-persist devices: {}", e);
             }
         }
 
@@ -347,38 +378,17 @@ impl DeviceManager {
                 .map(|a| !a.is_discovered(device_id))
                 .unwrap_or(true);
             if needs_scan {
-                let mut ant_for_scan = self
-                    .ant
-                    .take()
-                    .ok_or_else(|| AppError::AntPlus("No ANT+ USB stick found".into()))?;
-                let (ant_back, _) = tokio::task::spawn_blocking(move || {
-                    let result = ant_for_scan.scan();
-                    (ant_for_scan, result)
+                self.with_ant_blocking(|ant| {
+                    let _ = ant.scan();
                 })
-                .await
-                .map_err(|e| AppError::AntPlus(format!("ANT scan task failed: {}", e)))?;
-                self.set_ant(Some(ant_back));
+                .await?;
             }
         }
 
-        let mut ant = self
-            .ant
-            .take()
-            .ok_or_else(|| AppError::AntPlus("No ANT+ USB stick found".into()))?;
-
         let id = device_id.to_string();
-        let (ant_back, result) = tokio::task::spawn_blocking(move || {
-            let result = ant.connect(&id, tx);
-            (ant, result)
-        })
-        .await
-        .map_err(|e| AppError::AntPlus(format!("ANT connect task failed: {}", e)))?;
-
-        // ALWAYS put the AntManager back before checking the result,
-        // otherwise a failed connect drops the manager, killing all listeners.
-        self.set_ant(Some(ant_back));
-
-        let info = result?;
+        let info = self
+            .with_ant_blocking(move |ant| ant.connect(&id, tx))
+            .await??;
 
         // If it's a trainer, store FE-C backend
         if let Some(ref ant) = self.ant {
@@ -407,23 +417,11 @@ impl DeviceManager {
         self.connected_devices.remove(device_id);
 
         if device_id.starts_with("ant:") {
-            if let Some(mut ant) = self.ant.take() {
+            if self.ant.is_some() {
                 let id = device_id.to_string();
-                match tokio::task::spawn_blocking(move || {
-                    let result = ant.disconnect(&id);
-                    (ant, result)
-                })
-                .await
-                {
-                    Ok((ant_back, result)) => {
-                        self.set_ant(Some(ant_back));
-                        result
-                    }
-                    Err(e) => {
-                        log::error!("[ant+] Disconnect task panicked: {}", e);
-                        Err(AppError::AntPlus(format!("ANT disconnect failed: {}", e)))
-                    }
-                }
+                self.with_ant_blocking(move |ant| ant.disconnect(&id))
+                    .await??;
+                Ok(())
             } else {
                 Ok(())
             }
