@@ -136,13 +136,14 @@ pub fn run() {
                 }
 
                 let session_manager = Arc::new(SessionManager::new());
-                let primary_devices: Arc<tokio::sync::Mutex<HashMap<crate::device::types::DeviceType, String>>> =
-                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let primary_devices: Arc<std::sync::RwLock<HashMap<crate::device::types::DeviceType, String>>> =
+                    Arc::new(std::sync::RwLock::new(HashMap::new()));
 
                 // I6: Spawn a single global processor task that handles ALL sensor readings.
                 // This replaces the per-device processor tasks that caused duplicate processing.
+                // Non-primary readings are filtered at source (BLE/ANT+ listeners), so every
+                // reading that arrives here is from a primary device.
                 let session_mgr_clone = session_manager.clone();
-                let primaries_clone = primary_devices.clone();
                 let sensor_rx: broadcast::Receiver<crate::device::types::SensorReading> = sensor_tx.subscribe();
                 let handle = app_handle.clone();
                 tokio::spawn(async move {
@@ -150,18 +151,6 @@ pub fn run() {
                     loop {
                         match rx.recv().await {
                             Ok(reading) => {
-                                // Check if this reading's device is the primary for its type
-                                let dominated = {
-                                    let primaries = primaries_clone.lock().await;
-                                    if let Some(primary_id) = primaries.get(&reading.device_type()) {
-                                        !reading.device_id().is_empty() && reading.device_id() != primary_id
-                                    } else {
-                                        false
-                                    }
-                                };
-                                if dominated {
-                                    continue;
-                                }
                                 session_mgr_clone.process_reading(reading.clone()).await;
                                 let _ = handle.emit("sensor_reading", &reading);
                             }
@@ -176,6 +165,7 @@ pub fn run() {
                 let storage = Arc::new(storage);
                 let mut device_manager = DeviceManager::new();
                 device_manager.set_storage(storage.clone());
+                device_manager.set_primary_devices(primary_devices.clone());
 
                 let device_manager = Arc::new(tokio::sync::Mutex::new(device_manager));
 
@@ -201,7 +191,7 @@ pub fn run() {
                             if !disconnected.is_empty() {
                                 // Clean up primaries
                                 {
-                                    let mut p = primaries.lock().await;
+                                    let mut p = primaries.write().unwrap();
                                     let ids: Vec<String> =
                                         disconnected.iter().map(|i| i.id.clone()).collect();
                                     p.retain(|_, v| !ids.contains(v));
@@ -228,7 +218,7 @@ pub fn run() {
 
                             for info in &reconnected {
                                 let _ = handle.emit("device_reconnected", &info.id);
-                                let mut p = primaries.lock().await;
+                                let mut p = primaries.write().unwrap();
                                 p.entry(info.device_type)
                                     .or_insert_with(|| info.id.clone());
                             }

@@ -289,6 +289,7 @@ impl AntManager {
         &mut self,
         device_id: &str,
         tx: broadcast::Sender<SensorReading>,
+        primaries: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
     ) -> Result<DeviceInfo, AppError> {
         let discovered = self
             .discovered
@@ -328,7 +329,7 @@ impl AntManager {
         }
 
         let listener_handle = tokio::task::spawn_blocking(move || {
-            listen_ant_channel(data_rx, device_type, tx, stop_clone, did, metadata, dtype_id, last_seen_ts);
+            listen_ant_channel(data_rx, device_type, tx, stop_clone, did, metadata, dtype_id, last_seen_ts, primaries);
         });
 
         let info = DeviceInfo {

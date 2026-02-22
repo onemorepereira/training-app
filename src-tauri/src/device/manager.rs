@@ -47,6 +47,8 @@ pub struct DeviceManager {
     listener_handles: HashMap<String, JoinHandle<()>>,
     /// Auto-reconnect engine for dropped devices
     reconnect: ReconnectManager,
+    /// Shared primary-device map; listeners check this before sending readings
+    primary_devices: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
 }
 
 impl DeviceManager {
@@ -63,11 +65,16 @@ impl DeviceManager {
             ant_last_seen: None,
             listener_handles: HashMap::new(),
             reconnect: ReconnectManager::new(),
+            primary_devices: None,
         }
     }
 
     pub fn set_storage(&mut self, storage: Arc<Storage>) {
         self.storage = Some(storage);
+    }
+
+    pub fn set_primary_devices(&mut self, primaries: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>) {
+        self.primary_devices = Some(primaries);
     }
 
     /// Set AntManager and cache its metadata store
@@ -345,10 +352,11 @@ impl DeviceManager {
                 let peripheral = peripheral.clone();
                 let device_type = info.device_type;
                 let did = device_id.to_string();
+                let primaries = self.primary_devices.clone();
                 drop(connected_lock);
 
                 let handle = tokio::spawn(async move {
-                    listen_to_device(peripheral, device_type, tx, did).await;
+                    listen_to_device(peripheral, device_type, tx, did, primaries).await;
                 });
                 self.listener_handles.insert(device_id.to_string(), handle);
             } else {
@@ -386,8 +394,9 @@ impl DeviceManager {
         }
 
         let id = device_id.to_string();
+        let primaries = self.primary_devices.clone();
         let info = self
-            .with_ant_blocking(move |ant| ant.connect(&id, tx))
+            .with_ant_blocking(move |ant| ant.connect(&id, tx, primaries))
             .await??;
 
         // If it's a trainer, store FE-C backend
