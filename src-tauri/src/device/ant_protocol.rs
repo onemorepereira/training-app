@@ -1,3 +1,5 @@
+use log::debug;
+
 use super::types::SensorReading;
 
 /// Default wheel circumference in mm (700x25c)
@@ -63,6 +65,7 @@ impl AntDecoder {
     pub fn decode_power(&mut self, data: &[u8; 8], device_id: &str) -> Option<SensorReading> {
         let page = data[0];
         if page != 0x10 {
+            debug!("ANT+ power: unhandled page 0x{:02X} from {}", page, device_id);
             return None; // Only decode standard power page
         }
 
@@ -135,6 +138,7 @@ impl AntDecoder {
         let rpm = (rev_diff as f32 / time_secs) * 60.0;
 
         if rpm > 200.0 || rpm < 0.0 {
+            debug!("ANT+ cadence: out-of-range {:.0} rpm from {}", rpm, device_id);
             return None;
         }
 
@@ -179,6 +183,7 @@ impl AntDecoder {
         let kmh = (distance_m / time_secs) * 3.6;
 
         if kmh > 120.0 || kmh < 0.0 {
+            debug!("ANT+ speed: out-of-range {:.1} km/h from {}", kmh, device_id);
             return None;
         }
 

@@ -1,3 +1,4 @@
+use log::debug;
 use uuid::Uuid as BtUuid;
 
 use super::types::SensorReading;
@@ -49,6 +50,7 @@ pub fn decode_cycling_power(data: &[u8], device_id: &str) -> Option<SensorReadin
     let flags = u16::from_le_bytes([data[0], data[1]]);
     let watts = i16::from_le_bytes([data[2], data[3]]);
     if watts < 0 {
+        debug!("BLE cycling power: negative watts {} from {}", watts, device_id);
         return None;
     }
 
@@ -117,6 +119,9 @@ pub fn decode_csc(
                 let time_secs = time_diff as f32 / 1024.0;
                 let distance_m = rev_diff as f32 * DEFAULT_WHEEL_CIRCUMFERENCE_MM as f32 / 1000.0;
                 let kmh = (distance_m / time_secs) * 3.6;
+                if kmh >= 120.0 {
+                    debug!("BLE CSC: out-of-range wheel speed {:.1} km/h from {}", kmh, device_id);
+                }
                 if kmh > 0.0 && kmh < 120.0 {
                     readings.push(SensorReading::Speed {
                         kmh,
@@ -142,6 +147,9 @@ pub fn decode_csc(
             if time_diff > 0 && rev_diff > 0 {
                 let time_secs = time_diff as f32 / 1024.0;
                 let rpm = (rev_diff as f32 / time_secs) * 60.0;
+                if rpm >= 200.0 {
+                    debug!("BLE CSC: out-of-range cadence {:.0} rpm from {}", rpm, device_id);
+                }
                 if rpm > 0.0 && rpm < 200.0 {
                     readings.push(SensorReading::Cadence {
                         rpm,
@@ -228,6 +236,8 @@ pub fn decode_indoor_bike_data(data: &[u8], device_id: &str) -> Vec<SensorReadin
                     device_id: did.clone(),
                     pedal_balance: None,
                 });
+            } else {
+                debug!("BLE indoor bike: negative power {} from {}", raw_power, device_id);
             }
         }
         offset += 2;

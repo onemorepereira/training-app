@@ -111,6 +111,7 @@ impl SessionManager {
 
     pub async fn pause_session(&self) {
         if let Some(session) = self.current_session.lock().await.as_mut() {
+            info!("Session paused: {}", session.id);
             session.status = SessionStatus::Paused;
             // Clear last_reading_time so resume doesn't count the pause gap
             session.last_reading_time = None;
@@ -119,6 +120,7 @@ impl SessionManager {
 
     pub async fn resume_session(&self) {
         if let Some(session) = self.current_session.lock().await.as_mut() {
+            info!("Session resumed: {}", session.id);
             session.status = SessionStatus::Running;
         }
     }

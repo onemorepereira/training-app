@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use log::info;
+use log::{debug, info, warn};
 use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 
@@ -183,9 +183,9 @@ impl ZoneController {
         {
             let mut dm = device_manager.lock().await;
             if let Some(trainer_id) = dm.connected_trainer_id() {
-                dm.set_target_power(&trainer_id, initial_power as i16)
-                    .await
-                    .ok();
+                if let Err(e) = dm.set_target_power(&trainer_id, initial_power as i16).await {
+                    warn!("Initial trainer power command failed: {}", e);
+                }
             }
         }
 
@@ -416,10 +416,12 @@ async fn process_tick(
     if let Some(zero_since) = s.last_cadence_zero_since {
         if zero_since.elapsed().as_secs() >= CADENCE_ZERO_SECS {
             if s.commanded_power != 0 {
+                warn!("Cadence zero for >{}s — reducing power to 0W", CADENCE_ZERO_SECS);
                 s.commanded_power = 0;
                 s.safety_note = Some("Cadence zero — power reduced".to_string());
                 drop(s);
                 if command_trainer(device_manager, 0, sensor_tx).await.is_err() {
+                    warn!("Trainer disconnected during cadence-zero safety command");
                     let mut s = state.lock().await;
                     s.stop_reason = Some(StopReason::TrainerDisconnected);
                     s.active = false;
@@ -436,6 +438,10 @@ async fn process_tick(
         if let Some(max_hr) = s.max_hr {
             if let Some(hr) = s.last_hr {
                 if hr > max_hr {
+                    warn!(
+                        "HR ceiling exceeded: {} bpm > {} max — reducing to {}W",
+                        hr, max_hr, SAFETY_POWER
+                    );
                     s.commanded_power = SAFETY_POWER;
                     s.safety_note = Some("HR ceiling exceeded".to_string());
                     s.phase = "adjusting".to_string();
@@ -444,6 +450,7 @@ async fn process_tick(
                         .await
                         .is_err()
                     {
+                        warn!("Trainer disconnected during HR ceiling safety command");
                         let mut s = state.lock().await;
                         s.stop_reason = Some(StopReason::TrainerDisconnected);
                         s.active = false;
@@ -460,11 +467,13 @@ async fn process_tick(
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(u64::MAX);
         if hr_lost_secs >= HR_SENSOR_STOP_SECS {
+            warn!("HR sensor lost for {}s — stopping zone control", hr_lost_secs);
             s.stop_reason = Some(StopReason::SensorLost);
             s.safety_note = Some("HR sensor lost".to_string());
             s.active = false;
             return true;
         } else if hr_lost_secs >= HR_SENSOR_WARN_SECS {
+            warn!("HR sensor not responding for {}s — holding power", hr_lost_secs);
             s.safety_note = Some("HR sensor not responding — holding power".to_string());
             // Hold current power, don't adjust
             return false;
@@ -478,6 +487,7 @@ async fn process_tick(
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(u64::MAX);
         if power_lost_secs >= POWER_SENSOR_WARN_SECS {
+            warn!("Power sensor not responding for {}s", power_lost_secs);
             s.safety_note = Some("Power sensor not responding".to_string());
             // Continue — trainer ERG still works
         }
@@ -507,6 +517,7 @@ async fn process_tick(
                     .await
                     .is_err()
                 {
+                    warn!("Trainer disconnected during HR mode power command");
                     let mut s = state.lock().await;
                     s.stop_reason = Some(StopReason::TrainerDisconnected);
                     s.active = false;
@@ -547,6 +558,7 @@ fn process_hr_tick(
     let error = target_hr - smoothed_hr as f64;
 
     // Track time in zone
+    let prev_phase = s.phase.clone();
     let in_zone =
         smoothed_hr as u16 >= target.lower_bound && smoothed_hr as u16 <= target.upper_bound;
     if in_zone {
@@ -555,6 +567,10 @@ fn process_hr_tick(
         s.safety_note = None;
     } else {
         s.phase = "adjusting".to_string();
+    }
+
+    if s.phase != prev_phase {
+        debug!("Phase transition: {} -> {}", prev_phase, s.phase);
     }
 
     // Adaptive gains based on distance from target
@@ -575,6 +591,10 @@ fn process_hr_tick(
     let new_power = (new_power_f as u16).clamp(MIN_POWER, max_power);
 
     if new_power != s.commanded_power {
+        debug!(
+            "HR PID: smoothed_hr={}, error={:.1}, adjustment={:.1}W, power {}W -> {}W",
+            smoothed_hr, error, clamped_adjustment, s.commanded_power, new_power
+        );
         Some(new_power)
     } else {
         None

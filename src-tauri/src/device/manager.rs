@@ -383,6 +383,12 @@ impl DeviceManager {
             }
         }
 
+        info!(
+            "[{}] Connected via BLE: {:?} ({})",
+            device_id,
+            info.device_type,
+            info.name.as_deref().unwrap_or("unnamed")
+        );
         self.connected_devices
             .insert(device_id.to_string(), info.clone());
         self.auto_set_primary(info.device_type, device_id);
@@ -429,6 +435,12 @@ impl DeviceManager {
             }
         }
 
+        info!(
+            "[{}] Connected via ANT+: {:?} ({})",
+            device_id,
+            info.device_type,
+            info.name.as_deref().unwrap_or("unnamed")
+        );
         self.connected_devices
             .insert(device_id.to_string(), info.clone());
         self.auto_set_primary(info.device_type, device_id);
@@ -449,17 +461,16 @@ impl DeviceManager {
                 let id = device_id.to_string();
                 self.with_ant_blocking(move |ant| ant.disconnect(&id))
                     .await??;
-                Ok(())
-            } else {
-                Ok(())
             }
         } else {
             let ble = self
                 .ble
                 .as_ref()
                 .ok_or_else(|| AppError::Ble("BLE not initialized".into()))?;
-            ble.disconnect_device(device_id).await
+            ble.disconnect_device(device_id).await?;
         }
+        info!("[{}] Disconnected", device_id);
+        Ok(())
     }
 
     /// Check all connected devices and return IDs of any that have disconnected.
@@ -585,7 +596,7 @@ impl DeviceManager {
     // Trainer control methods -- C2: FE-C calls wrapped in spawn_blocking
 
     pub async fn set_target_power(&mut self, device_id: &str, watts: i16) -> Result<(), AppError> {
-        match self.trainer_backends.get_mut(device_id) {
+        let result = match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => {
                 controller.set_target_power(watts).await
             }
@@ -601,11 +612,15 @@ impl DeviceManager {
                 .map_err(|e| AppError::AntPlus(format!("FEC task failed: {}", e)))?
             }
             None => Err(AppError::Session("No trainer connected".into())),
+        };
+        if let Err(ref e) = result {
+            warn!("[{}] set_target_power({}W) failed: {}", device_id, watts, e);
         }
+        result
     }
 
     pub async fn set_resistance(&mut self, device_id: &str, level: u8) -> Result<(), AppError> {
-        match self.trainer_backends.get_mut(device_id) {
+        let result = match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => {
                 controller.set_resistance(level).await
             }
@@ -621,7 +636,11 @@ impl DeviceManager {
                 .map_err(|e| AppError::AntPlus(format!("FEC task failed: {}", e)))?
             }
             None => Err(AppError::Session("No trainer connected".into())),
+        };
+        if let Err(ref e) = result {
+            warn!("[{}] set_resistance({}) failed: {}", device_id, level, e);
         }
+        result
     }
 
     pub async fn set_simulation(
@@ -631,7 +650,7 @@ impl DeviceManager {
         crr: f32,
         cw: f32,
     ) -> Result<(), AppError> {
-        match self.trainer_backends.get_mut(device_id) {
+        let result = match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => {
                 controller.set_simulation(grade, crr, cw).await
             }
@@ -646,7 +665,11 @@ impl DeviceManager {
                 .map_err(|e| AppError::AntPlus(format!("FEC task failed: {}", e)))?
             }
             None => Err(AppError::Session("No trainer connected".into())),
+        };
+        if let Err(ref e) = result {
+            warn!("[{}] set_simulation(grade={}, crr={}, cw={}) failed: {}", device_id, grade, crr, cw, e);
         }
+        result
     }
 
     pub async fn start_trainer(&mut self, device_id: &str) -> Result<(), AppError> {
