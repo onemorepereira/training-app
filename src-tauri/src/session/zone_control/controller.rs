@@ -173,8 +173,8 @@ impl ZoneController {
             state.last_hr = None;
             state.last_cadence = None;
             state.last_cadence_zero_since = None;
-            state.last_hr_seen = None;
-            state.last_power_seen = None;
+            state.last_hr_seen = Some(Instant::now());
+            state.last_power_seen = Some(Instant::now());
             state.ftp = ftp;
             state.max_hr = max_hr;
         }
@@ -336,6 +336,9 @@ async fn control_loop(
     };
     let mut tick = tokio::time::interval(tick_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick — tokio::time::interval fires instantly
+    // on first call, but we need sensor data to arrive before processing.
+    tick.tick().await;
 
     // HR mode PID and smoother (only used for HeartRate mode)
     let mut pid = PidController::new(2.0, 0.1, 0.5);
