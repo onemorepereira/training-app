@@ -586,10 +586,6 @@ impl DeviceManager {
         self.reconnect.remove(device_id);
     }
 
-    pub fn clear_all_reconnect_targets(&mut self) {
-        self.reconnect.clear();
-    }
-
     // Trainer control methods -- C2: FE-C calls wrapped in spawn_blocking
 
     pub async fn set_target_power(&mut self, device_id: &str, watts: i16) -> Result<(), AppError> {

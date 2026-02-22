@@ -104,16 +104,6 @@ impl ZoneController {
         }
     }
 
-    pub async fn start(
-        &mut self,
-        target: ZoneTarget,
-        device_manager: Arc<Mutex<DeviceManager>>,
-        sensor_tx: broadcast::Sender<SensorReading>,
-    ) -> Result<(), AppError> {
-        self.start_with_config(target, device_manager, sensor_tx, None, None, None)
-            .await
-    }
-
     pub async fn start_with_config(
         &mut self,
         target: ZoneTarget,

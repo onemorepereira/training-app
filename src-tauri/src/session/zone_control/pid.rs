@@ -45,11 +45,6 @@ impl PidController {
         output.clamp(-self.output_limit, self.output_limit)
     }
 
-    pub fn reset(&mut self) {
-        self.integral = 0.0;
-        self.prev_error = None;
-    }
-
     pub fn set_gains(&mut self, kp: f64, ki: f64, kd: f64) {
         self.kp = kp;
         self.ki = ki;
@@ -188,17 +183,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_state() {
+    fn fresh_pid_has_no_accumulated_state() {
+        // I-only controller: error=5, dt=1 → integral=5, output=5
         let mut pid = PidController::with_limits(0.0, 1.0, 1.0, 200.0, 100.0);
-        pid.update(10.0, 1.0);
-        pid.update(20.0, 1.0);
-
-        pid.reset();
-
-        // After reset, integral should be 0 and no prev_error
-        // I-only: error=5, dt=1 → integral=5, output=5
         let out = pid.update(5.0, 1.0);
-        assert_approx(out, 5.0, 0.01, "after reset, integral starts fresh");
+        assert_approx(out, 5.0, 0.01, "fresh PID has no prior integral or derivative");
     }
 
     // --- HrSmoother tests ---
