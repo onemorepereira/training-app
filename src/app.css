@@ -118,6 +118,18 @@ body {
   color: var(--text-primary);
 }
 
+/* ── Shared Components ───────────────────────────────── */
+.error-banner {
+  padding: var(--space-md);
+  margin-bottom: var(--space-lg);
+  background: rgba(244, 67, 54, 0.08);
+  border: 1px solid rgba(244, 67, 54, 0.3);
+  border-radius: var(--radius-md);
+  color: var(--danger);
+  font-size: var(--text-base);
+  animation: slide-up 200ms ease;
+}
+
 /* ── Animations ──────────────────────────────────────── */
 @keyframes pulse-glow {
   0%, 100% { opacity: 1; }

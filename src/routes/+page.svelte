@@ -125,7 +125,7 @@
 
 <div class="dashboard">
   {#if error}
-    <div class="error">{error}</div>
+    <div class="error-banner">{error}</div>
   {/if}
 
   <div class="dash-header">
@@ -425,17 +425,6 @@
     background: var(--bg-elevated);
   }
 
-  .error {
-    padding: var(--space-md);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-base);
-    animation: slide-up 200ms ease;
-    flex-shrink: 0;
-  }
-
   .btn-session {
     display: inline-flex;
     align-items: center;
@@ -449,12 +438,12 @@
     background: var(--success);
     color: white;
     transition: all var(--transition-fast);
-    box-shadow: 0 2px 8px rgba(76, 175, 80, 0.3);
+    box-shadow: 0 2px 8px var(--success-glow);
   }
 
   .btn-session:hover {
     transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(76, 175, 80, 0.4);
+    box-shadow: 0 4px 12px var(--success-glow);
   }
 
   .btn-session:active {

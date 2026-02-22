@@ -3,7 +3,8 @@
   import { goto } from '$app/navigation';
   import type { SessionSummary } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
-  import { formatDuration, formatDateLong as formatDate, formatDateShort, formatTime, autoTitle } from '$lib/utils/format';
+  import { formatDuration, formatDateLong as formatDate, formatDateShort, formatTime } from '$lib/utils/format';
+  import { TYPE_LABELS, displayTitle, rpeColor } from '$lib/utils/session';
 
   let sessions = $state<SessionSummary[]>([]);
   let loading = $state(true);
@@ -28,32 +29,6 @@
   function setViewMode(mode: 'cards' | 'table') {
     viewMode = mode;
     localStorage.setItem('historyView', mode);
-  }
-
-  function displayTitle(session: SessionSummary): string {
-    return session.title ?? autoTitle(session.start_time);
-  }
-
-  const TYPE_LABELS: Record<string, string> = {
-    endurance: 'Endurance', intervals: 'Intervals', threshold: 'Threshold',
-    sweet_spot: 'Sweet Spot', vo2max: 'VO2max', sprint: 'Sprint',
-    tempo: 'Tempo', recovery: 'Recovery', race: 'Race', test: 'Test',
-    warmup: 'Warmup', group_ride: 'Group Ride', free_ride: 'Free Ride', other: 'Other',
-  };
-
-  function rpeColor(value: number): string {
-    if (value <= 5) {
-      const ratio = (value - 1) / 4;
-      const r = Math.round(76 + ratio * (255 - 76));
-      const g = Math.round(175 + ratio * (255 - 175));
-      const b = Math.round(80 + ratio * (77 - 80));
-      return `rgb(${r}, ${g}, ${b})`;
-    }
-    const ratio = (value - 5) / 5;
-    const r = Math.round(255 - ratio * (255 - 244));
-    const g = Math.round(255 - ratio * (255 - 67));
-    const b = Math.round(77 - ratio * (77 - 54));
-    return `rgb(${r}, ${g}, ${b})`;
   }
 
   function toggleSort(column: string) {
@@ -133,13 +108,26 @@
   </div>
 
   {#if error}
-    <div class="error">{error}</div>
+    <div class="error-banner">{error}</div>
   {/if}
 
   {#if loading}
-    <p class="empty">Loading sessions...</p>
+    <div class="empty-state">
+      <div class="empty-spinner"></div>
+      <p class="empty-text">Loading sessions...</p>
+    </div>
   {:else if sessions.length === 0}
-    <p class="empty">No sessions yet. Complete a ride to see it here.</p>
+    <div class="empty-state">
+      <div class="empty-icon">
+        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="14" width="3" height="6" rx="1"/>
+          <rect x="10.5" y="8" width="3" height="12" rx="1"/>
+          <rect x="17" y="4" width="3" height="16" rx="1"/>
+        </svg>
+      </div>
+      <p class="empty-text">No sessions yet</p>
+      <p class="empty-hint">Complete a ride to see it here</p>
+    </div>
   {:else if viewMode === 'cards'}
     <div class="sessions">
       {#each sortedSessions as session}
@@ -312,21 +300,39 @@
     box-shadow: var(--shadow-sm);
   }
 
-  .error {
-    margin-bottom: var(--space-lg);
-    padding: var(--space-md);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-base);
+  .empty-state {
+    text-align: center;
+    padding: var(--space-3xl) var(--space-lg);
+    color: var(--text-muted);
   }
 
-  .empty {
+  .empty-icon {
+    margin-bottom: var(--space-md);
+    opacity: 0.4;
+  }
+
+  .empty-text {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 0 0 var(--space-xs);
+  }
+
+  .empty-hint {
+    font-size: var(--text-sm);
     color: var(--text-muted);
-    font-size: var(--text-base);
-    padding: var(--space-3xl) 0;
-    text-align: center;
+    margin: 0;
+  }
+
+  .empty-spinner {
+    display: inline-block;
+    width: 24px;
+    height: 24px;
+    border: 2.5px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: var(--space-md);
   }
 
   /* --- Card View --- */

@@ -1,57 +1,38 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import type { SessionSummary, SessionAnalysis, ZoneRideConfig, PowerCurvePoint } from '$lib/tauri';
+  import type { SessionSummary, SessionAnalysis, SessionConfig, ZoneRideConfig, PowerCurvePoint } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
   import SessionTimeseries from '$lib/components/SessionTimeseries.svelte';
   import PowerCurve from '$lib/components/PowerCurve.svelte';
   import PowerHistogram from '$lib/components/PowerHistogram.svelte';
+  import HrHistogram from '$lib/components/HrHistogram.svelte';
   import ZoneDistribution from '$lib/components/ZoneDistribution.svelte';
   import ZoneRideAnalysis from '$lib/components/ZoneRideAnalysis.svelte';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import MetricCard from '$lib/components/MetricCard.svelte';
-  import { formatDuration, formatDateLong, formatTime, autoTitle } from '$lib/utils/format';
+  import { formatDuration, formatDateLong, formatTime } from '$lib/utils/format';
+  import { TYPE_LABELS, displayTitle, rpeColor } from '$lib/utils/session';
   import { formatSpeed } from '$lib/stores/units';
 
   let session = $state<SessionSummary | null>(null);
   let analysis = $state<SessionAnalysis | null>(null);
-  let units = $state<string>('metric');
+  let config = $state<SessionConfig | null>(null);
   let loading = $state(true);
   let analysisLoading = $state(true);
   let error = $state('');
   let editSession = $state<SessionSummary | null>(null);
   let exportingFit = $state(false);
-  let smoothing = $state(1);
+  let smoothing = $state(10);
   let zoneConfig = $state<ZoneRideConfig | null>(null);
   let histBucket = $state(20);
+  let hrHistBucket = $state(5);
   let overlayPeriod = $state<string>('all');
   let bestCurve = $state<PowerCurvePoint[]>([]);
 
-  const TYPE_LABELS: Record<string, string> = {
-    endurance: 'Endurance', intervals: 'Intervals', threshold: 'Threshold',
-    sweet_spot: 'Sweet Spot', vo2max: 'VO2max', sprint: 'Sprint',
-    tempo: 'Tempo', recovery: 'Recovery', race: 'Race', test: 'Test',
-    warmup: 'Warmup', group_ride: 'Group Ride', free_ride: 'Free Ride', other: 'Other',
-  };
-
-  function rpeColor(value: number): string {
-    if (value <= 5) {
-      const ratio = (value - 1) / 4;
-      const r = Math.round(76 + ratio * (255 - 76));
-      const g = Math.round(175 + ratio * (255 - 175));
-      const b = Math.round(80 + ratio * (77 - 80));
-      return `rgb(${r}, ${g}, ${b})`;
-    }
-    const ratio = (value - 5) / 5;
-    const r = Math.round(255 - ratio * (255 - 244));
-    const g = Math.round(255 - ratio * (255 - 67));
-    const b = Math.round(77 - ratio * (77 - 54));
-    return `rgb(${r}, ${g}, ${b})`;
-  }
-
-  function displayTitle(s: SessionSummary): string {
-    return s.title ?? autoTitle(s.start_time);
-  }
+  let units = $derived(config?.units ?? 'metric');
+  let hrZones = $derived(config?.hr_zones ?? null);
+  let powerZonePcts = $derived(config?.power_zones ?? null);
 
   $effect(() => {
     const sessionId = $page.params.id;
@@ -61,12 +42,12 @@
     loading = true;
     analysisLoading = true;
 
-    // Load session summary (fast) and config for units
+    // Load session summary (fast) and config
     Promise.all([api.getSession(sessionId), api.getUserConfig()])
       .then(([sess, cfg]) => {
         if (cancelled) return;
         session = sess;
-        units = cfg.units;
+        config = cfg;
         loading = false;
       })
       .catch((e) => {
@@ -135,6 +116,9 @@
     }
     editSession = null;
   }
+
+  let hasPowerHist = $derived(analysis != null && analysis.timeseries.some((p) => p.power != null));
+  let hasHrHist = $derived(analysis != null && analysis.timeseries.some((p) => p.heart_rate != null));
 </script>
 
 <div class="page">
@@ -147,11 +131,14 @@
   </a>
 
   {#if error}
-    <div class="error">{error}</div>
+    <div class="error-banner">{error}</div>
   {/if}
 
   {#if loading}
-    <p class="loading-text">Loading session...</p>
+    <div class="loading-state">
+      <div class="loading-spinner"></div>
+      <p class="loading-text">Loading session...</p>
+    </div>
   {:else if session}
     <!-- Summary header -->
     <div class="summary-header">
@@ -174,37 +161,74 @@
       {/if}
     </div>
 
-    <!-- Metrics grid -->
-    <div class="metrics-grid">
-      <MetricCard label="Duration" value={formatDuration(session.duration_secs)} size="sm" />
-      <MetricCard label="NP" value={session.normalized_power} unit="W" size="sm" />
-      <MetricCard label="TSS" value={session.tss != null ? Math.round(session.tss) : null} size="sm" />
-      <MetricCard label="IF" value={session.intensity_factor != null ? session.intensity_factor.toFixed(2) : null} size="sm" />
-      <MetricCard label="Avg Power" value={session.avg_power} unit="W" size="sm" />
-      <MetricCard label="Max Power" value={session.max_power} unit="W" size="sm" />
-      <MetricCard label="Avg HR" value={session.avg_hr} unit="bpm" size="sm" />
-      <MetricCard label="Max HR" value={session.max_hr} unit="bpm" size="sm" />
-      <MetricCard label="Avg Cadence" value={session.avg_cadence != null ? Math.round(session.avg_cadence) : null} unit="rpm" size="sm" />
-      <MetricCard
-        label="Avg Speed"
-        value={session.avg_speed != null ? formatSpeed(session.avg_speed, units as 'metric' | 'imperial') : null}
-        unit={units === 'imperial' ? 'mph' : 'km/h'}
-        size="sm"
-      />
-      <MetricCard
-        label="Distance"
-        value={session.distance_km != null
-          ? (units === 'imperial' ? (session.distance_km * 0.621371).toFixed(1) : session.distance_km.toFixed(1))
-          : null}
-        unit={units === 'imperial' ? 'mi' : 'km'}
-        size="sm"
-      />
-      <MetricCard label="Work" value={session.work_kj != null ? Math.round(session.work_kj) : null} unit="kJ" size="sm" />
-      <MetricCard label="VI" value={session.variability_index != null ? session.variability_index.toFixed(2) : null} size="sm" />
-      <MetricCard label="FTP" value={session.ftp} unit="W" size="sm" />
-      {#if analysis?.pwc}
-        <MetricCard label="PWC150" value={analysis.pwc.pwc150} unit="W" size="sm" />
-        <MetricCard label="PWC170" value={analysis.pwc.pwc170} unit="W" size="sm" />
+    <!-- Grouped Metrics -->
+    <div class="metrics-groups">
+      <div class="metric-group" style="--group-tint: rgba(100, 181, 246, 0.12)">
+        <span class="group-label">Time</span>
+        <div class="group-cards">
+          <MetricCard label="Duration" value={formatDuration(session.duration_secs)} size="sm" />
+          <MetricCard label="Work" value={session.work_kj != null ? Math.round(session.work_kj) : null} unit="kJ" size="sm" />
+        </div>
+      </div>
+
+      <div class="metric-group" style="--group-tint: rgba(255, 167, 38, 0.12)">
+        <span class="group-label">Effort</span>
+        <div class="group-cards">
+          <MetricCard label="NP" value={session.normalized_power} unit="W" size="sm" />
+          <MetricCard label="TSS" value={session.tss != null ? Math.round(session.tss) : null} size="sm" />
+          <MetricCard label="IF" value={session.intensity_factor != null ? session.intensity_factor.toFixed(2) : null} size="sm" />
+          <MetricCard label="VI" value={session.variability_index != null ? session.variability_index.toFixed(2) : null} size="sm" />
+        </div>
+      </div>
+
+      <div class="metric-group" style="--group-tint: rgba(255, 77, 109, 0.12)">
+        <span class="group-label">Power</span>
+        <div class="group-cards">
+          <MetricCard label="Avg Power" value={session.avg_power} unit="W" size="sm" />
+          <MetricCard label="Max Power" value={session.max_power} unit="W" size="sm" />
+          <MetricCard label="FTP" value={session.ftp} unit="W" size="sm" />
+          {#if analysis?.pwc}
+            <MetricCard label="PWC150" value={analysis.pwc.pwc150} unit="W" size="sm" />
+            <MetricCard label="PWC170" value={analysis.pwc.pwc170} unit="W" size="sm" />
+          {/if}
+        </div>
+      </div>
+
+      {#if session.avg_hr != null || session.max_hr != null}
+        <div class="metric-group" style="--group-tint: rgba(244, 67, 54, 0.12)">
+          <span class="group-label">Heart Rate</span>
+          <div class="group-cards">
+            <MetricCard label="Avg HR" value={session.avg_hr} unit="bpm" size="sm" />
+            <MetricCard label="Max HR" value={session.max_hr} unit="bpm" size="sm" />
+          </div>
+        </div>
+      {/if}
+
+      {#if session.avg_cadence != null || session.avg_speed != null || session.distance_km != null}
+        <div class="metric-group" style="--group-tint: rgba(76, 175, 80, 0.12)">
+          <span class="group-label">Movement</span>
+          <div class="group-cards">
+            {#if session.avg_cadence != null}
+              <MetricCard label="Avg Cadence" value={Math.round(session.avg_cadence)} unit="rpm" size="sm" />
+            {/if}
+            {#if session.avg_speed != null}
+              <MetricCard
+                label="Avg Speed"
+                value={formatSpeed(session.avg_speed, units as 'metric' | 'imperial')}
+                unit={units === 'imperial' ? 'mph' : 'km/h'}
+                size="sm"
+              />
+            {/if}
+            {#if session.distance_km != null}
+              <MetricCard
+                label="Distance"
+                value={units === 'imperial' ? (session.distance_km * 0.621371).toFixed(1) : session.distance_km.toFixed(1)}
+                unit={units === 'imperial' ? 'mi' : 'km'}
+                size="sm"
+              />
+            {/if}
+          </div>
+        </div>
       {/if}
     </div>
 
@@ -302,32 +326,61 @@
           <ZoneDistribution
             powerZones={analysis.power_zone_distribution}
             hrZones={analysis.hr_zone_distribution}
+            ftp={session.ftp}
+            {powerZonePcts}
+            hrZoneBounds={hrZones}
           />
         {/if}
       </section>
     </div>
 
-    <!-- Power Histogram -->
-    {#if analysis && analysis.timeseries.some((p) => p.power != null)}
-      <section class="chart-section">
-        <div class="section-header">
-          <h2>Power Distribution</h2>
-          <div class="smoothing-toggle">
-            {#each [{ v: 10, l: '10W' }, { v: 20, l: '20W' }, { v: 50, l: '50W' }] as opt}
-              <button
-                class="smooth-btn"
-                class:active={histBucket === opt.v}
-                onclick={() => histBucket = opt.v}
-              >
-                {opt.l}
-              </button>
-            {/each}
-          </div>
-        </div>
-        <div class="panel-wrap">
-          <PowerHistogram timeseries={analysis.timeseries} bucketWidth={histBucket} ftp={session.ftp} />
-        </div>
-      </section>
+    <!-- Power + HR Distribution (two-column) -->
+    {#if hasPowerHist || hasHrHist}
+      <div class="dist-row">
+        {#if hasPowerHist}
+          <section class="chart-section">
+            <div class="section-header">
+              <h2>Power Distribution</h2>
+              <div class="smoothing-toggle">
+                {#each [{ v: 10, l: '10W' }, { v: 20, l: '20W' }, { v: 50, l: '50W' }] as opt}
+                  <button
+                    class="smooth-btn"
+                    class:active={histBucket === opt.v}
+                    onclick={() => histBucket = opt.v}
+                  >
+                    {opt.l}
+                  </button>
+                {/each}
+              </div>
+            </div>
+            <div class="panel-wrap">
+              <PowerHistogram timeseries={analysis!.timeseries} bucketWidth={histBucket} ftp={session.ftp} />
+            </div>
+          </section>
+        {/if}
+
+        {#if hasHrHist}
+          <section class="chart-section">
+            <div class="section-header">
+              <h2>HR Distribution</h2>
+              <div class="smoothing-toggle">
+                {#each [{ v: 3, l: '3 bpm' }, { v: 5, l: '5 bpm' }, { v: 10, l: '10 bpm' }] as opt}
+                  <button
+                    class="smooth-btn"
+                    class:active={hrHistBucket === opt.v}
+                    onclick={() => hrHistBucket = opt.v}
+                  >
+                    {opt.l}
+                  </button>
+                {/each}
+              </div>
+            </div>
+            <div class="panel-wrap">
+              <HrHistogram timeseries={analysis!.timeseries} bucketWidth={hrHistBucket} {hrZones} />
+            </div>
+          </section>
+        {/if}
+      </div>
     {/if}
   {/if}
 </div>
@@ -360,25 +413,38 @@
     transition: color var(--transition-fast);
   }
 
+  .back-link svg {
+    transition: transform var(--transition-fast);
+  }
+
   .back-link:hover {
     color: var(--accent);
   }
 
-  .error {
-    margin-bottom: var(--space-lg);
-    padding: var(--space-md);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-base);
+  .back-link:hover svg {
+    transform: translateX(-2px);
+  }
+
+  .loading-state {
+    text-align: center;
+    padding: var(--space-3xl) var(--space-lg);
+  }
+
+  .loading-spinner {
+    display: inline-block;
+    width: 24px;
+    height: 24px;
+    border: 2.5px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: var(--space-md);
   }
 
   .loading-text {
     color: var(--text-muted);
     font-size: var(--text-base);
-    padding: var(--space-3xl) 0;
-    text-align: center;
+    margin: 0;
   }
 
   /* --- Summary Header --- */
@@ -443,12 +509,43 @@
     font-style: italic;
   }
 
-  /* --- Metrics Grid --- */
-  .metrics-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-    gap: var(--space-sm);
+  /* --- Grouped Metrics --- */
+  .metrics-groups {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-md);
     margin-bottom: var(--space-lg);
+  }
+
+  .metric-group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    flex: 1 1 auto;
+    min-width: 250px;
+    background: var(--group-tint, transparent);
+    border-radius: var(--radius-lg);
+    padding: var(--space-sm) var(--space-md);
+  }
+
+  .group-label {
+    font-size: var(--text-xs);
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    padding-left: 2px;
+  }
+
+  .group-cards {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+  }
+
+  .group-cards > :global(*) {
+    min-width: 120px;
+    flex: 1 1 0;
   }
 
   /* --- Actions --- */
@@ -579,8 +676,23 @@
     margin-bottom: var(--space-xl);
   }
 
+  /* --- Distribution Row (Power + HR histograms) --- */
+  .dist-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-xl);
+  }
+
+  .dist-row > :only-child {
+    grid-column: 1 / -1;
+  }
+
   @media (max-width: 720px) {
     .two-col {
+      grid-template-columns: 1fr;
+    }
+
+    .dist-row {
       grid-template-columns: 1fr;
     }
   }

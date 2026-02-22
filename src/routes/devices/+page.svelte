@@ -251,7 +251,7 @@
   <SetupBanner />
 
   {#if error}
-    <div class="error">{error}</div>
+    <div class="error-banner">{error}</div>
   {/if}
 
   {#if $connectedDevices.length === 0 && !scanning}
@@ -539,8 +539,8 @@
 
   h1 {
     margin: 0;
-    font-size: var(--text-xl);
-    font-weight: 700;
+    font-size: var(--text-2xl);
+    font-weight: 800;
   }
 
   .scan-btn {
@@ -587,17 +587,6 @@
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
     flex-shrink: 0;
-  }
-
-  .error {
-    padding: var(--space-md);
-    margin-bottom: var(--space-lg);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-base);
-    animation: slide-up 200ms ease;
   }
 
   .empty-state {

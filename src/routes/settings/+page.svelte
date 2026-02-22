@@ -73,7 +73,7 @@
   <h1>Settings</h1>
 
   {#if error}
-    <div class="error">{error}</div>
+    <div class="error-banner">{error}</div>
   {/if}
 
   <div class="settings-form">
@@ -201,17 +201,6 @@
     margin: 0 0 var(--space-xl);
     font-size: var(--text-2xl);
     font-weight: 800;
-  }
-
-  .error {
-    margin-bottom: var(--space-lg);
-    padding: var(--space-md);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-base);
-    animation: slide-up 200ms ease;
   }
 
   .section {

@@ -26,6 +26,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-opener": "^2.5.3",
     "echarts": "^6.0.0"
   }
 }
