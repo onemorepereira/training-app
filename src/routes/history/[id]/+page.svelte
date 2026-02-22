@@ -10,7 +10,8 @@
   import ZoneRideAnalysis from '$lib/components/ZoneRideAnalysis.svelte';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import MetricCard from '$lib/components/MetricCard.svelte';
-  import { formatDuration, formatDateLong, formatTime, autoTitle } from '$lib/utils/format';
+  import { formatDuration, formatDateLong, formatTime } from '$lib/utils/format';
+  import { TYPE_LABELS, displayTitle, rpeColor } from '$lib/utils/session';
   import { formatSpeed } from '$lib/stores/units';
 
   let session = $state<SessionSummary | null>(null);
@@ -26,32 +27,6 @@
   let histBucket = $state(20);
   let overlayPeriod = $state<string>('all');
   let bestCurve = $state<PowerCurvePoint[]>([]);
-
-  const TYPE_LABELS: Record<string, string> = {
-    endurance: 'Endurance', intervals: 'Intervals', threshold: 'Threshold',
-    sweet_spot: 'Sweet Spot', vo2max: 'VO2max', sprint: 'Sprint',
-    tempo: 'Tempo', recovery: 'Recovery', race: 'Race', test: 'Test',
-    warmup: 'Warmup', group_ride: 'Group Ride', free_ride: 'Free Ride', other: 'Other',
-  };
-
-  function rpeColor(value: number): string {
-    if (value <= 5) {
-      const ratio = (value - 1) / 4;
-      const r = Math.round(76 + ratio * (255 - 76));
-      const g = Math.round(175 + ratio * (255 - 175));
-      const b = Math.round(80 + ratio * (77 - 80));
-      return `rgb(${r}, ${g}, ${b})`;
-    }
-    const ratio = (value - 5) / 5;
-    const r = Math.round(255 - ratio * (255 - 244));
-    const g = Math.round(255 - ratio * (255 - 67));
-    const b = Math.round(77 - ratio * (77 - 54));
-    return `rgb(${r}, ${g}, ${b})`;
-  }
-
-  function displayTitle(s: SessionSummary): string {
-    return s.title ?? autoTitle(s.start_time);
-  }
 
   $effect(() => {
     const sessionId = $page.params.id;
@@ -147,11 +122,14 @@
   </a>
 
   {#if error}
-    <div class="error">{error}</div>
+    <div class="error-banner">{error}</div>
   {/if}
 
   {#if loading}
-    <p class="loading-text">Loading session...</p>
+    <div class="loading-state">
+      <div class="loading-spinner"></div>
+      <p class="loading-text">Loading session...</p>
+    </div>
   {:else if session}
     <!-- Summary header -->
     <div class="summary-header">
@@ -360,25 +338,38 @@
     transition: color var(--transition-fast);
   }
 
+  .back-link svg {
+    transition: transform var(--transition-fast);
+  }
+
   .back-link:hover {
     color: var(--accent);
   }
 
-  .error {
-    margin-bottom: var(--space-lg);
-    padding: var(--space-md);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-base);
+  .back-link:hover svg {
+    transform: translateX(-2px);
+  }
+
+  .loading-state {
+    text-align: center;
+    padding: var(--space-3xl) var(--space-lg);
+  }
+
+  .loading-spinner {
+    display: inline-block;
+    width: 24px;
+    height: 24px;
+    border: 2.5px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: var(--space-md);
   }
 
   .loading-text {
     color: var(--text-muted);
     font-size: var(--text-base);
-    padding: var(--space-3xl) 0;
-    text-align: center;
+    margin: 0;
   }
 
   /* --- Summary Header --- */
@@ -446,7 +437,7 @@
   /* --- Metrics Grid --- */
   .metrics-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
     gap: var(--space-sm);
     margin-bottom: var(--space-lg);
   }

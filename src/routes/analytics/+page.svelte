@@ -66,13 +66,24 @@
   </div>
 
   {#if error}
-    <div class="error">{error}</div>
+    <div class="error-banner">{error}</div>
   {/if}
 
   {#if loading}
-    <p class="empty">Loading analytics...</p>
+    <div class="empty-state">
+      <div class="empty-spinner"></div>
+      <p class="empty-text">Loading analytics...</p>
+    </div>
   {:else if sessions.length === 0}
-    <p class="empty">No sessions yet. Complete some rides to see your training trends.</p>
+    <div class="empty-state">
+      <div class="empty-icon">
+        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+        </svg>
+      </div>
+      <p class="empty-text">No sessions yet</p>
+      <p class="empty-hint">Complete some rides to see your training trends</p>
+    </div>
   {:else}
     <div class="summary-cards">
       <MetricCard label="Fitness" value={currentCtl} unit="CTL" size="sm" accent="#4a90d9" />
@@ -158,29 +169,47 @@
     margin: 0 0 var(--space-md) 0;
     font-size: var(--text-lg);
     font-weight: 700;
-    color: var(--text-secondary);
+    color: var(--text-primary);
   }
 
-  .error {
-    margin-bottom: var(--space-lg);
-    padding: var(--space-md);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-base);
-  }
-
-  .empty {
-    color: var(--text-muted);
-    font-size: var(--text-base);
-    padding: var(--space-3xl) 0;
+  .empty-state {
     text-align: center;
+    padding: var(--space-3xl) var(--space-lg);
+    color: var(--text-muted);
+  }
+
+  .empty-icon {
+    margin-bottom: var(--space-md);
+    opacity: 0.4;
+  }
+
+  .empty-text {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 0 0 var(--space-xs);
+  }
+
+  .empty-hint {
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+    margin: 0;
+  }
+
+  .empty-spinner {
+    display: inline-block;
+    width: 24px;
+    height: 24px;
+    border: 2.5px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: var(--space-md);
   }
 
   .summary-cards {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
     gap: var(--space-md);
     margin-bottom: var(--space-xl);
   }

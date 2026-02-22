@@ -86,7 +86,7 @@
 
 <div class="app">
   {#if !navCollapsed}
-    <nav class="nav-rail">
+    <nav class="nav-rail" aria-label="Main navigation">
       <div class="rail-logo">
         <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="18.5" cy="17.5" r="3.5"/>
@@ -101,6 +101,8 @@
             href={item.href}
             class="rail-item"
             class:active={$page.url.pathname === item.href}
+            aria-current={$page.url.pathname === item.href ? 'page' : undefined}
+            aria-label={item.label}
             data-tooltip={item.label}
           >
             {#if item.icon === 'ride'}
@@ -195,7 +197,7 @@
   .rail-links {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: var(--space-xs);
     width: 100%;
     padding: 0 var(--space-sm);
   }
