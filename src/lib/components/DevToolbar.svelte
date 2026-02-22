@@ -49,22 +49,29 @@
 <style>
   .dev-toolbar {
     position: fixed;
-    bottom: 12px;
-    right: 12px;
+    top: 6px;
+    right: 6px;
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
+    gap: 6px;
+    padding: 3px 8px;
     background: var(--bg-elevated);
     border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     z-index: 9999;
-    font-size: var(--text-xs);
+    font-size: 11px;
+    opacity: 0.55;
+    transition: opacity 150ms;
+  }
+
+  .dev-toolbar:hover {
+    opacity: 1;
   }
 
   .dev-label {
     color: var(--accent);
     font-weight: 700;
+    font-size: 10px;
     letter-spacing: 0.05em;
   }
 
@@ -73,7 +80,7 @@
     color: var(--text-primary);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-sm);
-    padding: 2px 6px;
+    padding: 1px 4px;
     font-size: inherit;
   }
 
@@ -86,7 +93,7 @@
     color: var(--accent);
     border: none;
     border-radius: var(--radius-sm);
-    padding: 2px 10px;
+    padding: 1px 8px;
     font-size: inherit;
     font-weight: 600;
     cursor: pointer;
