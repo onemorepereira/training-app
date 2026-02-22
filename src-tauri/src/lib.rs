@@ -292,6 +292,7 @@ pub fn run() {
             });
 
             app.manage(state);
+            log::info!("Application startup complete");
             Ok(())
         })
         .on_window_event(|window, event| {

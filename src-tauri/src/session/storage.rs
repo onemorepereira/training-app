@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::{debug, info, warn};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;
@@ -100,6 +100,7 @@ impl Storage {
             .connect_with(options)
             .await
             .map_err(AppError::Database)?;
+        info!("Database opened: {}", db_path.display());
         let migration_sql = include_str!("../../migrations/001_init.sql");
         sqlx::raw_sql(migration_sql)
             .execute(&pool)
@@ -176,6 +177,7 @@ impl Storage {
         .execute(&pool)
         .await
         .map_err(AppError::Database)?;
+        info!("Database migrations complete");
         Ok(Self {
             pool,
             data_dir: data_dir.to_string(),
@@ -187,6 +189,10 @@ impl Storage {
         summary: &SessionSummary,
         raw_data: &[u8],
     ) -> Result<(), AppError> {
+        info!(
+            "Saving session: id={}, duration={}s",
+            summary.id, summary.duration_secs
+        );
         let raw_file = Path::new(&self.data_dir)
             .join("sessions")
             .join(format!("{}.bin", summary.id));
@@ -446,6 +452,7 @@ impl Storage {
         // pedal_balance which is broken with bincode — it omitted the field during
         // serialization but the deserializer always expected it.
         bincode::deserialize::<Vec<SensorReading>>(&data).or_else(|_| {
+            debug!("Using legacy format fallback for session {}", session_id);
             let legacy: Vec<LegacySensorReading> = bincode::deserialize(&data)
                 .map_err(|e| {
                     AppError::Serialization(format!(
@@ -610,6 +617,7 @@ impl Storage {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<(), AppError> {
+        info!("Deleting session: {}", session_id);
         // Delete file first, then DB rows. A row without a file is visible in
         // history (gracefully handleable). A file without a row is an orphan
         // that wastes disk space silently forever.

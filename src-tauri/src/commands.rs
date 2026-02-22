@@ -1,3 +1,4 @@
+use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
@@ -61,6 +62,7 @@ pub async fn scan_devices(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<Vec<DeviceInfo>, AppError> {
+    info!("Scanning for devices");
     let mut dm = state.device_manager.lock().await;
     let devices = dm.scan_all().await?;
     let _ = app.emit("device_list_updated", &devices);
@@ -73,6 +75,7 @@ pub async fn connect_device(
     app: tauri::AppHandle,
     device_id: String,
 ) -> Result<DeviceInfo, AppError> {
+    info!("Connecting device: {}", device_id);
     let tx = state.sensor_tx.clone();
     let mut dm = state.device_manager.lock().await;
     let info = dm.connect(&device_id, tx).await?;
@@ -89,6 +92,7 @@ pub async fn disconnect_device(
     app: tauri::AppHandle,
     device_id: String,
 ) -> Result<(), AppError> {
+    info!("Disconnecting device: {}", device_id);
     let mut dm = state.device_manager.lock().await;
     dm.clear_reconnect_target(&device_id);
     dm.disconnect(&device_id).await?;
@@ -101,6 +105,7 @@ pub async fn disconnect_device(
 
 #[tauri::command]
 pub async fn start_session(state: State<'_, AppState>) -> Result<String, AppError> {
+    info!("Starting session");
     let config = state.storage.get_user_config().await?;
     let id = state.session_manager.start_session(config).await?;
     Ok(id)
@@ -111,6 +116,10 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSu
     let result = state.session_manager.stop_session_with_log().await;
 
     if let Some((ref summary, ref sensor_log)) = result {
+        info!(
+            "Session stopped: id={}, duration={}s",
+            summary.id, summary.duration_secs
+        );
         let raw_data = bincode::serialize(sensor_log)
             .map_err(|e| AppError::Serialization(e.to_string()))?;
         state.storage.save_session(summary, &raw_data).await?;
@@ -128,6 +137,8 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSu
                 }
             }
         });
+    } else {
+        info!("Stop session: no active session");
     }
 
     Ok(result.map(|(summary, _)| summary))
@@ -217,6 +228,7 @@ pub async fn set_primary_device(
     device_type: DeviceType,
     device_id: String,
 ) -> Result<(), AppError> {
+    info!("Set primary device: {:?} = {}", device_type, device_id);
     let mut primaries = state.primary_devices.write().unwrap();
     primaries.insert(device_type, device_id);
     Ok(())
@@ -232,6 +244,7 @@ pub async fn get_primary_devices(
 
 #[tauri::command]
 pub async fn set_trainer_power(state: State<'_, AppState>, watts: i16) -> Result<(), AppError> {
+    info!("Set trainer power: {}W", watts);
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -241,6 +254,7 @@ pub async fn set_trainer_power(state: State<'_, AppState>, watts: i16) -> Result
 
 #[tauri::command]
 pub async fn set_trainer_resistance(state: State<'_, AppState>, level: u8) -> Result<(), AppError> {
+    info!("Set trainer resistance: level {}", level);
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -255,6 +269,7 @@ pub async fn set_trainer_simulation(
     crr: f32,
     cw: f32,
 ) -> Result<(), AppError> {
+    info!("Set trainer simulation: grade={}, crr={}, cw={}", grade, crr, cw);
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -310,6 +325,7 @@ pub async fn delete_session(
     session_id: String,
 ) -> Result<(), AppError> {
     validate_session_id(&session_id)?;
+    info!("Deleting session: {}", session_id);
     state.storage.delete_session(&session_id).await
 }
 
@@ -319,6 +335,7 @@ pub async fn export_session_fit(
     session_id: String,
 ) -> Result<String, AppError> {
     validate_session_id(&session_id)?;
+    info!("Exporting session to FIT: {}", session_id);
     let summary = state.storage.get_session(&session_id).await?;
     let readings = state.storage.load_sensor_data(&session_id)?;
     let fit_data = fit_export::export_fit(&summary, &readings)?;
@@ -384,6 +401,10 @@ pub async fn start_zone_control(
     state: State<'_, AppState>,
     target: ZoneTarget,
 ) -> Result<(), AppError> {
+    info!(
+        "Start zone control: {:?} zone {} ({}-{})",
+        target.mode, target.zone, target.lower_bound, target.upper_bound
+    );
     let config = state.storage.get_user_config().await?;
     let ftp = Some(config.ftp);
     let max_hr = config.max_hr;
@@ -391,7 +412,13 @@ pub async fn start_zone_control(
     // For HR mode, try to estimate initial power from historical data
     let initial_power_estimate = if target.mode == ZoneMode::HeartRate {
         let target_hr = ((target.lower_bound + target.upper_bound) / 2) as u8;
-        estimate_power_from_history(&state.storage, target_hr).await.ok().flatten()
+        match estimate_power_from_history(&state.storage, target_hr).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to estimate initial power from history: {}", e);
+                None
+            }
+        }
     } else {
         None
     };
@@ -415,7 +442,9 @@ pub async fn stop_zone_control(
     state: State<'_, AppState>,
 ) -> Result<Option<StopReason>, AppError> {
     let mut zc = state.zone_controller.lock().await;
-    Ok(zc.stop().await)
+    let reason = zc.stop().await;
+    info!("Stop zone control: {:?}", reason);
+    Ok(reason)
 }
 
 #[tauri::command]
