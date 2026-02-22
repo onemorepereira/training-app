@@ -32,7 +32,7 @@
       animation: false,
       grid: {
         left: 50,
-        right: 20,
+        right: 30,
         top: 30,
         bottom: 40,
       },
@@ -127,6 +127,7 @@
             color: '#ffa726',
             fontSize: 11,
             fontFamily: 'IBM Plex Mono, monospace',
+            position: 'insideStartTop' as const,
           },
           data: [{ yAxis: ftpVal }],
         }

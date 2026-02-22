@@ -50,7 +50,7 @@
           },
           title: {
             show: true,
-            offsetCenter: [0, '85%'],
+            offsetCenter: [0, '50%'],
             fontSize: 11,
             fontWeight: 600,
             color: 'rgba(255,255,255,0.3)',

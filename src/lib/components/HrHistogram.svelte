@@ -6,42 +6,38 @@
   interface Props {
     timeseries: TimeseriesPoint[];
     bucketWidth?: number;
-    ftp?: number | null;
+    hrZones?: [number, number, number, number, number] | null;
   }
 
-  let { timeseries, bucketWidth = 20, ftp = null }: Props = $props();
+  let { timeseries, bucketWidth = 5, hrZones = null }: Props = $props();
 
   let chartEl: HTMLDivElement;
   let chart = $state<echarts.ECharts | null>(null);
 
-  // Power zone colors (Z1-Z7), matching ZoneDistribution
-  const ZONE_COLORS = ['#70708a', '#4a90d9', '#4caf50', '#ffc107', '#ff9800', '#f44336', '#b71c1c'];
+  const ZONE_COLORS = ['#70708a', '#4a90d9', '#4caf50', '#ffc107', '#f44336'];
 
-  function zoneColor(watts: number): string {
-    if (ftp == null || ftp <= 0) return ZONE_COLORS[0];
-    const pct = watts / ftp;
-    if (pct < 0.55) return ZONE_COLORS[0]; // Z1
-    if (pct < 0.75) return ZONE_COLORS[1]; // Z2
-    if (pct < 0.90) return ZONE_COLORS[2]; // Z3
-    if (pct < 1.05) return ZONE_COLORS[3]; // Z4
-    if (pct < 1.20) return ZONE_COLORS[4]; // Z5
-    if (pct < 1.50) return ZONE_COLORS[5]; // Z6
-    return ZONE_COLORS[6]; // Z7
+  function zoneColor(bpm: number): string {
+    if (!hrZones) return ZONE_COLORS[0];
+    if (bpm < hrZones[0]) return ZONE_COLORS[0]; // Z1
+    if (bpm < hrZones[1]) return ZONE_COLORS[1]; // Z2
+    if (bpm < hrZones[2]) return ZONE_COLORS[2]; // Z3
+    if (bpm < hrZones[3]) return ZONE_COLORS[3]; // Z4
+    return ZONE_COLORS[4]; // Z5
   }
 
   let histogram = $derived.by(() => {
     const buckets = new Map<number, number>();
     for (const pt of timeseries) {
-      if (pt.power == null || pt.power <= 0) continue;
-      const bucket = Math.floor(pt.power / bucketWidth) * bucketWidth;
+      if (pt.heart_rate == null || pt.heart_rate <= 0) continue;
+      const bucket = Math.floor(pt.heart_rate / bucketWidth) * bucketWidth;
       buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
     }
 
     const sorted = [...buckets.entries()].sort((a, b) => a[0] - b[0]);
     return {
-      labels: sorted.map(([w]) => `${w}-${w + bucketWidth}`),
+      labels: sorted.map(([hr]) => `${hr}-${hr + bucketWidth}`),
       values: sorted.map(([, count]) => count),
-      colors: sorted.map(([w]) => zoneColor(w + bucketWidth / 2)),
+      colors: sorted.map(([hr]) => zoneColor(hr + bucketWidth / 2)),
     };
   });
 
@@ -67,7 +63,7 @@
         formatter(params: unknown) {
           const item = (params as { name: string; value: number }[])[0];
           if (!item) return '';
-          return `${item.name} W<br><b>${formatSeconds(item.value)}</b>`;
+          return `${item.name} bpm<br><b>${formatSeconds(item.value)}</b>`;
         },
       },
       xAxis: {
@@ -124,7 +120,6 @@
   });
 
   $effect(() => {
-    // Re-read histogram to trigger reactivity
     histogram;
     if (!chart) return;
     chart.setOption(buildOption(), true);

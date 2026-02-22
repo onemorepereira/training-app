@@ -18,7 +18,7 @@
 
   const COLORS = {
     power: '#ff4d6d',
-    hr: '#f44336',
+    hr: '#ffa726',
     cadence: '#64b5f6',
     speed: '#4caf50',
   };
@@ -110,8 +110,8 @@
           itemStyle: { color: COLORS.hr },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(244, 67, 54, 0.15)' },
-              { offset: 1, color: 'rgba(244, 67, 54, 0)' },
+              { offset: 0, color: 'rgba(255, 167, 38, 0.15)' },
+              { offset: 1, color: 'rgba(255, 167, 38, 0)' },
             ]),
           },
           data: [],
