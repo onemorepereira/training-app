@@ -49,14 +49,6 @@ impl ReconnectManager {
         }
     }
 
-    /// Clear all targets
-    pub fn clear(&mut self) {
-        if !self.targets.is_empty() {
-            log::info!("Cleared {} auto-reconnect targets", self.targets.len());
-            self.targets.clear();
-        }
-    }
-
     /// Return devices due for a retry attempt and bump their backoff
     pub fn due_for_retry(&mut self) -> Vec<DeviceInfo> {
         let now = Instant::now();
@@ -71,10 +63,6 @@ impl ReconnectManager {
             }
         }
         due
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.targets.is_empty()
     }
 
     pub fn attempt_count(&self, device_id: &str) -> u32 {
@@ -140,10 +128,10 @@ mod tests {
     fn remove_clears_target() {
         let mut rm = ReconnectManager::new();
         rm.register(test_device("dev1"));
-        assert!(!rm.is_empty());
+        assert!(!rm.targets.is_empty());
 
         rm.remove("dev1");
-        assert!(rm.is_empty());
+        assert!(rm.targets.is_empty());
     }
 
     #[test]
