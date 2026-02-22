@@ -12,11 +12,11 @@ fn now_epoch_ms() -> u64 {
 
 /// Stateful ANT+ decoder that tracks previous values for delta calculations.
 ///
-/// **Note:** The first sample for each metric (power, cadence, speed) is used to
-/// initialize the decoder state and returns `None`. This causes a 1-2 second gap
-/// after connecting before data appears. This is an intentional tradeoff — ANT+
-/// reports cumulative counters, so the first sample has no previous value to
-/// compute a delta from.
+/// **Note:** The first sample for cadence and speed is used to initialize the
+/// decoder state and returns `None` — ANT+ reports cumulative counters, so the
+/// first sample has no previous value to compute a delta from. Power is the
+/// exception: the first sample returns the instantaneous power field directly
+/// (bytes 6-7), avoiding a 1-2s data gap after connecting.
 #[derive(Debug, Default)]
 pub struct AntDecoder {
     // Power profile state
@@ -82,8 +82,14 @@ impl AntDecoder {
             self.prev_power_event_count = event_count;
             self.prev_power_accumulated = accumulated;
             self.power_initialized = true;
-            // First sample initializes state only
-            return None;
+            // Return instant power on first sample so data appears immediately
+            return Some(SensorReading::Power {
+                watts: instant_power,
+                timestamp: Some(std::time::Instant::now()),
+                epoch_ms: now_epoch_ms(),
+                device_id: device_id.to_string(),
+                pedal_balance,
+            });
         }
 
         // Check for new data (event count changed)
@@ -267,12 +273,18 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_power() {
+    fn decode_power_first_sample_returns_instant_power() {
         let mut decoder = AntDecoder::new();
-        // First message initializes
-        let data1: [u8; 8] = [0x10, 1, 0, 0, 0, 0, 200, 0]; // 200W
-        let r1 = decoder.decode_power(&data1, "test");
-        assert!(r1.is_none()); // first sample initializes
+        // First message returns instant power immediately (bytes 6-7 = 200W)
+        let data1: [u8; 8] = [0x10, 1, 0, 0, 0, 0, 200, 0];
+        let r1 = decoder.decode_power(&data1, "test").unwrap();
+        match r1 {
+            SensorReading::Power { watts, pedal_balance, .. } => {
+                assert_eq!(watts, 200);
+                assert_eq!(pedal_balance, None);
+            }
+            _ => panic!("Expected Power"),
+        }
 
         // Second message with new event count
         let data2: [u8; 8] = [0x10, 2, 0, 0, 200, 0, 250, 0]; // 250W
@@ -280,7 +292,7 @@ mod tests {
         match r2 {
             SensorReading::Power { watts, pedal_balance, .. } => {
                 assert_eq!(watts, 250);
-                assert_eq!(pedal_balance, None); // no differentiation bit in test data
+                assert_eq!(pedal_balance, None);
             }
             _ => panic!("Expected Power"),
         }
@@ -395,6 +407,21 @@ mod tests {
                 assert!((rpm - 59.077).abs() < 0.1, "expected ~59.077, got {}", rpm);
             }
             _ => panic!("Expected Cadence"),
+        }
+    }
+
+    #[test]
+    fn decode_power_first_sample_includes_pedal_balance() {
+        let mut decoder = AntDecoder::new();
+        // byte[2] = 0xB2: bit7 set (differentiated), bits 0-6 = 50 (50% right pedal)
+        let data: [u8; 8] = [0x10, 1, 0xB2, 0, 0, 0, 180, 0];
+        let r = decoder.decode_power(&data, "test").unwrap();
+        match r {
+            SensorReading::Power { watts, pedal_balance, .. } => {
+                assert_eq!(watts, 180);
+                assert_eq!(pedal_balance, Some(50));
+            }
+            _ => panic!("Expected Power"),
         }
     }
 
