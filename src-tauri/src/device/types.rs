@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +166,19 @@ pub struct AntDeviceMetadata {
     pub battery_voltage: Option<f32>,
 }
 
+/// Returns true when the reading comes from a non-primary device for its type.
+/// Used by listeners to drop dominated readings before they enter the broadcast channel.
+pub fn is_dominated(
+    primaries: &HashMap<DeviceType, String>,
+    reading: &SensorReading,
+) -> bool {
+    if let Some(primary_id) = primaries.get(&reading.device_type()) {
+        !reading.device_id().is_empty() && reading.device_id() != primary_id
+    } else {
+        false
+    }
+}
+
 impl SensorReading {
     #[allow(dead_code)]
     pub fn epoch_ms(&self) -> u64 {
@@ -195,5 +209,83 @@ impl SensorReading {
             SensorReading::Speed { .. } => DeviceType::CadenceSpeed,
             SensorReading::TrainerCommand { .. } => DeviceType::FitnessTrainer,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn power_reading(device_id: &str) -> SensorReading {
+        SensorReading::Power {
+            watts: 200,
+            timestamp: None,
+            epoch_ms: 0,
+            device_id: device_id.to_string(),
+            pedal_balance: None,
+        }
+    }
+
+    fn hr_reading(device_id: &str) -> SensorReading {
+        SensorReading::HeartRate {
+            bpm: 140,
+            timestamp: None,
+            epoch_ms: 0,
+            device_id: device_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn is_dominated_non_primary_device_is_dominated() {
+        let primaries = HashMap::from([(DeviceType::Power, "pm-1".to_string())]);
+        assert!(is_dominated(&primaries, &power_reading("pm-2")));
+    }
+
+    #[test]
+    fn is_dominated_primary_device_is_not_dominated() {
+        let primaries = HashMap::from([(DeviceType::Power, "pm-1".to_string())]);
+        assert!(!is_dominated(&primaries, &power_reading("pm-1")));
+    }
+
+    #[test]
+    fn is_dominated_no_primary_set_is_not_dominated() {
+        let primaries = HashMap::new();
+        assert!(!is_dominated(&primaries, &power_reading("pm-1")));
+    }
+
+    #[test]
+    fn is_dominated_empty_device_id_is_not_dominated() {
+        let primaries = HashMap::from([(DeviceType::Power, "pm-1".to_string())]);
+        assert!(!is_dominated(&primaries, &power_reading("")));
+    }
+
+    #[test]
+    fn is_dominated_different_type_primary_does_not_affect() {
+        let primaries = HashMap::from([(DeviceType::HeartRate, "hr-1".to_string())]);
+        assert!(!is_dominated(&primaries, &power_reading("pm-1")));
+    }
+
+    #[test]
+    fn is_dominated_trainer_command_has_empty_device_id() {
+        let primaries = HashMap::from([(DeviceType::FitnessTrainer, "trainer-1".to_string())]);
+        let cmd = SensorReading::TrainerCommand {
+            target_watts: 200,
+            epoch_ms: 0,
+            source: CommandSource::Manual,
+        };
+        // TrainerCommand.device_id() returns "", so it should not be dominated
+        assert!(!is_dominated(&primaries, &cmd));
+    }
+
+    #[test]
+    fn is_dominated_each_type_independent() {
+        let primaries = HashMap::from([
+            (DeviceType::Power, "pm-1".to_string()),
+            (DeviceType::HeartRate, "hr-1".to_string()),
+        ]);
+        // HR reading from non-primary HR device is dominated
+        assert!(is_dominated(&primaries, &hr_reading("hr-2")));
+        // Power reading from primary power device is not
+        assert!(!is_dominated(&primaries, &power_reading("pm-1")));
     }
 }

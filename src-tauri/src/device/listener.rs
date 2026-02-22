@@ -2,16 +2,19 @@ use btleplug::api::{Characteristic, Peripheral as _};
 use btleplug::platform::Peripheral;
 use futures::StreamExt;
 use log::{error, info, warn};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use super::protocol::*;
-use super::types::{DeviceType, SensorReading};
+use super::types::{is_dominated, DeviceType, SensorReading};
 
 pub async fn listen_to_device(
     peripheral: Peripheral,
     device_type: DeviceType,
     tx: broadcast::Sender<SensorReading>,
     device_id: String,
+    primaries: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
 ) {
     let characteristics = peripheral.characteristics();
     let target_chars: Vec<&Characteristic> = characteristics
@@ -82,6 +85,15 @@ pub async fn listen_to_device(
         };
 
         for reading in readings {
+            if let Some(ref p) = primaries {
+                let dominated = {
+                    let guard = p.read().unwrap();
+                    is_dominated(&guard, &reading)
+                };
+                if dominated {
+                    continue;
+                }
+            }
             if tx.send(reading).is_err() {
                 warn!("[{}] No receivers for sensor readings, stopping listener", device_id);
                 return;

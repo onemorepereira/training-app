@@ -68,7 +68,7 @@ pub struct AppState {
     pub session_manager: Arc<SessionManager>,
     pub storage: Arc<Storage>,
     pub sensor_tx: broadcast::Sender<SensorReading>,
-    pub primary_devices: Arc<tokio::sync::Mutex<HashMap<DeviceType, String>>>,
+    pub primary_devices: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>,
     pub zone_controller: Arc<tokio::sync::Mutex<ZoneController>>,
 }
 
@@ -95,7 +95,7 @@ pub async fn connect_device(
 
     // Auto-set as primary if no primary exists for this device type
     {
-        let mut primaries = state.primary_devices.lock().await;
+        let mut primaries = state.primary_devices.write().unwrap();
         auto_set_primary(&mut primaries, info.device_type, &device_id);
     }
 
@@ -112,7 +112,7 @@ pub async fn disconnect_device(
     device_id: String,
 ) -> Result<(), AppError> {
     {
-        let mut primaries = state.primary_devices.lock().await;
+        let mut primaries = state.primary_devices.write().unwrap();
         remove_primary(&mut primaries, &device_id);
     }
     let mut dm = state.device_manager.lock().await;
@@ -243,7 +243,7 @@ pub async fn set_primary_device(
     device_type: DeviceType,
     device_id: String,
 ) -> Result<(), AppError> {
-    let mut primaries = state.primary_devices.lock().await;
+    let mut primaries = state.primary_devices.write().unwrap();
     primaries.insert(device_type, device_id);
     Ok(())
 }
@@ -252,7 +252,7 @@ pub async fn set_primary_device(
 pub async fn get_primary_devices(
     state: State<'_, AppState>,
 ) -> Result<HashMap<String, String>, AppError> {
-    let primaries = state.primary_devices.lock().await;
+    let primaries = state.primary_devices.read().unwrap();
     Ok(format_primaries(&primaries))
 }
 
