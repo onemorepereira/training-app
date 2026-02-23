@@ -16,6 +16,7 @@ pub struct MetricsCalculator {
     hr_readings: Vec<u8>,
     cadence_readings: Vec<f32>,
     speed_history: Vec<(u64, f32)>,
+    last_speed_ms: Option<u64>,
 }
 
 impl MetricsCalculator {
@@ -32,16 +33,23 @@ impl MetricsCalculator {
             hr_readings: Vec::new(),
             cadence_readings: Vec::new(),
             speed_history: Vec::new(),
+            last_speed_ms: None,
         }
     }
 
     pub fn record_power(&mut self, watts: u16, epoch_ms: u64) {
-        self.last_epoch_ms = Some(epoch_ms);
-        self.power_history.push((epoch_ms, watts));
+        // Enforce monotonicity: clamp backward jumps from clock adjustments
+        // or device switches so windowed averages stay consistent.
+        let ts = match self.last_epoch_ms {
+            Some(prev) if epoch_ms < prev => prev,
+            _ => epoch_ms,
+        };
+        self.last_epoch_ms = Some(ts);
+        self.power_history.push((ts, watts));
 
         // NP: accumulate one sample per epoch-second.
         // Within a second, average all readings to get that second's power.
-        let current_second = epoch_ms / 1000;
+        let current_second = ts / 1000;
         match self.last_np_second {
             Some(prev_second) if prev_second == current_second => {
                 // Same second — accumulate for averaging
@@ -91,7 +99,12 @@ impl MetricsCalculator {
     }
 
     pub fn record_speed(&mut self, kmh: f32, epoch_ms: u64) {
-        self.speed_history.push((epoch_ms, kmh));
+        let ts = match self.last_speed_ms {
+            Some(prev) if epoch_ms < prev => prev,
+            _ => epoch_ms,
+        };
+        self.last_speed_ms = Some(ts);
+        self.speed_history.push((ts, kmh));
     }
 
     pub fn current_power(&self) -> Option<u16> {
@@ -441,6 +454,19 @@ mod tests {
         // cutoff = 10000 - 3000 = 7000; only 10000 >= 7000
         let avg = calc.avg_power(3).unwrap();
         assert_approx(avg, 300.0, 0.1, "windowed avg excludes old");
+    }
+
+    #[test]
+    fn avg_power_backward_clock_jump_clamped() {
+        let mut calc = MetricsCalculator::new(200);
+        calc.record_power(200, 5000);   // 5s
+        calc.record_power(200, 6000);   // 6s
+        calc.record_power(200, 7000);   // 7s
+        calc.record_power(300, 3000);   // backward jump to 3s — clamped to 7s
+        // All 4 readings should be in a 3s window from 7000
+        // cutoff = 7000 - 3000 = 4000; readings at 5000, 6000, 7000, 7000
+        let avg = calc.avg_power(3).unwrap();
+        assert_approx(avg, 225.0, 0.1, "backward jump clamped avg");
     }
 
     #[test]
