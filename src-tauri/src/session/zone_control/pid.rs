@@ -50,6 +50,14 @@ impl PidController {
         self.ki = ki;
         self.kd = kd;
     }
+
+    pub fn integral(&self) -> f64 {
+        self.integral
+    }
+
+    pub fn decay_integral(&mut self, factor: f64) {
+        self.integral *= factor;
+    }
 }
 
 use std::collections::VecDeque;
@@ -282,5 +290,43 @@ mod tests {
         assert_approx(kp, 1.0, 0.01, "boundary 5 kp");
         assert_approx(ki, 0.05, 0.01, "boundary 5 ki");
         assert_approx(kd, 0.3, 0.01, "boundary 5 kd");
+    }
+
+    // --- decay_integral tests ---
+
+    #[test]
+    fn decay_integral_reduces_by_factor() {
+        // Accumulate integral to 25, decay by 0.7 → 17.5
+        let mut pid = PidController::with_limits(0.0, 1.0, 0.0, 200.0, 100.0);
+        pid.update(5.0, 5.0); // integral = 25
+        pid.decay_integral(0.7);
+        assert_approx(pid.integral(), 17.5, 0.01, "decay by 0.7");
+    }
+
+    #[test]
+    fn decay_integral_repeated_converges_toward_zero() {
+        // Accumulate integral to 25, decay 0.5 three times → 25 * 0.125 = 3.125
+        let mut pid = PidController::with_limits(0.0, 1.0, 0.0, 200.0, 100.0);
+        pid.update(5.0, 5.0); // integral = 25
+        pid.decay_integral(0.5);
+        pid.decay_integral(0.5);
+        pid.decay_integral(0.5);
+        assert_approx(pid.integral(), 3.125, 0.01, "repeated decay converges");
+    }
+
+    #[test]
+    fn decay_integral_with_factor_one_is_noop() {
+        let mut pid = PidController::with_limits(0.0, 1.0, 0.0, 200.0, 100.0);
+        pid.update(5.0, 5.0); // integral = 25
+        pid.decay_integral(1.0);
+        assert_approx(pid.integral(), 25.0, 0.01, "factor 1.0 is noop");
+    }
+
+    #[test]
+    fn decay_integral_with_factor_zero_clears() {
+        let mut pid = PidController::with_limits(0.0, 1.0, 0.0, 200.0, 100.0);
+        pid.update(5.0, 5.0); // integral = 25
+        pid.decay_integral(0.0);
+        assert_approx(pid.integral(), 0.0, 0.01, "factor 0.0 clears");
     }
 }
