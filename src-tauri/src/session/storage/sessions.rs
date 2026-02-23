@@ -303,12 +303,15 @@ impl Storage {
         session_id: &str,
         zone_config: &str,
     ) -> Result<(), AppError> {
-        sqlx::query("UPDATE sessions SET zone_config = ? WHERE id = ?")
+        let result = sqlx::query("UPDATE sessions SET zone_config = ? WHERE id = ?")
             .bind(zone_config)
             .bind(session_id)
             .execute(&self.pool)
             .await
             .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::Session(format!("Session not found: {}", session_id)));
+        }
         Ok(())
     }
 

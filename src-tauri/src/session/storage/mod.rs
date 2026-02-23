@@ -800,6 +800,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_zone_config_nonexistent_session_returns_error() {
+        let (storage, _tmp) = test_storage().await;
+        let result = storage.save_zone_config("no-such-id", r#"{"zone":1}"#).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Session not found"),
+            "expected 'Session not found', got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
     async fn list_devices_ordered_by_last_seen() {
         let (storage, _tmp) = test_storage().await;
         let d1 = make_device("d1", Some("Oldest"), "2024-01-01T00:00:00Z");
