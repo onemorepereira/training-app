@@ -48,6 +48,8 @@ struct ControlLoopState {
     ftp: Option<u16>,
     /// Max HR from user config, used for HR ceiling safety
     max_hr: Option<u8>,
+    /// Instant of the last processed tick, for measuring actual elapsed time
+    last_tick_at: Option<Instant>,
 }
 
 impl ControlLoopState {
@@ -72,6 +74,7 @@ impl ControlLoopState {
             last_power_seen: None,
             ftp: None,
             max_hr: None,
+            last_tick_at: None,
         }
     }
 
@@ -153,7 +156,9 @@ impl ZoneController {
             state.paused = false;
             state.commanded_power = initial_power;
             state.time_in_zone_ms = 0;
-            state.started_at = Some(Instant::now());
+            let now = Instant::now();
+            state.started_at = Some(now);
+            state.last_tick_at = Some(now);
             state.paused_accumulated_ms = 0;
             state.pause_started = None;
             state.phase = "ramping".to_string();
@@ -402,6 +407,14 @@ async fn process_tick(
         return false;
     }
 
+    // Measure actual elapsed time since last tick
+    let now = Instant::now();
+    let tick_ms = s
+        .last_tick_at
+        .map(|t| now.duration_since(t).as_millis() as u64)
+        .unwrap_or(0);
+    s.last_tick_at = Some(now);
+
     // === Safety: cadence zero for >CADENCE_ZERO_SECS → command 0W ===
     if let Some(zero_since) = s.last_cadence_zero_since {
         if zero_since.elapsed().as_secs() >= CADENCE_ZERO_SECS {
@@ -496,10 +509,10 @@ async fn process_tick(
     // === Mode-specific tick ===
     match target.mode {
         ZoneMode::Power => {
-            process_power_tick(&mut s, target);
+            process_power_tick(&mut s, target, tick_ms);
         }
         ZoneMode::HeartRate => {
-            let new_power = process_hr_tick(&mut s, target, pid, hr_smoother);
+            let new_power = process_hr_tick(&mut s, target, pid, hr_smoother, tick_ms);
             if let Some(watts) = new_power {
                 s.commanded_power = watts;
                 drop(s);
@@ -520,11 +533,11 @@ async fn process_tick(
     false
 }
 
-fn process_power_tick(s: &mut ControlLoopState, target: &ZoneTarget) {
+fn process_power_tick(s: &mut ControlLoopState, target: &ZoneTarget, tick_ms: u64) {
     if let Some(power) = s.last_power {
         let in_zone = power >= target.lower_bound && power <= target.upper_bound;
         if in_zone {
-            s.time_in_zone_ms += 1000; // 1s tick
+            s.time_in_zone_ms += tick_ms;
             s.phase = "in_zone".to_string();
             s.safety_note = None;
         } else {
@@ -542,6 +555,7 @@ fn process_hr_tick(
     target: &ZoneTarget,
     pid: &mut PidController,
     hr_smoother: &HrSmoother,
+    tick_ms: u64,
 ) -> Option<u16> {
     let smoothed_hr = hr_smoother.smoothed()?;
     let target_hr = ((target.lower_bound + target.upper_bound) / 2) as f64;
@@ -552,7 +566,7 @@ fn process_hr_tick(
     let in_zone =
         smoothed_hr as u16 >= target.lower_bound && smoothed_hr as u16 <= target.upper_bound;
     if in_zone {
-        s.time_in_zone_ms += 5000; // 5s tick
+        s.time_in_zone_ms += tick_ms;
         s.phase = "in_zone".to_string();
         s.safety_note = None;
     } else {
@@ -567,7 +581,7 @@ fn process_hr_tick(
     let (kp, ki, kd) = adaptive_gains(error.abs());
     pid.set_gains(kp, ki, kd);
 
-    let dt_secs = 5.0; // HR mode tick interval
+    let dt_secs = tick_ms as f64 / 1000.0;
     let watts_adjustment = pid.update(error, dt_secs);
 
     // Rate limit: max ±HR_MAX_WATTS_PER_TICK per tick
