@@ -50,7 +50,7 @@
           },
           title: {
             show: true,
-            offsetCenter: [0, '50%'],
+            offsetCenter: [0, '35%'],
             fontSize: 11,
             fontWeight: 600,
             color: 'rgba(255,255,255,0.3)',
@@ -62,7 +62,7 @@
             fontFamily: 'IBM Plex Mono, monospace',
             color: '#f0f0f5',
             formatter: '{value}',
-            offsetCenter: [0, '70%'],
+            offsetCenter: [0, '65%'],
           },
           data: [{ value, name: 'WATTS' }],
           animationDuration: 300,
@@ -94,7 +94,8 @@
 
   $effect(() => {
     if (chart) {
-      chart.setOption({ series: [{ data: [{ value: power ?? 0, name: 'WATTS' }] }] });
+      // Rebuild full option so zone color bands update when ftp changes
+      chart.setOption(getOption(power ?? 0));
     }
   });
 </script>
