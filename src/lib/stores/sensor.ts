@@ -27,14 +27,15 @@ let latestSpeed: number | null = null;
 
 let unlistenSensor: (() => void) | null = null;
 let unlistenMetrics: (() => void) | null = null;
-let initializing = false;
+let generation = 0;
 
 export async function startSensorListening() {
-  if (unlistenSensor || initializing) return;
-  initializing = true;
+  if (unlistenSensor) return;
 
-  try {
-    unlistenSensor = await listen<SensorReading>('sensor_reading', (event) => {
+  const myGen = ++generation;
+
+  const [sensorUn, metricsUn] = await Promise.all([
+    listen<SensorReading>('sensor_reading', (event) => {
       const reading = event.payload;
       if (reading.Power) { latestPower = reading.Power.watts; currentPower.set(latestPower); }
       if (reading.HeartRate) { latestHR = reading.HeartRate.bpm; currentHR.set(latestHR); }
@@ -47,18 +48,26 @@ export async function startSensorListening() {
           return next.length > MAX_HISTORY ? next.slice(next.length - MAX_HISTORY) : next;
         });
       }
-    });
-
-    unlistenMetrics = await listen<LiveMetrics>('live_metrics', (event) => {
+    }),
+    listen<LiveMetrics>('live_metrics', (event) => {
       liveMetrics.set(event.payload);
-    });
-  } finally {
-    initializing = false;
+    }),
+  ]);
+
+  // If stop was called (or another start began) while we were awaiting,
+  // our generation is stale — clean up immediately to avoid leaking.
+  if (myGen !== generation) {
+    sensorUn();
+    metricsUn();
+    return;
   }
+
+  unlistenSensor = sensorUn;
+  unlistenMetrics = metricsUn;
 }
 
 export function stopSensorListening() {
-  initializing = false;
+  generation++; // Invalidate any in-flight startSensorListening
   if (unlistenSensor) {
     unlistenSensor();
     unlistenSensor = null;
