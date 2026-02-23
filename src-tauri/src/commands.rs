@@ -231,7 +231,10 @@ pub async fn set_primary_device(
     device_id: String,
 ) -> Result<(), AppError> {
     info!("Set primary device: {:?} = {}", device_type, device_id);
-    let mut primaries = state.primary_devices.write().unwrap();
+    let mut primaries = state
+        .primary_devices
+        .write()
+        .map_err(|e| AppError::Session(format!("Lock poisoned: {e}")))?;
     primaries.insert(device_type, device_id);
     Ok(())
 }
@@ -240,7 +243,10 @@ pub async fn set_primary_device(
 pub async fn get_primary_devices(
     state: State<'_, AppState>,
 ) -> Result<HashMap<String, String>, AppError> {
-    let primaries = state.primary_devices.read().unwrap();
+    let primaries = state
+        .primary_devices
+        .read()
+        .map_err(|e| AppError::Session(format!("Lock poisoned: {e}")))?;
     Ok(format_primaries(&primaries))
 }
 

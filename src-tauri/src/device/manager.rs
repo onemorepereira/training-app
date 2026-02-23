@@ -331,7 +331,7 @@ impl DeviceManager {
                 Err(e) => return Err(BleError::Btleplug(format!("BLE init failed: {}", e)).into()),
             }
         }
-        let ble = self.ble.as_ref().unwrap();
+        let ble = self.ble.as_ref().ok_or(BleError::NotInitialized)?;
         let mut info = ble.connect_device(device_id).await?;
 
         // Read DIS metadata to populate manufacturer/model/serial
