@@ -2,6 +2,7 @@
   import PowerGauge from '$lib/components/PowerGauge.svelte';
   import MetricCard from '$lib/components/MetricCard.svelte';
   import MetricsChart from '$lib/components/MetricsChart.svelte';
+  import RetroRide from '$lib/components/RetroRide.svelte';
   import TrainerControl from '$lib/components/TrainerControl.svelte';
   import ZoneRideBuilder from '$lib/components/ZoneRideBuilder.svelte';
   import ZoneRideStatus from '$lib/components/ZoneRideStatus.svelte';
@@ -136,6 +137,9 @@
       <button class="toggle-tab" class:active={$dashboardView === 'graphs'} onclick={() => $dashboardView = 'graphs'}>
         Graphs
       </button>
+      <button class="toggle-tab" class:active={$dashboardView === 'retro'} onclick={() => $dashboardView = 'retro'}>
+        Retro
+      </button>
     </div>
     <button class="fullscreen-btn" onclick={toggleFullscreen} aria-label="Toggle fullscreen (Esc)">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -150,7 +154,7 @@
   <div class="dash-main">
     {#if $dashboardView === 'gauges'}
       <div class="gauge-section">
-        <PowerGauge power={$currentPower} />
+        <PowerGauge power={$currentPower} ftp={userConfig?.ftp} />
       </div>
 
       <div class="metrics-grid">
@@ -163,9 +167,13 @@
           size="lg"
         />
       </div>
-    {:else}
+    {:else if $dashboardView === 'graphs'}
       <div class="chart-section">
         <MetricsChart {zoneBand} />
+      </div>
+    {:else if $dashboardView === 'retro'}
+      <div class="retro-section">
+        <RetroRide />
       </div>
     {/if}
   </div>
@@ -301,6 +309,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-md);
+    padding-bottom: var(--space-xl);
   }
 
   .dash-header {
@@ -370,6 +379,10 @@
 
   .chart-section {
     height: clamp(240px, 40vh, 500px);
+    position: relative;
+  }
+
+  .retro-section {
     position: relative;
   }
 
