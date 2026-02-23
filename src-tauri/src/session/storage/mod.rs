@@ -90,6 +90,12 @@ impl Storage {
         for stmt in migration_006_stmts {
             run_alter_ignore_duplicate(&pool, stmt).await?;
         }
+        // Migration 007: zone ride config snapshot per session
+        run_alter_ignore_duplicate(
+            &pool,
+            "ALTER TABLE sessions ADD COLUMN zone_config TEXT",
+        )
+        .await?;
         // Migration 008: work (kJ) and variability index
         let migration_008_stmts = [
             "ALTER TABLE sessions ADD COLUMN work_kj REAL",
@@ -772,6 +778,25 @@ mod tests {
 
         let new_dev = devices.iter().find(|d| d.id == "ble-new").unwrap();
         assert_eq!(new_dev.name, Some("HRM".to_string()));
+    }
+
+    #[tokio::test]
+    async fn save_and_get_zone_config() {
+        let (storage, _tmp) = test_storage().await;
+        let summary = make_summary("zc-1");
+        storage.save_session(&summary, b"raw").await.unwrap();
+
+        // No zone config initially
+        let config = storage.get_zone_config("zc-1").await.unwrap();
+        assert_eq!(config, None);
+
+        // Save zone config
+        let zone_json = r#"{"mode":"zone","zone":3}"#;
+        storage.save_zone_config("zc-1", zone_json).await.unwrap();
+
+        // Read it back
+        let config = storage.get_zone_config("zc-1").await.unwrap();
+        assert_eq!(config, Some(zone_json.to_string()));
     }
 
     #[tokio::test]
