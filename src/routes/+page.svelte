@@ -8,7 +8,7 @@
   import ZoneRideStatus from '$lib/components/ZoneRideStatus.svelte';
   import ConnectionHealth from '$lib/components/ConnectionHealth.svelte';
   import { currentPower, currentHR, currentCadence, currentSpeed, liveMetrics } from '$lib/stores/sensor';
-  import { sessionActive, sessionPaused, sessionId, dashboardView } from '$lib/stores/session';
+  import { sessionActive, sessionPaused, sessionId, dashboardView, requestStart, requestStop } from '$lib/stores/session';
   import { autoSessionEnabled, autoSessionCountdown } from '$lib/stores/autoSession';
   import { trainerConnected } from '$lib/stores/devices';
   import { unitSystem, formatSpeed, speedUnit } from '$lib/stores/units';
@@ -45,10 +45,7 @@
           try { await stopZoneRide(); } catch { /* best-effort */ }
         }
         const currentSessionId = $sessionId;
-        const result = await api.stopSession();
-        sessionActive.set(false);
-        sessionId.set(null);
-        sessionPaused.set(false);
+        const result = await requestStop();
         showZoneBuilder = false;
         stopZonePolling();
 
@@ -73,10 +70,7 @@
           postRideSession = result;
         }
       } else {
-        const id = await api.startSession();
-        sessionId.set(id);
-        sessionActive.set(true);
-        sessionPaused.set(false);
+        await requestStart();
       }
     } catch (e) {
       error = extractError(e);
