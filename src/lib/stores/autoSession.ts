@@ -1,7 +1,6 @@
 import { writable, get } from 'svelte/store';
 import { currentCadence, currentSpeed, liveMetrics } from '$lib/stores/sensor';
-import { sessionActive, sessionId, sessionPaused } from '$lib/stores/session';
-import { api } from '$lib/tauri';
+import { sessionActive, requestStart, requestStop } from '$lib/stores/session';
 
 export const autoSessionEnabled = writable(false);
 export const autoSessionCountdown = writable<number | null>(null);
@@ -12,8 +11,6 @@ const AUTO_STOP_THRESHOLD_SECS = 3;
 let tickInterval: ReturnType<typeof setInterval> | null = null;
 let cadenceAboveZeroTicks = 0;
 let speedZeroTicks = 0;
-let starting = false;
-let stopping = false;
 
 function tick() {
   const enabled = get(autoSessionEnabled);
@@ -36,7 +33,7 @@ function tick() {
       } else {
         autoSessionCountdown.set(null);
         cadenceAboveZeroTicks = 0;
-        startSession();
+        requestStart().catch(() => {});
       }
     } else {
       cadenceAboveZeroTicks = 0;
@@ -52,7 +49,7 @@ function tick() {
       speedZeroTicks++;
       if (speedZeroTicks >= AUTO_STOP_THRESHOLD_SECS) {
         speedZeroTicks = 0;
-        stopSession();
+        requestStop().catch(() => {});
       }
     } else {
       speedZeroTicks = 0;
@@ -60,36 +57,6 @@ function tick() {
     // Reset start counter when session is active
     cadenceAboveZeroTicks = 0;
     autoSessionCountdown.set(null);
-  }
-}
-
-async function startSession() {
-  if (starting) return;
-  starting = true;
-  try {
-    const id = await api.startSession();
-    sessionId.set(id);
-    sessionActive.set(true);
-    sessionPaused.set(false);
-  } catch {
-    // Ignore — user can still start manually
-  } finally {
-    starting = false;
-  }
-}
-
-async function stopSession() {
-  if (stopping) return;
-  stopping = true;
-  try {
-    await api.stopSession();
-    sessionActive.set(false);
-    sessionId.set(null);
-    sessionPaused.set(false);
-  } catch {
-    // Ignore — user can still stop manually
-  } finally {
-    stopping = false;
   }
 }
 
@@ -110,6 +77,4 @@ export function destroyAutoSession() {
     tickInterval = null;
   }
   resetCounters();
-  starting = false;
-  stopping = false;
 }
