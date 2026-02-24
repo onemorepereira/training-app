@@ -17,9 +17,24 @@ A cycling training application with real-time sensor support over BLE and ANT+.
 - Session history and activity metadata
 - Device management with auto-reconnect for known devices
 
+## Install (macOS)
+
+```bash
+brew tap onemorepereira/training-app
+brew install --cask --no-quarantine training-app
+```
+
+The `--no-quarantine` flag is required because the app is not signed with an Apple Developer certificate. Without it, macOS will block the app from launching.
+
+To update:
+
+```bash
+brew upgrade training-app
+```
+
 ## Prerequisites
 
-- Linux (other platforms not yet tested)
+- Linux or macOS (Apple Silicon)
 - Rust toolchain (1.77.2+)
 - Node.js and npm
 - System dependencies for Tauri v2: see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
