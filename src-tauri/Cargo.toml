@@ -31,7 +31,7 @@ log = "0.4"
 flexi_logger = "0.29"
 thiserror = "2"
 futures = "0.3"
-rusb = "0.9"
+rusb = { version = "0.9", features = ["vendored"] }
 tauri-plugin-opener = "2.5.3"
 
 [features]
