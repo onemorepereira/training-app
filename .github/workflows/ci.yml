@@ -8,7 +8,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +32,8 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -32,6 +42,10 @@ jobs:
             librsvg2-dev \
             patchelf \
             libusb-1.0-0-dev
+
+      - name: Install system dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: brew install libusb
 
       - name: Cache Cargo registry and target
         uses: actions/cache@v4

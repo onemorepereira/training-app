@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PrereqStatus {
@@ -17,6 +16,32 @@ pub struct FixResult {
     pub status: PrereqStatus,
 }
 
+// macOS and Windows handle BLE natively (Core Bluetooth / WinRT) and don't
+// need udev rules, BlueZ, or systemd. Return "all met" on non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn check() -> PrereqStatus {
+    PrereqStatus {
+        udev_rules: true,
+        bluez_installed: true,
+        bluetooth_service: true,
+        all_met: true,
+        pkexec_available: false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn fix(_udev_rules_source: &str) -> FixResult {
+    FixResult {
+        success: true,
+        message: "No prerequisites needed on this platform.".into(),
+        status: check(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+use std::process::Command;
+
+#[cfg(target_os = "linux")]
 fn check_udev_rules() -> bool {
     match std::fs::read_to_string("/etc/udev/rules.d/99-ant-usb.rules") {
         Ok(contents) => {
@@ -26,6 +51,7 @@ fn check_udev_rules() -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn check_bluez_installed() -> bool {
     Command::new("bluetoothctl")
         .arg("--version")
@@ -34,6 +60,7 @@ fn check_bluez_installed() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
 fn check_bluetooth_service() -> bool {
     Command::new("systemctl")
         .args(["is-active", "bluetooth"])
@@ -45,6 +72,7 @@ fn check_bluetooth_service() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
 fn is_pkexec_available() -> bool {
     Command::new("which")
         .arg("pkexec")
@@ -53,6 +81,7 @@ fn is_pkexec_available() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
 pub fn check() -> PrereqStatus {
     let udev_rules = check_udev_rules();
     let bluez_installed = check_bluez_installed();
@@ -67,6 +96,7 @@ pub fn check() -> PrereqStatus {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn detect_package_manager() -> Option<&'static str> {
     for cmd in ["apt-get", "dnf", "pacman"] {
         if Command::new("which")
@@ -84,6 +114,7 @@ fn detect_package_manager() -> Option<&'static str> {
 /// Build the list of commands to run as root via pkexec.
 /// Each entry is a Vec of arguments to pass to `pkexec` directly,
 /// avoiding shell script construction and shell injection risks.
+#[cfg(target_os = "linux")]
 fn build_fix_commands(status: &PrereqStatus, udev_rules_source: &str) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
 
@@ -128,6 +159,7 @@ fn build_fix_commands(status: &PrereqStatus, udev_rules_source: &str) -> Vec<Vec
     commands
 }
 
+#[cfg(target_os = "linux")]
 pub fn fix(udev_rules_source: &str) -> FixResult {
     let status = check();
     if status.all_met {
@@ -189,6 +221,7 @@ pub fn fix(udev_rules_source: &str) -> FixResult {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod tests {
     use super::*;
 
