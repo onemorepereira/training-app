@@ -71,7 +71,9 @@ impl AntUsb {
                     .open()
                     .map_err(|e| AntError::Usb(format!("Failed to open ANT stick: {}", e)))?;
 
-                // Detach kernel driver if attached
+                // Detach kernel driver if attached (Linux-only; macOS/Windows
+                // don't have kernel drivers for USB devices)
+                #[cfg(target_os = "linux")]
                 if handle.kernel_driver_active(0).unwrap_or(false) {
                     handle.detach_kernel_driver(0).map_err(|e| {
                         AntError::Usb(format!("Failed to detach kernel driver: {}", e))
@@ -113,6 +115,7 @@ impl AntUsb {
                     .map_err(|e| AntError::Usb(format!("Failed to reset: {}", e)))?;
 
                 // Re-claim after reset
+                #[cfg(target_os = "linux")]
                 if handle.kernel_driver_active(0).unwrap_or(false) {
                     let _ = handle.detach_kernel_driver(0);
                 }
@@ -176,6 +179,7 @@ impl Drop for AntUsb {
             msg_id: MSG_SYSTEM_RESET,
             data: vec![0x00],
         });
+        #[cfg(target_os = "linux")]
         let _ = self.handle.attach_kernel_driver(0);
     }
 }
