@@ -55,6 +55,68 @@
       </div>
     </div>
   </section>
+
+  <section class="section">
+    <h2 class="section-title">Frameworks & Libraries</h2>
+    <div class="field-group">
+      <div class="field">
+        <span class="field-label">App Framework</span>
+        <button class="link" onclick={() => openUrl('https://tauri.app')}>Tauri</button>
+      </div>
+      <div class="field">
+        <span class="field-label">UI Framework</span>
+        <button class="link" onclick={() => openUrl('https://svelte.dev')}>Svelte</button>
+      </div>
+      <div class="field">
+        <span class="field-label">Charts</span>
+        <button class="link" onclick={() => openUrl('https://echarts.apache.org')}>Apache ECharts</button>
+      </div>
+      <div class="field">
+        <span class="field-label">Bluetooth</span>
+        <button class="link" onclick={() => openUrl('https://github.com/deviceplug/btleplug')}>btleplug</button>
+      </div>
+      <div class="field">
+        <span class="field-label">Database</span>
+        <button class="link" onclick={() => openUrl('https://github.com/launchbadge/sqlx')}>SQLx</button>
+      </div>
+      <div class="field">
+        <span class="field-label">Async Runtime</span>
+        <button class="link" onclick={() => openUrl('https://tokio.rs')}>Tokio</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2 class="section-title">Fonts</h2>
+    <div class="field-group">
+      <div class="field">
+        <span class="field-label">Sans-serif</span>
+        <button class="link" onclick={() => openUrl('https://fonts.google.com/specimen/Outfit')}>Outfit</button>
+      </div>
+      <div class="field">
+        <span class="field-label">Monospace</span>
+        <button class="link" onclick={() => openUrl('https://fonts.google.com/specimen/IBM+Plex+Mono')}>IBM Plex Mono</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2 class="section-title">Protocols & Standards</h2>
+    <div class="field-group">
+      <div class="field">
+        <span class="field-label">ANT+</span>
+        <button class="link" onclick={() => openUrl('https://www.thisisant.com')}>Garmin ANT+</button>
+      </div>
+      <div class="field">
+        <span class="field-label">BLE FTMS</span>
+        <button class="link" onclick={() => openUrl('https://www.bluetooth.com/specifications/specs/fitness-machine-service-1-0')}>Bluetooth FTMS</button>
+      </div>
+      <div class="field">
+        <span class="field-label">Activity Files</span>
+        <button class="link" onclick={() => openUrl('https://developer.garmin.com/fit/overview')}>Garmin FIT SDK</button>
+      </div>
+    </div>
+  </section>
 </div>
 
 <style>
