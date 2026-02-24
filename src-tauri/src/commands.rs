@@ -431,10 +431,11 @@ pub async fn start_zone_control(
         None
     };
 
+    let power_zones = Some(config.power_zones);
     let dm = state.device_manager.clone();
     let tx = state.sensor_tx.clone();
     let mut zc = state.zone_controller.lock().await;
-    zc.start_with_config(target, dm, tx, ftp, max_hr, initial_power_estimate).await
+    zc.start_with_config(target, dm, tx, ftp, max_hr, initial_power_estimate, power_zones).await
 }
 
 #[tauri::command]

@@ -58,6 +58,10 @@ impl PidController {
     pub fn decay_integral(&mut self, factor: f64) {
         self.integral *= factor;
     }
+
+    pub fn reset_integral(&mut self) {
+        self.integral = 0.0;
+    }
 }
 
 use std::collections::VecDeque;
@@ -328,5 +332,15 @@ mod tests {
         pid.update(5.0, 5.0); // integral = 25
         pid.decay_integral(0.0);
         assert_approx(pid.integral(), 0.0, 0.01, "factor 0.0 clears");
+    }
+
+    #[test]
+    fn reset_integral_clears_accumulated_state() {
+        // Accumulate integral to 25, reset, verify integral() == 0
+        let mut pid = PidController::with_limits(0.0, 1.0, 0.0, 200.0, 100.0);
+        pid.update(5.0, 5.0); // integral = 25
+        assert_approx(pid.integral(), 25.0, 0.01, "before reset");
+        pid.reset_integral();
+        assert_approx(pid.integral(), 0.0, 0.01, "after reset");
     }
 }
