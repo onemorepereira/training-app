@@ -140,8 +140,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/onemorepereira/homebrew-training-app.git" tap
+          git clone "https://github.com/onemorepereira/homebrew-training-app.git" tap
           cd tap
+          git config http.https://github.com/.extraheader "Authorization: basic $(echo -n "x-access-token:${GH_TOKEN}" | base64)"
 
           cat > Casks/training-app.rb << RUBY
           cask "training-app" do
