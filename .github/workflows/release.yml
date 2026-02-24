@@ -119,3 +119,49 @@ jobs:
         with:
           generate_release_notes: true
           files: artifacts/**/*
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for release assets to propagate
+        run: sleep 10
+
+      - name: Download macOS DMG and compute SHA256
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_URL="https://github.com/onemorepereira/training-app/releases/download/v${VERSION}/training-app_${VERSION}_aarch64.dmg"
+          curl -sL "$DMG_URL" -o training-app.dmg
+          SHA256=$(shasum -a 256 training-app.dmg | awk '{print $1}')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+
+      - name: Update Homebrew cask
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/onemorepereira/homebrew-training-app.git" tap
+          cd tap
+
+          cat > Casks/training-app.rb << RUBY
+          cask "training-app" do
+            version "${VERSION}"
+            sha256 "${SHA256}"
+
+            url "https://github.com/onemorepereira/training-app/releases/download/v#{version}/training-app_#{version}_aarch64.dmg"
+            name "Training App"
+            desc "A cycling training application"
+            homepage "https://github.com/onemorepereira/training-app"
+
+            app "training-app.app"
+          end
+          RUBY
+
+          # Remove heredoc indentation
+          sed -i 's/^          //' Casks/training-app.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/training-app.rb
+          git commit -m "Update training-app to ${VERSION}"
+          git push
