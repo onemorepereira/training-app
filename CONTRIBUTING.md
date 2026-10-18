@@ -2,21 +2,28 @@
 
 ## Setup
 
-1. Fork and clone the repo
+1. Fork the repo, clone your fork, and add the upstream remote:
+
+   ```bash
+   git remote add upstream https://github.com/onemorepereira/training-app.git
+   ```
+
 2. Install prerequisites (see [README.md](README.md#prerequisites))
 3. Install dependencies:
 
-```bash
-npm install
-```
+   ```bash
+   npm install
+   ```
 
 4. Verify everything builds and passes:
 
-```bash
-cd src-tauri && cargo test
-npm test
-npm run check
-```
+   ```bash
+   cd src-tauri && cargo test
+   npm test
+   npm run check
+   ```
+
+5. Run the app with `npm run tauri dev`. Without sensors, use the simulator in the dev toolbar on the dashboard. It's only compiled into development builds.
 
 ## Workflow
 
@@ -29,11 +36,12 @@ Browse [open issues](https://github.com/onemorepereira/training-app/issues). If 
 Branch from `main` with a descriptive name:
 
 ```bash
-git checkout main && git pull origin main
-git checkout -b <type>/<issue-number>-<short-description>
+git checkout main && git pull upstream main
+git checkout -b <type>/<issue-number>-<short-description>   # issue number optional if there's no issue
 ```
 
 Branch name conventions:
+
 - `fix/` for bug fixes (e.g., `fix/3-shell-injection-prerequisites`)
 - `feat/` for new features (e.g., `feat/42-session-export-csv`)
 - `docs/` for documentation (e.g., `docs/contributing-guide`)
@@ -50,7 +58,7 @@ Branch name conventions:
 
 ```bash
 cd src-tauri && cargo test          # All Rust tests must pass
-npm test                            # Frontend unit tests must pass
+npm test                            # Frontend unit tests (Vitest) must pass
 npm run check                       # Frontend type checking must pass
 ```
 
@@ -58,7 +66,7 @@ npm run check                       # Frontend type checking must pass
 
 Write a clear commit message:
 
-```
+```text
 <imperative summary of what changed>
 
 <optional body explaining why, not what>
@@ -68,7 +76,7 @@ Closes #<issue-number>
 
 Example:
 
-```
+```text
 Fix shell injection risk in prerequisites fix script
 
 Replace build_fix_script (bash string interpolation) with
@@ -93,7 +101,7 @@ Then open a pull request against `main`. In the PR body:
 
 ### 7. CI and review
 
-- CI runs automatically on every PR (Rust tests + frontend type check)
+- CI runs automatically on every PR, on Linux and macOS: `cargo test`, `npm run check` and `npm test`. On PRs it also fails if an already-shipped migration file was edited, renamed or deleted
 - PRs require passing CI before merge
 - All PRs are squash-merged to keep a clean linear history
 
@@ -105,7 +113,7 @@ Then open a pull request against `main`. In the PR body:
 - Every test must answer: **"What breaks if this test is deleted?"**
 - Use hand-computed reference values in assertions, not just `is_some()`
 - Prioritize edge cases over happy paths
-- Use `assert_approx(actual, expected, epsilon, msg)` for float comparisons
+- Use `assert_approx(actual, expected, epsilon, msg)` for float comparisons. There's no shared helper: each test module defines its own (see `session/metrics.rs`), so copy it into a new module
 - Epsilon guidance: watts +/-0.1, ratios +/-0.01, TSS +/-0.5
 - Test one concept per test; name after behavior (e.g., `np_constant_power_equals_that_power`)
 
@@ -133,25 +141,33 @@ Rules:
 - Use Svelte 5 runes (`$state`, `$derived`, `$effect`)
 - Type all Tauri API calls — see `src/lib/tauri.ts`
 - Handle Tauri command errors gracefully in the UI
+- Put pure logic (formatting, zone math, analytics) in `src/lib/utils/` with a colocated `*.test.ts` Vitest file
 
 ### Project commands
 
 ```bash
 cd src-tauri && cargo test                         # All Rust tests
 cd src-tauri && cargo test --lib session::metrics   # Specific module
-npm test                                            # Frontend unit tests
+npm test                                            # Frontend unit tests (Vitest)
 npm run check                                       # Frontend types
-npm run dev                                         # Dev server
+npm run tauri dev                                   # Run the app (dev build)
 npm run build:release                               # Production build
 ```
 
 ## Releases
 
-Releases are automated. When a version tag is pushed:
+Releases are cut by pushing a version tag. Current releases use a `-beta` suffix:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.7.5-beta
+git push origin v0.7.5-beta
 ```
 
-The release workflow builds Linux packages (.deb, .AppImage, .rpm) and publishes them as a GitHub Release with auto-generated release notes.
+The [release workflow](.github/workflows/release.yml) then:
+
+1. Sets the version from the tag in `tauri.conf.json`, `Cargo.toml`, and `package.json`, in CI only. The committed versions stay at `0.1.0`
+2. Runs `cargo test`, `npm run check` and `npm test` on Linux and macOS
+3. Builds Linux x86_64 packages (`.deb`, `.rpm`, `.AppImage`) and a macOS Apple Silicon `.dmg`
+4. Publishes them as a GitHub Release with auto-generated release notes
+
+The Homebrew cask in [onemorepereira/homebrew-training-app](https://github.com/onemorepereira/homebrew-training-app) is updated by that repo's own workflow, not by this one. The workflow runs hourly (or by hand via `workflow_dispatch`) and reads GitHub's `releases/latest`. That endpoint skips prereleases, so **don't mark releases as prerelease**, or Homebrew users will never get them. Expect the cask to catch up within about an hour.
