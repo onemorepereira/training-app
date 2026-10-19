@@ -353,6 +353,7 @@ mod tests {
             activity_type: None,
             rpe: None,
             notes: None,
+            zones: None,
         }
     }
 

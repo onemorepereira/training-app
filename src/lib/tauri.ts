@@ -64,6 +64,7 @@ export interface SessionSummary {
   activity_type?: string;
   rpe?: number;
   notes?: string;
+  zones?: ZoneSnapshot | null;
 }
 
 export interface SessionConfig {
@@ -138,6 +139,13 @@ export interface SessionAnalysis {
   power_zone_distribution: ZoneBucket[];
   hr_zone_distribution: ZoneBucket[];
   pwc: PwcMarkers | null;
+  /** Zones the distributions used (session snapshot, or current zones for older sessions). */
+  zones: ZoneSnapshot;
+}
+
+export interface ZoneSnapshot {
+  power_zones: [number, number, number, number, number, number];
+  hr_zones: [number, number, number, number, number];
 }
 
 export type ZoneMode = 'Power' | 'HeartRate';

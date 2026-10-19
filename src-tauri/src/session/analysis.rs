@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use super::gap::{self, capped_interval_ms};
 
 use crate::device::types::SensorReading;
-use crate::session::types::{SessionConfig, SessionSummary};
+use crate::session::types::{SessionConfig, SessionSummary, ZoneSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionAnalysis {
@@ -13,6 +13,9 @@ pub struct SessionAnalysis {
     pub power_zone_distribution: Vec<ZoneBucket>,
     pub hr_zone_distribution: Vec<ZoneBucket>,
     pub pwc: Option<PwcMarkers>,
+    /// Zones the distributions were computed with: the session's snapshot,
+    /// or the current zones for sessions recorded before snapshots existed.
+    pub zones: ZoneSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,8 +60,9 @@ pub fn compute_analysis(
     let timeseries = build_timeseries(readings);
     let power_curve = compute_power_curve(readings);
     let ftp = session.ftp.unwrap_or(config.ftp);
+    let zones = session.zones.unwrap_or_else(|| ZoneSnapshot::from(config));
     let (power_zone_distribution, hr_zone_distribution) =
-        compute_zone_distribution(readings, ftp, &config.power_zones, &config.hr_zones);
+        compute_zone_distribution(readings, ftp, &zones.power_zones, &zones.hr_zones);
     let pwc = compute_pwc(&timeseries);
     SessionAnalysis {
         timeseries,
@@ -66,6 +70,7 @@ pub fn compute_analysis(
         power_zone_distribution,
         hr_zone_distribution,
         pwc,
+        zones,
     }
 }
 
@@ -429,6 +434,7 @@ mod tests {
             activity_type: None,
             rpe: None,
             notes: None,
+            zones: None,
         }
     }
 
@@ -714,6 +720,45 @@ mod tests {
 
         assert_eq!(analysis.timeseries.len(), 2);
         assert_eq!(analysis.timeseries[1].elapsed_secs, 1_718_445_600.0);
+    }
+
+    // --- Zone snapshot ---
+
+    fn snapshot_zones() -> ZoneSnapshot {
+        ZoneSnapshot {
+            power_zones: [45, 60, 75, 90, 105, 120],
+            hr_zones: [100, 120, 140, 160, 180],
+        }
+    }
+
+    #[test]
+    fn zone_distribution_uses_session_zones_snapshot() {
+        // 100W at FTP 200 = 50%: Z1 with today's zones (≤55%), Z2 with the
+        // snapshot (45 < 50 ≤ 60). HR 110: Z1 today (≤120), Z2 in snapshot.
+        let readings: Vec<SensorReading> = (0..10)
+            .flat_map(|i| [power_reading(100, i * 1000), hr_reading(110, i * 1000 + 500)])
+            .collect();
+        let mut session = test_session(10, 200);
+        session.zones = Some(snapshot_zones());
+
+        let analysis = compute_analysis(&readings, &session, &test_config());
+
+        assert_approx(analysis.power_zone_distribution[1].percentage, 100.0, 0.01, "power Z2");
+        assert_approx(analysis.hr_zone_distribution[1].percentage, 100.0, 0.01, "HR Z2");
+        assert_eq!(analysis.zones, snapshot_zones(), "reports the zones it used");
+    }
+
+    #[test]
+    fn analysis_falls_back_to_config_zones_when_snapshot_missing() {
+        let readings: Vec<SensorReading> =
+            (0..10).map(|i| power_reading(100, i * 1000)).collect();
+        let session = test_session(10, 200); // zones: None (pre-snapshot session)
+        let config = test_config();
+
+        let analysis = compute_analysis(&readings, &session, &config);
+
+        assert_approx(analysis.power_zone_distribution[0].percentage, 100.0, 0.01, "power Z1");
+        assert_eq!(analysis.zones, ZoneSnapshot::from(&config));
     }
 
     // --- compute_analysis FTP fallback ---

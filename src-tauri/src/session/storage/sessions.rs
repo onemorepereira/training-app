@@ -6,7 +6,7 @@ use super::fsio::{io_error, remove_durable, write_durable};
 use super::Storage;
 use crate::device::types::{CommandSource, SensorReading};
 use crate::error::AppError;
-use crate::session::types::SessionSummary;
+use crate::session::types::{SessionSummary, ZoneSnapshot};
 
 /// Legacy sensor reading format: Power variant lacked pedal_balance field because
 /// #[serde(skip_serializing_if)] silently dropped it from bincode output.
@@ -102,6 +102,7 @@ struct SessionRow {
     activity_type: Option<String>,
     rpe: Option<i32>,
     notes: Option<String>,
+    zones: Option<String>,
 }
 
 impl TryFrom<SessionRow> for SessionSummary {
@@ -116,6 +117,13 @@ impl TryFrom<SessionRow> for SessionSummary {
                     row.start_time, row.id, e
                 ))
             })?;
+        // A malformed snapshot must not hide the session: fall back to "unknown"
+        // (analysis then uses the current zones) and log it.
+        let zones = row.zones.as_deref().and_then(|json| {
+            serde_json::from_str::<ZoneSnapshot>(json)
+                .map_err(|e| warn!("Ignoring malformed zones for session {}: {}", row.id, e))
+                .ok()
+        });
         Ok(Self {
             id: row.id,
             start_time,
@@ -137,6 +145,7 @@ impl TryFrom<SessionRow> for SessionSummary {
             activity_type: row.activity_type,
             rpe: row.rpe.map(|v| v as u8),
             notes: row.notes,
+            zones,
         })
     }
 }
@@ -182,6 +191,13 @@ impl Storage {
             summary.id, summary.duration_secs
         );
         let raw_file = self.raw_path(&summary.id);
+        // Encode before touching any file so an encoding error can't leave a
+        // raw file without a row.
+        let zones_json = summary
+            .zones
+            .map(|z| serde_json::to_string(&z))
+            .transpose()
+            .map_err(|e| AppError::Serialization(format!("Failed to encode zones: {}", e)))?;
 
         if self.session_exists(&summary.id).await? {
             let raw_present = tokio::fs::try_exists(&raw_file)
@@ -228,8 +244,8 @@ impl Storage {
             "INSERT OR IGNORE INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
              normalized_power, tss, intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, \
              work_kj, variability_index, distance_km, \
-             raw_file_path, title, activity_type, rpe, notes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             raw_file_path, title, activity_type, rpe, notes, zones) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&summary.id)
         .bind(summary.start_time.to_rfc3339())
@@ -252,6 +268,7 @@ impl Storage {
         .bind(&summary.activity_type)
         .bind(summary.rpe.map(|v| v as i32))
         .bind(&summary.notes)
+        .bind(zones_json)
         .execute(&self.pool)
         .await
         .map_err(AppError::Database)?;
@@ -297,7 +314,7 @@ impl Storage {
         let rows = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
              intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
-             distance_km, title, activity_type, rpe, notes FROM sessions ORDER BY start_time DESC",
+             distance_km, title, activity_type, rpe, notes, zones FROM sessions ORDER BY start_time DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -309,7 +326,7 @@ impl Storage {
         let row = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
              intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
-             distance_km, title, activity_type, rpe, notes FROM sessions WHERE id = ?",
+             distance_km, title, activity_type, rpe, notes, zones FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_one(&self.pool)

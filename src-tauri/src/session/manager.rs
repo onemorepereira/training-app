@@ -246,6 +246,7 @@ fn build_summary(session: &ActiveSession) -> SessionSummary {
         activity_type: None,
         rpe: None,
         notes: None,
+        zones: Some(ZoneSnapshot::from(&session.config)),
     }
 }
 
@@ -551,6 +552,24 @@ mod tests {
         feed_constant_power(&mgr, 199, 12, 18).await;
         mgr.process_reading(power_reading_at(199, 30_000)).await;
         assert_eq!(mgr.stop_session().await.unwrap().normalized_power, Some(200));
+    }
+
+    #[tokio::test]
+    async fn stop_summary_captures_zones_from_session_config() {
+        let mgr = SessionManager::new();
+        let mut config = default_config();
+        config.power_zones = [50, 70, 85, 100, 115, 140];
+        config.hr_zones = [110, 130, 150, 165, 180];
+        mgr.start_session(config).await.unwrap();
+        mgr.process_reading(power_reading(200)).await;
+        let summary = mgr.stop_session().await.unwrap();
+        assert_eq!(
+            summary.zones,
+            Some(crate::session::types::ZoneSnapshot {
+                power_zones: [50, 70, 85, 100, 115, 140],
+                hr_zones: [110, 130, 150, 165, 180],
+            })
+        );
     }
 
     #[tokio::test]

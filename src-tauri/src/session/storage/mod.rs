@@ -2,6 +2,7 @@ mod autosave;
 mod config;
 mod devices;
 mod fsio;
+mod meta;
 mod power_curves;
 mod schema;
 mod sessions;
@@ -84,6 +85,7 @@ mod tests {
             activity_type: None,
             rpe: None,
             notes: None,
+            zones: None,
         }
     }
 
@@ -109,6 +111,83 @@ mod tests {
     async fn init_creates_tables() {
         let (_storage, _tmp) = test_storage().await;
         // Success means migrations ran without error
+    }
+
+    #[tokio::test]
+    async fn reopening_storage_is_idempotent_with_app_meta_and_zones() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        {
+            let s = Storage::new(&dir).await.unwrap();
+            let mut summary = make_summary("idem-1");
+            summary.zones = Some(crate::session::types::ZoneSnapshot {
+                power_zones: [50, 70, 85, 100, 115, 140],
+                hr_zones: [110, 130, 150, 165, 180],
+            });
+            s.save_session(&summary, b"raw").await.unwrap();
+            s.set_meta("metrics_version", "2").await.unwrap();
+            s.pool.close().await;
+        }
+        // Second open re-runs every inline migration on an existing DB
+        let s = Storage::new(&dir).await.unwrap();
+        assert!(s.get_session("idem-1").await.unwrap().zones.is_some());
+        assert_eq!(s.get_meta("metrics_version").await.unwrap().as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn save_session_round_trips_zones() {
+        let (storage, _tmp) = test_storage().await;
+        let zones = crate::session::types::ZoneSnapshot {
+            power_zones: [50, 70, 85, 100, 115, 140],
+            hr_zones: [110, 130, 150, 165, 180],
+        };
+        let mut summary = make_summary("zones-1");
+        summary.zones = Some(zones);
+        storage.save_session(&summary, b"raw").await.unwrap();
+
+        assert_eq!(storage.get_session("zones-1").await.unwrap().zones, Some(zones));
+        let listed = storage.list_sessions().await.unwrap();
+        assert_eq!(listed[0].zones, Some(zones));
+    }
+
+    #[test]
+    fn autosave_summary_json_without_zones_still_deserializes() {
+        // JSON written by a build before zone snapshots existed
+        let mut v = serde_json::to_value(make_summary("old-json")).unwrap();
+        v.as_object_mut().unwrap().remove("zones");
+        let s: SessionSummary = serde_json::from_value(v).unwrap();
+        assert_eq!(s.zones, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_row_has_no_zones() {
+        let (storage, _tmp) = test_storage().await;
+        // Row written by an older build: no zones column value
+        sqlx::query("INSERT INTO sessions (id, start_time, duration_secs) VALUES (?, ?, ?)")
+            .bind("legacy-1")
+            .bind("2024-06-15T10:00:00+00:00")
+            .bind(60)
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(storage.get_session("legacy-1").await.unwrap().zones, None);
+    }
+
+    #[tokio::test]
+    async fn get_meta_missing_key_returns_none() {
+        let (storage, _tmp) = test_storage().await;
+        assert_eq!(storage.get_meta("metrics_version").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn set_meta_overwrites_value() {
+        let (storage, _tmp) = test_storage().await;
+        storage.set_meta("metrics_repair_attempts", "1").await.unwrap();
+        storage.set_meta("metrics_repair_attempts", "2").await.unwrap();
+        assert_eq!(
+            storage.get_meta("metrics_repair_attempts").await.unwrap().as_deref(),
+            Some("2")
+        );
     }
 
     #[tokio::test]
@@ -177,6 +256,7 @@ mod tests {
             activity_type: None,
             rpe: None,
             notes: None,
+            zones: None,
         };
         storage.save_session(&summary, b"").await.unwrap();
 
