@@ -112,9 +112,9 @@
       {/if}
     </div>
     <div class="bar-legend">
-      <span class="legend-item"><span class="dot below"></span> Below</span>
-      <span class="legend-item"><span class="dot in-zone"></span> In Zone</span>
-      <span class="legend-item"><span class="dot above"></span> Above</span>
+      <span class="legend-item"><span class="dot below"></span> Below <span class="data">{formatDuration(timeInZone.belowSecs)}</span></span>
+      <span class="legend-item"><span class="dot in-zone"></span> In zone <span class="data">{formatDuration(timeInZone.inZoneSecs)}</span></span>
+      <span class="legend-item"><span class="dot above"></span> Above <span class="data">{formatDuration(timeInZone.aboveSecs)}</span></span>
     </div>
   </div>
 </section>

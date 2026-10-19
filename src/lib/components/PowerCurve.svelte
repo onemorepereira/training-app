@@ -3,6 +3,18 @@
   import * as echarts from 'echarts';
   import { createDisposeGuard } from '$lib/utils/disposeGuard';
   import type { PowerCurvePoint } from '$lib/tauri';
+  import { SERIES, withAlpha, axisLabel, axisNameStyle, axisLine, splitLine, legendDefaults, tooltipDefaults, FONT_DATA } from '$lib/charts/theme';
+
+  /** Durations riders compare (plus 1s as the curve's start), labelled on the log axis. */
+  const KEY_DURATIONS: [number, string][] = [
+    [1, '1s'],
+    [5, '5s'],
+    [60, '1 min'],
+    [300, '5 min'],
+    [1200, '20 min'],
+    [3600, '1 h'],
+  ];
+  const KEY_LABEL = new Map(KEY_DURATIONS);
 
   interface OverlaySeries {
     label: string;
@@ -33,51 +45,35 @@
       backgroundColor: 'transparent',
       animation: false,
       grid: {
-        left: 50,
-        right: 30,
-        top: 30,
+        left: 56,
+        right: 32,
+        top: 36,
         bottom: 40,
       },
       tooltip: {
         trigger: 'axis',
-        backgroundColor: '#1c1c30',
-        borderColor: 'rgba(255,255,255,0.08)',
-        textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
+        ...tooltipDefaults(),
       },
-      legend: {
-        show: false,
-        top: 4,
-        right: 10,
-        textStyle: { color: '#70708a', fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' },
-        itemWidth: 16,
-        itemHeight: 2,
-      },
+      legend: legendDefaults({ show: false, top: 4, right: 10, itemHeight: 3 }),
       xAxis: {
         type: 'log',
         min: 1,
-        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
+        axisLine: axisLine(),
         axisTick: { show: false },
-        axisLabel: {
-          color: '#70708a',
-          fontSize: 10,
-          formatter(value: number) {
-            const ticks: Record<number, string> = {
-              1: '1s', 2: '2s', 5: '5s', 10: '10s', 30: '30s',
-              60: '1m', 120: '2m', 300: '5m', 600: '10m', 1200: '20m', 3600: '1h',
-            };
-            return ticks[value] ?? '';
-          },
-        },
+        axisLabel: axisLabel({
+          customValues: KEY_DURATIONS.map(([d]) => d),
+          formatter: (value: number) => KEY_LABEL.get(value) ?? '',
+        }),
         splitLine: { show: false },
       },
       yAxis: {
         type: 'value',
         name: 'W',
-        nameTextStyle: { color: '#70708a', fontSize: 10 },
+        nameTextStyle: axisNameStyle(),
         min: 0,
-        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.04)' } },
+        splitLine: splitLine(),
         axisLine: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10 },
+        axisLabel: axisLabel(),
       },
       series: [],
     };
@@ -116,6 +112,7 @@
     }
     if (ftpVal) allWatts.push(ftpVal);
 
+    const rideMax = Math.max(...curve.map((p) => p.duration_secs));
     const maxWatts = Math.max(...allWatts);
     const maxDuration = Math.max(...allDurations);
 
@@ -123,12 +120,12 @@
       ? {
           silent: true,
           symbol: 'none',
-          lineStyle: { color: '#ffa726', type: 'dashed' as const, width: 1.5 },
+          lineStyle: { color: SERIES.ftp, type: 'dashed' as const, width: 1.5 },
           label: {
             formatter: `FTP ${ftpVal}W`,
-            color: '#ffa726',
-            fontSize: 11,
-            fontFamily: 'IBM Plex Mono, monospace',
+            color: SERIES.ftp,
+            fontSize: 12,
+            fontFamily: FONT_DATA,
             position: 'insideStartTop' as const,
           },
           data: [{ yAxis: ftpVal }],
@@ -142,12 +139,12 @@
         smooth: true,
         symbol: 'circle',
         symbolSize: 6,
-        lineStyle: { color: '#ff4d6d', width: 2 },
-        itemStyle: { color: '#ff4d6d' },
+        lineStyle: { color: SERIES.power, width: 2 },
+        itemStyle: { color: SERIES.power },
         areaStyle: {
           color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: 'rgba(255, 77, 109, 0.25)' },
-            { offset: 1, color: 'rgba(255, 77, 109, 0)' },
+            { offset: 0, color: withAlpha(SERIES.power, 0.25) },
+            { offset: 1, color: withAlpha(SERIES.power, 0) },
           ]),
         },
         data,
@@ -190,7 +187,11 @@
             return lines.join('<br>');
           },
         },
-        xAxis: { max: maxDuration },
+        // Label only the key durations the ride actually covers.
+        xAxis: {
+          max: maxDuration,
+          axisLabel: { customValues: KEY_DURATIONS.map(([d]) => d).filter((d) => d <= rideMax) },
+        },
         yAxis: { max: Math.ceil(maxWatts / 50) * 50 + 50 },
         series,
       },

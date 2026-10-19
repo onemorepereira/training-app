@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import * as echarts from 'echarts';
   import type { TimeseriesPoint } from '$lib/tauri';
+  import { POWER_ZONE_COLORS, axisLabel, axisLine, splitLine, tooltipDefaults } from '$lib/charts/theme';
 
   interface Props {
     timeseries: TimeseriesPoint[];
@@ -15,7 +16,7 @@
   let chart = $state<echarts.ECharts | null>(null);
 
   // Power zone colors (Z1-Z7), matching ZoneDistribution
-  const ZONE_COLORS = ['#70708a', '#4a90d9', '#4caf50', '#ffc107', '#ff9800', '#f44336', '#b71c1c'];
+  const ZONE_COLORS: readonly string[] = POWER_ZONE_COLORS;
 
   function zoneColor(watts: number): string {
     if (ftp == null || ftp <= 0) return ZONE_COLORS[0];
@@ -57,13 +58,11 @@
     return {
       backgroundColor: 'transparent',
       animation: false,
-      grid: { left: 50, right: 16, top: 16, bottom: 60 },
+      grid: { left: 56, right: 16, top: 16, bottom: 72 },
       tooltip: {
         trigger: 'axis',
         axisPointer: { type: 'shadow' },
-        backgroundColor: '#1c1c30',
-        borderColor: 'rgba(255,255,255,0.08)',
-        textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
+        ...tooltipDefaults(),
         formatter(params: unknown) {
           const item = (params as { name: string; value: number }[])[0];
           if (!item) return '';
@@ -73,24 +72,14 @@
       xAxis: {
         type: 'category',
         data: h.labels,
-        axisLabel: {
-          color: '#a0a0b8',
-          fontSize: 10,
-          fontFamily: 'IBM Plex Mono, monospace',
-          rotate: 45,
-          interval: 0,
-        },
-        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
+        axisLabel: axisLabel({ rotate: 45, hideOverlap: true }),
+        axisLine: axisLine(),
         axisTick: { show: false },
       },
       yAxis: {
         type: 'value',
-        axisLabel: {
-          color: '#70708a',
-          fontSize: 10,
-          formatter: (v: number) => formatSeconds(v),
-        },
-        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.04)' } },
+        axisLabel: axisLabel({ formatter: (v: number) => formatSeconds(v), }),
+        splitLine: splitLine(),
         axisLine: { show: false },
       },
       series: [{

@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
+  import SegmentedControl from '$lib/ui/SegmentedControl.svelte';
+  import StateView from '$lib/ui/StateView.svelte';
+  import Notice from '$lib/ui/Notice.svelte';
   import type { SessionSummary } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
   import { formatDuration, formatDateLong as formatDate, formatDateShort, formatTime } from '$lib/utils/format';
@@ -8,6 +11,9 @@
 
   let sessions = $state<SessionSummary[]>([]);
   let loading = $state(true);
+  /** Failure to load the list (page-level error state). */
+  let loadError = $state('');
+  /** Failure of an action on the list (export), shown as a dismissible notice. */
   let error = $state('');
   let exportingId = $state<string | null>(null);
   let viewMode = $state<'cards' | 'table'>(
@@ -16,19 +22,46 @@
   let sortColumn = $state<string>('start_time');
   let sortAsc = $state(false);
 
-  onMount(async () => {
+  async function load() {
+    loading = true;
+    loadError = '';
     try {
       sessions = await api.listSessions();
     } catch (e) {
-      error = extractError(e);
+      loadError = extractError(e);
     } finally {
       loading = false;
     }
-  });
+  }
+
+  onMount(load);
+
+  const VIEWS = [
+    { value: 'cards', label: 'Cards' },
+    { value: 'table', label: 'Table' },
+  ] as const;
+
+  /** Columns; `minor` ones hide on narrow windows so the table never scrolls sideways. */
+  const COLUMNS = [
+    { key: 'start_time', label: 'Date', minor: false, num: false },
+    { key: 'title', label: 'Title', minor: false, num: false },
+    { key: 'activity_type', label: 'Type', minor: true, num: false },
+    { key: 'duration_secs', label: 'Duration', minor: false, num: true },
+    { key: 'avg_power', label: 'Avg W', minor: true, num: true },
+    { key: 'normalized_power', label: 'NP', minor: false, num: true },
+    { key: 'tss', label: 'TSS', minor: false, num: true },
+    { key: 'intensity_factor', label: 'IF', minor: true, num: true },
+    { key: 'avg_hr', label: 'Avg HR', minor: true, num: true },
+    { key: 'rpe', label: 'RPE', minor: false, num: true },
+  ];
 
   function setViewMode(mode: 'cards' | 'table') {
     viewMode = mode;
-    localStorage.setItem('historyView', mode);
+    try {
+      localStorage.setItem('historyView', mode);
+    } catch {
+      // Storage unavailable: the choice just isn't remembered.
+    }
   }
 
   function toggleSort(column: string) {
@@ -67,6 +100,7 @@
 
   async function exportFit(e: Event, sessionId: string) {
     e.stopPropagation();
+    error = '';
     exportingId = sessionId;
     try {
       await api.exportSessionFit(sessionId);
@@ -78,119 +112,93 @@
   }
 </script>
 
-<div class="page">
+<div class="page-wide" data-page="history">
   <div class="page-header">
-    <h1>History</h1>
-    {#if sessions.length > 0}
-      <div class="view-toggle">
-        <button
-          class="toggle-btn"
-          class:active={viewMode === 'cards'}
-          onclick={() => setViewMode('cards')}
-          aria-label="Card view"
-        >
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
-          </svg>
-        </button>
-        <button
-          class="toggle-btn"
-          class:active={viewMode === 'table'}
-          onclick={() => setViewMode('table')}
-          aria-label="Table view"
-        >
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
-          </svg>
-        </button>
-      </div>
+    <div class="heading">
+      <h1 class="page-title">History</h1>
+      {#if !loading && !loadError && sessions.length > 0}
+        <span class="count">{sessions.length} ride{sessions.length === 1 ? '' : 's'}</span>
+      {/if}
+    </div>
+    {#if !loading && !loadError && sessions.length > 0}
+      <SegmentedControl label="Layout" options={VIEWS} value={viewMode} onchange={setViewMode} />
     {/if}
   </div>
 
   {#if error}
-    <div class="error-banner">{error}</div>
+    <div class="notice-slot">
+      <Notice tone="error" title="Couldn't export the ride" ondismiss={() => (error = '')}>{error}</Notice>
+    </div>
   {/if}
 
   {#if loading}
-    <div class="empty-state">
-      <div class="empty-spinner"></div>
-      <p class="empty-text">Loading sessions...</p>
-    </div>
+    <StateView kind="loading" title="Loading your rides…" />
+  {:else if loadError}
+    <StateView
+      kind="error"
+      title="Couldn't load your rides"
+      message="Your rides are safe; the list just couldn't be read right now."
+      details={loadError}
+      action={{ label: 'Retry', onclick: load }}
+    />
   {:else if sessions.length === 0}
-    <div class="empty-state">
-      <div class="empty-icon">
-        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="4" y="14" width="3" height="6" rx="1"/>
-          <rect x="10.5" y="8" width="3" height="12" rx="1"/>
-          <rect x="17" y="4" width="3" height="16" rx="1"/>
-        </svg>
-      </div>
-      <p class="empty-text">No sessions yet</p>
-      <p class="empty-hint">Complete a ride to see it here</p>
-    </div>
+    <StateView
+      kind="empty"
+      title="No rides yet"
+      message="Start a ride from the Ride screen and it will show up here."
+      action={{ label: 'Go to Ride', onclick: () => goto('/') }}
+    />
   {:else if viewMode === 'cards'}
-    <div class="sessions">
-      {#each sortedSessions as session}
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div class="card" onclick={() => goto('/history/' + session.id)} onkeydown={(e) => e.key === 'Enter' && goto('/history/' + session.id)} tabindex="0" role="button">
-          <div class="card-header">
-            <div class="card-title-row">
-              <span class="card-title">{displayTitle(session)}</span>
+    <div class="cards">
+      {#each sortedSessions as session (session.id)}
+        <article class="card">
+          <div class="card-head">
+            <h2 class="card-title"><a href="/history/{session.id}" class="card-link">{displayTitle(session)}</a></h2>
+            <div class="badges">
               {#if session.activity_type}
                 <span class="type-badge">{TYPE_LABELS[session.activity_type] ?? session.activity_type}</span>
               {/if}
               {#if session.rpe != null}
-                <span class="rpe-badge" style="color: {rpeColor(session.rpe)}">RPE {session.rpe}</span>
+                <span class="rpe-badge data" style="color: {rpeColor(session.rpe)}">RPE {session.rpe}</span>
               {/if}
             </div>
-            <div class="card-subtitle">
-              <span class="date">{formatDate(session.start_time)}</span>
-              <span class="time">{formatTime(session.start_time)}</span>
-            </div>
+            <div class="card-date">{formatDate(session.start_time)} · {formatTime(session.start_time)}</div>
           </div>
-          <div class="card-stats">
+
+          <dl class="card-stats">
             <div class="stat">
-              <span class="stat-value">{formatDuration(session.duration_secs)}</span>
-              <span class="stat-label">Duration</span>
+              <dt>Duration</dt>
+              <dd class="data">{formatDuration(session.duration_secs)}</dd>
             </div>
-            {#if session.avg_power != null}
-              <div class="stat">
-                <span class="stat-value">{session.avg_power}<span class="stat-unit">W</span></span>
-                <span class="stat-label">Avg Power</span>
-              </div>
-            {/if}
-            {#if session.normalized_power != null}
-              <div class="stat">
-                <span class="stat-value">{session.normalized_power}<span class="stat-unit">W</span></span>
-                <span class="stat-label">NP</span>
-              </div>
-            {/if}
-            {#if session.tss != null}
-              <div class="stat">
-                <span class="stat-value">{Math.round(session.tss)}</span>
-                <span class="stat-label">TSS</span>
-              </div>
-            {/if}
-            {#if session.avg_hr != null}
-              <div class="stat">
-                <span class="stat-value">{session.avg_hr}<span class="stat-unit">bpm</span></span>
-                <span class="stat-label">Avg HR</span>
-              </div>
-            {/if}
-          </div>
+            <div class="stat">
+              <dt>Avg power</dt>
+              <dd class="data">{#if session.avg_power != null}{session.avg_power}<span class="stat-unit">W</span>{:else}–{/if}</dd>
+            </div>
+            <div class="stat">
+              <dt>NP · TSS</dt>
+              <dd class="data">{session.normalized_power ?? '–'}{#if session.normalized_power != null}<span class="stat-unit">W</span>{/if} · {session.tss != null ? Math.round(session.tss) : '–'}</dd>
+            </div>
+            <div class="stat">
+              <dt>Avg HR</dt>
+              <dd class="data">{#if session.avg_hr != null}{session.avg_hr}<span class="stat-unit">bpm</span>{:else}–{/if}</dd>
+            </div>
+          </dl>
+
           {#if session.notes}
-            <div class="card-notes">{session.notes.length > 60 ? session.notes.slice(0, 60) + '...' : session.notes}</div>
+            <p class="card-notes">{session.notes}</p>
           {/if}
+
           <div class="card-actions">
             <button
-              class="export-btn"
+              type="button"
+              class="btn btn-secondary export"
               disabled={exportingId === session.id}
               onclick={(e) => exportFit(e, session.id)}
             >
-              {exportingId === session.id ? 'Exporting...' : 'Export FIT'}
+              {exportingId === session.id ? 'Exporting…' : 'Export FIT'}
             </button>
           </div>
-        </div>
+        </article>
       {/each}
     </div>
   {:else}
@@ -198,51 +206,43 @@
       <table class="sessions-table">
         <thead>
           <tr>
-            {#each [
-              { key: 'start_time', label: 'Date' },
-              { key: 'title', label: 'Title' },
-              { key: 'activity_type', label: 'Type' },
-              { key: 'duration_secs', label: 'Duration' },
-              { key: 'avg_power', label: 'Avg W' },
-              { key: 'normalized_power', label: 'NP' },
-              { key: 'tss', label: 'TSS' },
-              { key: 'intensity_factor', label: 'IF' },
-              { key: 'avg_hr', label: 'Avg HR' },
-              { key: 'rpe', label: 'RPE' },
-            ] as col}
-              <th onclick={() => toggleSort(col.key)} class="sortable">
-                {col.label}
-                {#if sortColumn === col.key}
-                  <span class="sort-arrow">{sortAsc ? '\u25B2' : '\u25BC'}</span>
-                {/if}
+            {#each COLUMNS as col (col.key)}
+              <th
+                class:minor={col.minor}
+                class:num={col.num}
+                aria-sort={sortColumn === col.key ? (sortAsc ? 'ascending' : 'descending') : 'none'}
+              >
+                <button type="button" class="sort-btn" onclick={() => toggleSort(col.key)}>
+                  {col.label}
+                  <svg class="sort-icon" class:active={sortColumn === col.key} class:asc={sortColumn === col.key && sortAsc} viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                </button>
               </th>
             {/each}
           </tr>
         </thead>
         <tbody>
-          {#each sortedSessions as session}
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <tr class="table-row" onclick={() => goto('/history/' + session.id)} onkeydown={(e) => e.key === 'Enter' && goto('/history/' + session.id)} tabindex="0">
+          {#each sortedSessions as session (session.id)}
+            <tr class="table-row" onclick={() => goto('/history/' + session.id)}>
               <td class="col-date">{formatDateShort(session.start_time)}</td>
-              <td class="col-title">{displayTitle(session)}</td>
-              <td>
+              <td class="col-title"><a href="/history/{session.id}" onclick={(e) => e.stopPropagation()}>{displayTitle(session)}</a></td>
+              <td class="minor">
                 {#if session.activity_type}
-                  <span class="type-badge small">{TYPE_LABELS[session.activity_type] ?? session.activity_type}</span>
+                  <span class="type-badge">{TYPE_LABELS[session.activity_type] ?? session.activity_type}</span>
                 {:else}
-                  <span class="text-muted">-</span>
+                  <span class="none">–</span>
                 {/if}
               </td>
-              <td class="col-num">{formatDuration(session.duration_secs)}</td>
-              <td class="col-num">{session.avg_power ?? '-'}</td>
-              <td class="col-num">{session.normalized_power ?? '-'}</td>
-              <td class="col-num">{session.tss != null ? Math.round(session.tss) : '-'}</td>
-              <td class="col-num">{session.intensity_factor != null ? session.intensity_factor.toFixed(2) : '-'}</td>
-              <td class="col-num">{session.avg_hr ?? '-'}</td>
-              <td class="col-num">
+              <td class="num data">{formatDuration(session.duration_secs)}</td>
+              <td class="num data minor">{session.avg_power ?? '–'}</td>
+              <td class="num data">{session.normalized_power ?? '–'}</td>
+              <td class="num data">{session.tss != null ? Math.round(session.tss) : '–'}</td>
+              <td class="num data minor">{session.intensity_factor != null ? session.intensity_factor.toFixed(2) : '–'}</td>
+              <td class="num data minor">{session.avg_hr ?? '–'}</td>
+              <td class="num data">
                 {#if session.rpe != null}
                   <span style="color: {rpeColor(session.rpe)}; font-weight: 700">{session.rpe}</span>
                 {:else}
-                  -
+                  <span class="none">–</span>
                 {/if}
               </td>
             </tr>
@@ -254,101 +254,38 @@
 </div>
 
 <style>
-  .page {
-    max-width: 960px;
-  }
-
-  .page-header {
+  .heading {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--space-xl);
+    align-items: baseline;
+    gap: var(--space-md);
   }
 
-  h1 {
-    margin: 0;
-    font-size: var(--text-2xl);
-    font-weight: 800;
-  }
-
-  .view-toggle {
-    display: flex;
-    gap: 2px;
-    background: var(--bg-body);
-    border-radius: var(--radius-md);
-    padding: 3px;
-  }
-
-  .toggle-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 28px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .toggle-btn:hover { color: var(--text-secondary); }
-  .toggle-btn.active {
-    background: var(--bg-elevated);
-    color: var(--accent);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .empty-state {
-    text-align: center;
-    padding: var(--space-3xl) var(--space-lg);
-    color: var(--text-muted);
-  }
-
-  .empty-icon {
-    margin-bottom: var(--space-md);
-    opacity: 0.4;
-  }
-
-  .empty-text {
-    font-size: var(--text-lg);
-    font-weight: 600;
+  .count {
     color: var(--text-secondary);
-    margin: 0 0 var(--space-xs);
-  }
-
-  .empty-hint {
     font-size: var(--text-sm);
-    color: var(--text-muted);
-    margin: 0;
   }
 
-  .empty-spinner {
-    display: inline-block;
-    width: 24px;
-    height: 24px;
-    border: 2.5px solid var(--border-strong);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin-bottom: var(--space-md);
+  .notice-slot {
+    margin-bottom: var(--space-lg);
   }
 
-  /* --- Card View --- */
-  .sessions {
-    display: flex;
-    flex-direction: column;
+  /* --- Cards --- */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
     gap: var(--space-md);
   }
 
   .card {
-    background: var(--bg-surface);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    padding: var(--space-lg);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-lg);
-    padding: var(--space-lg);
-    cursor: pointer;
-    transition: all var(--transition-fast);
+    background: var(--bg-surface);
+    transition: background var(--transition-fast), border-color var(--transition-fast);
   }
 
   .card:hover {
@@ -356,138 +293,134 @@
     background: var(--bg-elevated);
   }
 
-  .card:focus-visible {
+  .card:focus-within {
+    border-color: var(--accent);
+  }
+
+  .card-head {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .card-title {
+    margin: 0;
+    font-size: var(--text-lg);
+    font-weight: 700;
+    line-height: 1.3;
+  }
+
+  /* Stretched link: the whole card opens the ride */
+  .card-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--control-h-sm);
+    color: var(--text-primary);
+    text-decoration: none;
+  }
+
+  .card-link::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+  }
+
+  .card-link:focus-visible {
+    outline: none;
+  }
+
+  .card-link:focus-visible::after {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
 
-  .card-header {
-    margin-bottom: var(--space-md);
-  }
-
-  .card-title-row {
+  .badges {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-sm);
-    flex-wrap: wrap;
-    margin-bottom: 4px;
   }
 
-  .card-title {
-    font-size: var(--text-base);
-    font-weight: 700;
-    color: var(--text-primary);
+  .badges:empty {
+    display: none;
   }
 
-  .card-subtitle {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-md);
-  }
-
-  .date {
-    font-size: var(--text-sm);
+  .card-date {
     color: var(--text-secondary);
-  }
-
-  .time {
-    font-size: var(--text-xs);
-    color: var(--text-muted);
+    font-size: var(--text-sm);
   }
 
   .type-badge {
     padding: 2px var(--space-sm);
     border-radius: var(--radius-full);
     background: var(--accent-soft);
-    color: var(--accent);
+    color: var(--text-primary);
     font-size: var(--text-xs);
     font-weight: 600;
     white-space: nowrap;
   }
 
-  .type-badge.small {
-    font-size: 0.625rem;
-    padding: 1px 6px;
-  }
-
   .rpe-badge {
     font-size: var(--text-xs);
     font-weight: 700;
-    font-family: var(--font-data);
   }
 
   .card-stats {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-lg);
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-md) var(--space-lg);
+    margin: 0;
   }
 
-  .stat {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+  .stat dt {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-muted);
   }
 
-  .stat-value {
-    font-family: var(--font-data);
-    font-size: var(--text-lg);
+  .stat dd {
+    margin: 2px 0 0;
+    font-size: 1.125rem;
     font-weight: 700;
     color: var(--text-primary);
-    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .stat-unit {
+    margin-left: 3px;
     font-size: var(--text-xs);
     font-weight: 500;
     color: var(--text-muted);
-    margin-left: 2px;
-  }
-
-  .stat-label {
-    font-size: var(--text-xs);
-    color: var(--text-faint);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    font-weight: 600;
   }
 
   .card-notes {
-    margin-top: var(--space-sm);
-    font-size: var(--text-xs);
-    color: var(--text-muted);
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
     font-style: italic;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
 
   .card-actions {
-    margin-top: var(--space-md);
+    margin-top: auto;
     padding-top: var(--space-md);
     border-top: 1px solid var(--border-subtle);
   }
 
-  .export-btn {
-    padding: var(--space-xs) var(--space-md);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-md);
-    background: var(--bg-elevated);
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
+  /* Sits above the stretched link so it gets its own clicks */
+  .export {
+    position: relative;
+    z-index: 1;
   }
 
-  .export-btn:hover:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .export-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
-  /* --- Table View --- */
+  /* --- Table --- */
   .table-wrap {
     overflow-x: auto;
     border: 1px solid var(--border-subtle);
@@ -501,35 +434,59 @@
   }
 
   .sessions-table th {
-    padding: var(--space-sm) var(--space-md);
-    text-align: left;
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    padding: 0 var(--space-xs);
     border-bottom: 1px solid var(--border-default);
     background: var(--bg-elevated);
+    text-align: left;
     white-space: nowrap;
-    user-select: none;
   }
 
-  .sessions-table th.sortable {
+  .sessions-table th.num {
+    text-align: right;
+  }
+
+  .sort-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-height: var(--control-h-sm);
+    padding: 0 var(--space-sm);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
     cursor: pointer;
   }
 
-  .sessions-table th.sortable:hover {
+  .sort-btn:hover {
     color: var(--text-primary);
+    background: var(--bg-hover);
   }
 
-  .sort-arrow {
-    font-size: 0.6em;
-    margin-left: 2px;
+  .sort-icon {
+    opacity: 0;
     color: var(--accent);
+    transition: transform var(--transition-fast);
+  }
+
+  .sort-btn:hover .sort-icon {
+    opacity: 0.5;
+  }
+
+  .sort-icon.active {
+    opacity: 1;
+  }
+
+  .sort-icon.asc {
+    transform: rotate(180deg);
   }
 
   .sessions-table td {
-    padding: var(--space-sm) var(--space-md);
+    padding: var(--space-xs) var(--space-md);
     border-bottom: 1px solid var(--border-subtle);
     color: var(--text-secondary);
     white-space: nowrap;
@@ -544,31 +501,43 @@
     background: var(--bg-hover);
   }
 
-  .table-row:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: -2px;
-  }
-
   .col-date {
     color: var(--text-primary);
     font-weight: 600;
   }
 
   .col-title {
-    color: var(--text-primary);
-    font-weight: 600;
-    max-width: 160px;
+    min-width: 24ch;
+    max-width: 40ch;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
-  .col-num {
-    font-family: var(--font-data);
-    font-variant-numeric: tabular-nums;
+  .col-title a {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--control-h-sm);
+    color: var(--text-primary);
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .col-title a:hover {
+    text-decoration: underline;
+  }
+
+  .num {
     text-align: right;
   }
 
-  .text-muted {
-    color: var(--text-faint);
+  .none {
+    color: var(--text-muted);
+  }
+
+  /* Narrow windows: drop the lower-priority columns instead of scrolling sideways */
+  @media (max-width: 1279px) {
+    .minor {
+      display: none;
+    }
   }
 </style>
