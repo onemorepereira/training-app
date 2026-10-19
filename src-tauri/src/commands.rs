@@ -1,7 +1,7 @@
 use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, State};
 use tokio::sync::broadcast;
 
 use crate::device::manager::DeviceManager;
@@ -552,30 +552,12 @@ pub async fn check_prerequisites() -> Result<prerequisites::PrereqStatus, AppErr
 }
 
 #[tauri::command]
-pub async fn fix_prerequisites(
-    app: tauri::AppHandle,
-) -> Result<prerequisites::FixResult, AppError> {
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|e| AppError::Session(format!("Cannot locate resource dir: {}", e)))?;
-    let bundle_path = resource_dir.join("resources/99-ant-usb.rules");
-
-    // Copy to /tmp so pkexec (running as root) can read it — AppImage FUSE
-    // mounts are only accessible to the launching user, not root.
-    let tmp_path = std::path::PathBuf::from("/tmp/99-ant-usb.rules");
-    std::fs::copy(&bundle_path, &tmp_path).map_err(|e| {
-        AppError::Session(format!("Failed to copy udev rules to /tmp: {}", e))
-    })?;
-    let source = tmp_path.to_string_lossy().to_string();
-
-    tokio::task::spawn_blocking(move || {
-        let result = prerequisites::fix(&source);
-        let _ = std::fs::remove_file(&tmp_path);
-        result
-    })
-    .await
-    .map_err(|e| AppError::Session(format!("Prereq fix failed: {}", e)))
+pub async fn fix_prerequisites() -> Result<prerequisites::FixResult, AppError> {
+    // One pkexec prompt; the udev rule is embedded and piped on stdin, so no
+    // file is staged anywhere (design ADR-4).
+    tokio::task::spawn_blocking(prerequisites::fix)
+        .await
+        .map_err(|e| AppError::Session(format!("Prereq fix failed: {}", e)))
 }
 
 #[cfg(not(feature = "production"))]
