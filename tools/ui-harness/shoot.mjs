@@ -81,12 +81,11 @@ const INTERACTIONS = [
   ['ride-riding-postride-modal', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: /Stop/ }).first().click(); await p.waitForTimeout(800); }],
   ['ride-riding-paused', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: /Pause/ }).click(); await p.waitForTimeout(600); }],
   ['ride-normal-nav-tooltip', 'ride', 'normal', async (p) => { await p.hover('nav a[href="/history"]'); await p.waitForTimeout(400); }],
-  ['history-normal-table', 'history', 'normal', async (p) => { await p.getByRole('button', { name: 'Table view' }).click(); await p.waitForTimeout(400); }],
+  ['history-normal-table', 'history', 'normal', async (p) => { await p.getByRole('radio', { name: 'Table' }).click(); await p.waitForTimeout(400); }],
   ['history-detail-normal-editmodal', 'history-detail', 'normal', async (p) => { await p.getByRole('button', { name: /Edit/ }).click(); await p.waitForTimeout(500); }],
-  ['history-detail-normal-zonetooltip', 'history-detail', 'normal', async (p) => { const bar = p.locator('.zone-dist .zone-bar, .zone-dist [class*="bar"]').first(); await bar.scrollIntoViewIfNeeded(); await bar.hover(); await p.waitForTimeout(300); }],
-  ['devices-normal-details-modal', 'devices', 'normal', async (p) => { await p.getByRole('button', { name: 'Device details' }).nth(2).click(); await p.waitForTimeout(600); }],
+  ['devices-normal-details-modal', 'devices', 'normal', async (p) => { await p.getByRole('button', { name: 'Details', exact: true }).first().click(); await p.waitForTimeout(600); }],
   ['devices-prereqfail', 'devices', 'normal&prereq=fail', async () => {}],
-  ['settings-normal-imperial', 'settings', 'normal', async (p) => { await p.getByRole('button', { name: 'Imperial' }).click(); await p.waitForTimeout(300); }],
+  ['settings-normal-imperial', 'settings', 'normal', async (p) => { await p.getByRole('radio', { name: 'Imperial' }).click(); await p.waitForTimeout(300); }],
 ];
 
 // ── Dev server ──────────────────────────────────────────────────────────

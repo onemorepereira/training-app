@@ -142,6 +142,19 @@ Rules:
 - Type all Tauri API calls — see `src/lib/tauri.ts`
 - Handle Tauri command errors gracefully in the UI
 - Put pure logic (formatting, zone math, analytics) in `src/lib/utils/` with a colocated `*.test.ts` Vitest file
+- Build UI from the shared pieces instead of styling your own:
+  - **Shared control classes:** `src/lib/ui/controls.css`:
+    - buttons: `.btn` plus `.btn-primary`, `.btn-secondary`, `.btn-ghost`, `.btn-danger` or `.btn-success`, and `.btn-lg` for ride controls;
+    - fields;
+    - the `.page` and `.page-wide` page containers.
+  - **Shared components:** `src/lib/ui/`: `Dialog`, `Notice`, `StateView` (loading, empty, error with Retry), `SegmentedControl`, `IconButton` (always labelled) and `Switch`.
+  - **Charts:** `src/lib/charts/theme.ts` holds the text sizes, colours, series colours and zone palettes.
+- UI rules (enforced by `src/lib/ui/tokens.test.ts`, `src/lib/charts/theme.test.ts` and `npm run ui:check`):
+  - text at least 12 px;
+  - text contrast at least 4.5:1;
+  - interactive targets at least 32 px, and 44 px for ride controls;
+  - no network fonts.
+- Before changing a screen, run `npm run ui:check`. It needs the one-time setup in [tools/ui-harness/README.md](tools/ui-harness/README.md).
 
 ### Project commands
 
@@ -150,6 +163,7 @@ cd src-tauri && cargo test                         # All Rust tests
 cd src-tauri && cargo test --lib session::metrics   # Specific module
 npm test                                            # Frontend unit tests (Vitest)
 npm run check                                       # Frontend types
+npm run ui:check                                    # UI rules (Chromium + WebKit, mocked backend)
 npm run tauri dev                                   # Run the app (dev build)
 npm run build:release                               # Production build
 ```
