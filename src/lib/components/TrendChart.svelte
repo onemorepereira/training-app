@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as echarts from 'echarts';
+  import { axisLabel, axisNameStyle, splitLine, axisLine, legendDefaults, tooltipDefaults } from '$lib/charts/theme';
 
   interface Props {
     labels: string[];
@@ -36,11 +37,11 @@
       {
         type: 'value',
         name: barUnit ? `${barLabel} (${barUnit})` : barLabel,
-        nameTextStyle: { color: '#70708a', fontSize: 10 },
+        nameTextStyle: axisNameStyle(),
         min: 0,
-        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.04)' } },
+        splitLine: splitLine(),
         axisLine: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10 },
+        axisLabel: axisLabel(),
       },
     ];
 
@@ -48,11 +49,11 @@
       yAxes.push({
         type: 'value',
         name: lineUnit ? `${lineLabel} (${lineUnit})` : lineLabel,
-        nameTextStyle: { color: '#70708a', fontSize: 10 },
+        nameTextStyle: axisNameStyle(),
         min: 0,
         splitLine: { show: false },
         axisLine: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10 },
+        axisLabel: axisLabel(),
       });
     }
 
@@ -88,29 +89,19 @@
       backgroundColor: 'transparent',
       animation: false,
       grid: {
-        left: 50,
-        right: hasLine ? 50 : 20,
-        top: 40,
-        bottom: 30,
+        left: 12,
+        right: 12,
+        top: 52,
+        bottom: 8,
+        containLabel: true,
       },
-      legend: {
-        top: 4,
-        textStyle: { color: '#a0a0b8', fontSize: 12, fontFamily: 'Outfit, sans-serif' },
-        itemWidth: 16,
-        itemHeight: 2,
-        itemGap: 16,
-      },
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: '#1c1c30',
-        borderColor: 'rgba(255,255,255,0.08)',
-        textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
-      },
+      legend: legendDefaults({ top: 4, itemHeight: 3 }),
+      tooltip: tooltipDefaults({ trigger: 'axis' }),
       xAxis: {
         type: 'category',
-        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
+        axisLine: axisLine(),
         axisTick: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10, rotate: labels.length > 12 ? 45 : 0 },
+        axisLabel: axisLabel({ rotate: labels.length > 12 ? 45 : 0 }),
         data: [],
       },
       yAxis: yAxes,
@@ -171,6 +162,6 @@
 
   .chart {
     width: 100%;
-    height: 300px;
+    height: clamp(280px, 36vh, 420px);
   }
 </style>

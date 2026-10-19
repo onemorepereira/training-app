@@ -1,8 +1,15 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import type { SessionConfig } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
   import { unitSystem, displayWeight, toStorageWeight, convertDisplayedWeight } from '$lib/stores/units';
+  import { configEquals } from '$lib/utils/dirty';
+  import { POWER_ZONE_COLORS, HR_ZONE_COLORS, POWER_ZONE_NAMES, HR_ZONE_NAMES } from '$lib/charts/theme';
+  import SegmentedControl from '$lib/ui/SegmentedControl.svelte';
+  import StateView from '$lib/ui/StateView.svelte';
+  import Notice from '$lib/ui/Notice.svelte';
+
+  const clone = (c: SessionConfig): SessionConfig => ({ ...c, hr_zones: [...c.hr_zones], power_zones: [...c.power_zones] });
 
   let config = $state<SessionConfig>({
     ftp: 200,
@@ -15,18 +22,46 @@
     resting_hr: null,
     max_hr: null,
   });
+  /** The last loaded or saved values; the form is dirty when it differs. */
+  let savedConfig = $state.raw<SessionConfig | null>(null);
   let weightDisplay = $state(75.0);
-  let saved = $state(false);
-  let error = $state('');
+  let loading = $state(true);
+  let loadError = $state('');
+  let saveError = $state('');
+  let saving = $state(false);
+  let savedNotice = $state(false);
+  let savedTimer: ReturnType<typeof setTimeout> | null = null;
 
-  onMount(async () => {
+  let dirty = $derived(savedConfig != null && !configEquals(savedConfig, config, weightDisplay));
+
+  const UNITS = [
+    { value: 'metric', label: 'Metric' },
+    { value: 'imperial', label: 'Imperial' },
+  ] as const;
+  const SEXES = [
+    { value: 'male', label: 'Male' },
+    { value: 'female', label: 'Female' },
+  ] as const;
+
+  async function load() {
+    loading = true;
+    loadError = '';
     try {
-      config = await api.getUserConfig();
-      weightDisplay = displayWeight(config.weight_kg, config.units);
-      unitSystem.set(config.units);
+      const c = await api.getUserConfig();
+      config = clone(c);
+      savedConfig = clone(c);
+      weightDisplay = displayWeight(c.weight_kg, c.units);
+      unitSystem.set(c.units);
     } catch (e) {
-      error = extractError(e);
+      loadError = extractError(e);
+    } finally {
+      loading = false;
     }
+  }
+
+  onMount(load);
+  onDestroy(() => {
+    if (savedTimer) clearTimeout(savedTimer);
   });
 
   // Converts the typed (possibly unsaved) weight; the app-wide unit changes only on Save.
@@ -36,17 +71,31 @@
   }
 
   async function save() {
-    error = '';
-    saved = false;
+    if (saving) return;
+    saveError = '';
+    saving = true;
     try {
-      config.weight_kg = toStorageWeight(weightDisplay, config.units);
-      await api.saveUserConfig(config);
-      unitSystem.set(config.units);
-      saved = true;
-      setTimeout(() => (saved = false), 2000);
+      const next = clone(config);
+      next.weight_kg = toStorageWeight(weightDisplay, config.units);
+      await api.saveUserConfig(next);
+      config.weight_kg = next.weight_kg;
+      savedConfig = next;
+      unitSystem.set(next.units);
+      savedNotice = true;
+      if (savedTimer) clearTimeout(savedTimer);
+      savedTimer = setTimeout(() => (savedNotice = false), 3000);
     } catch (e) {
-      error = extractError(e);
+      saveError = extractError(e);
+    } finally {
+      saving = false;
     }
+  }
+
+  function discard() {
+    if (!savedConfig) return;
+    config = clone(savedConfig);
+    weightDisplay = displayWeight(savedConfig.weight_kg, savedConfig.units);
+    saveError = '';
   }
 
   function powerWatts(zonePercent: number): number {
@@ -64,217 +113,202 @@
     const pcts = [0.60, 0.70, 0.80, 0.90, 1.00];
     config.hr_zones = pcts.map((p) => Math.round(p * hrr + rhr)) as typeof config.hr_zones;
   }
-
-  const hrZoneColors = ['#4caf50', '#8bc34a', '#ffeb3b', '#ff9800', '#f44336'];
-  const powerZoneColors = ['#78909c', '#4caf50', '#8bc34a', '#ffeb3b', '#ff9800', '#f44336', '#9c27b0'];
-  const powerZoneLabels = ['Active Recovery', 'Endurance', 'Tempo', 'Threshold', 'VO2max', 'Anaerobic', 'Neuromuscular'];
 </script>
 
-<div class="page">
-  <h1>Settings</h1>
+<div class="page" data-page="settings">
+  <header class="page-header">
+    <h1 class="page-title">Settings</h1>
+  </header>
 
-  {#if error}
-    <div class="error-banner">{error}</div>
-  {/if}
+  {#if loading}
+    <StateView kind="loading" title="Loading your settings…" />
+  {:else if loadError}
+    <StateView
+      kind="error"
+      title="Couldn't load your settings"
+      message="Nothing was changed. Try again; if it keeps failing, restart the app."
+      details={loadError}
+      action={{ label: 'Retry', onclick: load }}
+    />
+  {:else}
+    {#if savedNotice}
+      <div class="notice-slot"><Notice tone="success" ondismiss={() => (savedNotice = false)}>Settings saved</Notice></div>
+    {/if}
 
-  <div class="settings-form">
-    <section class="section">
-      <h2 class="section-title">Units</h2>
-      <div class="unit-toggle">
-        <button
-          class="unit-btn"
-          class:active={config.units === 'metric'}
-          onclick={() => onUnitsChange('metric')}
-        >Metric</button>
-        <button
-          class="unit-btn"
-          class:active={config.units === 'imperial'}
-          onclick={() => onUnitsChange('imperial')}
-        >Imperial</button>
-      </div>
-    </section>
+    <div class="columns">
+      <section class="card" aria-labelledby="profile-h">
+        <h2 class="section-title" id="profile-h">Athlete profile</h2>
 
-    <section class="section">
-      <h2 class="section-title">Athlete Profile</h2>
-      <div class="field-group">
-        <div class="field">
-          <label for="ftp">FTP</label>
-          <div class="input-wrap">
-            <input id="ftp" type="number" bind:value={config.ftp} min="50" max="500" />
-            <span class="input-unit">W</span>
+        <div class="fields">
+          <div class="field">
+            <span class="field-label" id="units-l">Units</span>
+            <SegmentedControl label="Units" options={UNITS} value={config.units} onchange={(u) => onUnitsChange(u)} />
           </div>
-        </div>
-        <div class="field">
-          <label for="weight">Weight</label>
-          <div class="input-wrap">
-            <input id="weight" type="number" bind:value={weightDisplay} min="30" max={config.units === 'imperial' ? 440 : 200} step="0.1" />
-            <span class="input-unit">{config.units === 'imperial' ? 'lbs' : 'kg'}</span>
-          </div>
-        </div>
-        <div class="field">
-          <label for="dob">Date of Birth</label>
-          <input id="dob" type="date" bind:value={config.date_of_birth} class="date-input" />
-        </div>
-        <div class="field">
-          <label for="sex">Sex</label>
-          <div class="sex-toggle">
-            <button class="sex-btn" class:active={config.sex === 'male'} onclick={() => config.sex = 'male'}>Male</button>
-            <button class="sex-btn" class:active={config.sex === 'female'} onclick={() => config.sex = 'female'}>Female</button>
-          </div>
-        </div>
-        <div class="field">
-          <label for="resting-hr">Resting HR</label>
-          <div class="input-wrap">
-            <input id="resting-hr" type="number" bind:value={config.resting_hr} min="30" max="120" />
-            <span class="input-unit">bpm</span>
-          </div>
-        </div>
-        <div class="field">
-          <label for="max-hr">Max HR</label>
-          <div class="input-wrap">
-            <input id="max-hr" type="number" bind:value={config.max_hr} min="120" max="230" />
-            <span class="input-unit">bpm</span>
-          </div>
-        </div>
-      </div>
-    </section>
 
-    <div class="zones-grid">
-      <section class="section">
-        <div class="section-header">
-          <div>
-            <h2 class="section-title">Heart Rate Zones</h2>
-            <p class="section-hint">Upper bound of each zone in bpm</p>
+          <label class="field">
+            <span class="field-label">FTP</span>
+            <span class="input-wrap">
+              <input type="number" class="data" bind:value={config.ftp} min="50" max="500" />
+              <span class="input-unit">W</span>
+            </span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Weight</span>
+            <span class="input-wrap">
+              <input type="number" class="data" bind:value={weightDisplay} min="30" max={config.units === 'imperial' ? 440 : 200} step="0.1" />
+              <span class="input-unit">{config.units === 'imperial' ? 'lbs' : 'kg'}</span>
+            </span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Date of birth</span>
+            <input type="date" class="date" bind:value={config.date_of_birth} />
+          </label>
+
+          <div class="field">
+            <span class="field-label">Sex</span>
+            <SegmentedControl label="Sex" options={SEXES} value={config.sex ?? ''} onchange={(v) => (config.sex = v)} />
           </div>
-          {#if canEstimateHrZones}
-            <button class="estimate-btn" onclick={estimateHrZones}>Estimate from rHR/Max</button>
-          {/if}
-        </div>
-        <div class="zones">
-          {#each config.hr_zones as zone, i}
-            <div class="zone-field">
-              <div class="zone-indicator" style="background: {hrZoneColors[i]}"></div>
-              <label for="hr-zone-{i}">Z{i + 1}</label>
-              <input id="hr-zone-{i}" type="number" bind:value={config.hr_zones[i]} min="60" max="220" />
-            </div>
-          {/each}
+
+          <label class="field">
+            <span class="field-label">Resting heart rate</span>
+            <span class="input-wrap">
+              <input type="number" class="data" bind:value={config.resting_hr} min="30" max="120" />
+              <span class="input-unit">bpm</span>
+            </span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Max heart rate</span>
+            <span class="input-wrap">
+              <input type="number" class="data" bind:value={config.max_hr} min="120" max="230" />
+              <span class="input-unit">bpm</span>
+            </span>
+          </label>
         </div>
       </section>
 
-      <section class="section">
-        <h2 class="section-title">Power Zones</h2>
-        <p class="section-hint">Upper bound as % of FTP ({config.ftp}W)</p>
-        <div class="zones">
-          {#each config.power_zones as pz, i}
-            <div class="zone-field">
-              <div class="zone-indicator" style="background: {powerZoneColors[i]}"></div>
-              <label for="pz-{i}">Z{i + 1}</label>
-              <span class="zone-name">{powerZoneLabels[i]}</span>
-              <div class="zone-input-group">
-                <input id="pz-{i}" type="number" bind:value={config.power_zones[i]} min="1" max="300" />
-                <span class="zone-pct">%</span>
-                <span class="zone-watts">{powerWatts(config.power_zones[i])}W</span>
-              </div>
+      <div class="zones-col">
+        <section class="card" aria-labelledby="pz-h">
+          <h2 class="section-title" id="pz-h">Power zones</h2>
+          <p class="hint">Top of each zone as a % of FTP (<span class="data">{config.ftp} W</span>).</p>
+          <ul class="zones">
+            {#each config.power_zones as _, i (i)}
+              <li class="zone-row">
+                <span class="swatch" style="background: {POWER_ZONE_COLORS[i]}" aria-hidden="true"></span>
+                <label class="zone-name" for="pz-{i}">Z{i + 1} · {POWER_ZONE_NAMES[i]}</label>
+                <span class="input-wrap zone-input">
+                  <input id="pz-{i}" type="number" class="data" bind:value={config.power_zones[i]} min="1" max="300" />
+                  <span class="input-unit">%</span>
+                </span>
+                <span class="zone-watts data">≤ {powerWatts(config.power_zones[i])} W</span>
+              </li>
+            {/each}
+            <li class="zone-row">
+              <span class="swatch" style="background: {POWER_ZONE_COLORS[6]}" aria-hidden="true"></span>
+              <span class="zone-name">Z7 · {POWER_ZONE_NAMES[6]}</span>
+              <span class="zone-input"></span>
+              <span class="zone-watts data">&gt; {powerWatts(config.power_zones[5])} W</span>
+            </li>
+          </ul>
+        </section>
+
+        <section class="card" aria-labelledby="hz-h">
+          <div class="card-head">
+            <div>
+              <h2 class="section-title" id="hz-h">Heart rate zones</h2>
+              <p class="hint">Top of each zone in bpm.</p>
             </div>
-          {/each}
-          <div class="zone-field zone-7">
-            <div class="zone-indicator" style="background: {powerZoneColors[6]}"></div>
-            <span class="zone-label">Z7</span>
-            <span class="zone-name">{powerZoneLabels[6]}</span>
-            <span class="zone-watts-hint">&gt; {powerWatts(config.power_zones[5])}W</span>
+            <button
+              type="button"
+              class="btn btn-secondary"
+              disabled={!canEstimateHrZones}
+              title={canEstimateHrZones ? undefined : 'Enter resting and max heart rate first'}
+              onclick={estimateHrZones}
+            >Estimate from resting/max HR</button>
           </div>
-        </div>
-      </section>
+          <ul class="zones">
+            {#each config.hr_zones as _, i (i)}
+              <li class="zone-row">
+                <span class="swatch" style="background: {HR_ZONE_COLORS[i]}" aria-hidden="true"></span>
+                <label class="zone-name" for="hz-{i}">Z{i + 1} · {HR_ZONE_NAMES[i]}</label>
+                <span class="input-wrap zone-input">
+                  <input id="hz-{i}" type="number" class="data" bind:value={config.hr_zones[i]} min="60" max="220" />
+                  <span class="input-unit">bpm</span>
+                </span>
+                <span class="zone-watts"></span>
+              </li>
+            {/each}
+          </ul>
+        </section>
+      </div>
     </div>
 
-    <button class="save-btn" class:saved onclick={save}>
-      {saved ? 'Saved' : 'Save Settings'}
-    </button>
-  </div>
+    {#if dirty || saveError}
+      <div class="save-bar" role="region" aria-label="Unsaved changes">
+        {#if saveError}
+          <Notice tone="error" title="Couldn't save settings" ondismiss={() => (saveError = '')}>{saveError} Your edits are kept.</Notice>
+        {/if}
+        <div class="save-row">
+          <span class="save-text">{dirty ? 'Unsaved changes' : 'No changes'}</span>
+          <button type="button" class="btn btn-ghost" disabled={!dirty || saving} onclick={discard}>Discard</button>
+          <button type="button" class="btn btn-primary" disabled={!dirty || saving} onclick={save}>{saving ? 'Saving…' : 'Save'}</button>
+        </div>
+      </div>
+    {/if}
+  {/if}
 </div>
 
 <style>
-  .page {
-    max-width: 960px;
+  .notice-slot {
+    margin-bottom: var(--space-lg);
   }
 
-  h1 {
-    margin: 0 0 var(--space-xl);
-    font-size: var(--text-2xl);
-    font-weight: 800;
+  .columns {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--space-xl);
+    align-items: start;
   }
 
-  .section {
-    margin-bottom: var(--space-3xl);
+  @media (min-width: 1280px) {
+    .columns {
+      grid-template-columns: minmax(320px, 2fr) 3fr;
+    }
   }
 
-  .section-title {
-    font-size: var(--text-sm);
-    font-weight: 700;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin: 0 0 var(--space-md);
-  }
-
-  .section-hint {
-    font-size: var(--text-sm);
-    color: var(--text-faint);
-    margin: -0.25rem 0 var(--space-md);
-  }
-
-  .unit-toggle {
-    display: flex;
-    gap: 2px;
-    background: var(--bg-body);
-    border-radius: var(--radius-md);
-    padding: 3px;
-    width: fit-content;
-  }
-
-  .unit-btn {
-    padding: var(--space-sm) var(--space-lg);
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    border-radius: 6px;
-    transition: all var(--transition-fast);
-  }
-
-  .unit-btn:hover {
-    color: var(--text-secondary);
-  }
-
-  .unit-btn.active {
-    background: var(--bg-elevated);
-    color: var(--accent);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .field-group {
+  .zones-col {
     display: flex;
     flex-direction: column;
-    gap: var(--space-md);
-    max-width: 480px;
+    gap: var(--space-xl);
   }
 
-  .field {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-md);
-    background: var(--bg-surface);
-    border-radius: var(--radius-md);
+  .card {
+    padding: var(--space-xl);
+    border-radius: var(--radius-lg);
     border: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
   }
 
-  .field label {
+  .card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+  }
+
+  .hint {
+    margin: calc(-1 * var(--space-sm)) 0 var(--space-lg);
+    font-size: var(--text-sm);
     color: var(--text-secondary);
-    font-size: var(--text-base);
-    font-weight: 500;
+  }
+
+  .fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: var(--space-lg);
   }
 
   .input-wrap {
@@ -283,230 +317,80 @@
     gap: var(--space-sm);
   }
 
+  .input-wrap input {
+    width: 100%;
+    min-width: 0;
+  }
+
   .input-unit {
+    min-width: 2.5em;
     font-size: var(--text-sm);
-    color: var(--text-muted);
-    font-weight: 500;
-    min-width: 20px;
-  }
-
-  .date-input {
-    width: auto;
-    text-align: left;
-    color-scheme: dark;
-  }
-
-  .sex-toggle {
-    display: flex;
-    gap: 2px;
-    background: var(--bg-body);
-    border-radius: var(--radius-md);
-    padding: 3px;
-  }
-
-  .sex-btn {
-    padding: var(--space-xs) var(--space-md);
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    border-radius: 5px;
-    transition: all var(--transition-fast);
-  }
-
-  .sex-btn:hover {
     color: var(--text-secondary);
   }
 
-  .sex-btn.active {
-    background: var(--bg-elevated);
-    color: var(--accent);
-    box-shadow: var(--shadow-sm);
-  }
-
-  input {
-    width: 80px;
-    padding: var(--space-sm);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-input);
-    color: var(--text-primary);
-    font-family: var(--font-data);
-    font-size: var(--text-base);
-    font-weight: 600;
-    text-align: right;
-    transition: border-color var(--transition-fast);
-    -moz-appearance: textfield;
-    appearance: textfield;
-  }
-
-  input::-webkit-outer-spin-button,
-  input::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
-
-  input:focus {
-    border-color: var(--accent);
-    outline: none;
-  }
-
-  .section-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-md);
-  }
-
-  .estimate-btn {
-    padding: var(--space-xs) var(--space-md);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-md);
-    background: var(--bg-elevated);
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    white-space: nowrap;
-    flex-shrink: 0;
-    margin-top: 2px;
-  }
-
-  .estimate-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .zones-grid {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: var(--space-lg);
-  }
-
-  @media (min-width: 700px) {
-    .zones-grid {
-      grid-template-columns: 1fr 1fr;
-    }
-
-    .zones-grid .section {
-      margin-bottom: 0;
-    }
+  .date {
+    width: 100%;
   }
 
   .zones {
+    list-style: none;
+    margin: 0;
+    padding: 0;
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
   }
 
-  .zone-field {
-    display: flex;
+  .zone-row {
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) 128px 96px;
     align-items: center;
     gap: var(--space-md);
-    padding: var(--space-sm) var(--space-md);
-    background: var(--bg-surface);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border-subtle);
+    min-height: var(--control-h);
   }
 
-  .zone-indicator {
-    width: 4px;
-    height: 20px;
-    border-radius: var(--radius-full);
-    flex-shrink: 0;
-  }
-
-  .zone-field label,
-  .zone-label {
-    color: var(--text-secondary);
-    font-size: var(--text-sm);
-    font-weight: 600;
-    min-width: 24px;
-  }
-
-  .zone-field input {
-    width: 70px;
-    margin-left: auto;
+  .swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
   }
 
   .zone-name {
-    font-size: var(--text-xs);
-    color: var(--text-faint);
-    flex: 1;
-    min-width: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .zone-input-group {
-    display: flex;
-    align-items: center;
-    gap: var(--space-xs);
-    margin-left: auto;
-    flex-shrink: 0;
-  }
-
-  .zone-input-group input {
-    margin-left: 0;
-  }
-
-  .zone-pct {
-    font-size: var(--text-xs);
-    color: var(--text-muted);
-    font-weight: 500;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--text-primary);
   }
 
   .zone-watts {
-    font-family: var(--font-data);
-    font-size: var(--text-xs);
-    color: var(--text-faint);
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    min-width: 40px;
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
     text-align: right;
   }
 
-  .zone-7 {
-    opacity: 0.7;
-  }
-
-  .zone-watts-hint {
-    font-family: var(--font-data);
-    font-size: var(--text-xs);
-    color: var(--text-faint);
-    font-weight: 600;
-    margin-left: auto;
-  }
-
-  .save-btn {
-    padding: var(--space-md) var(--space-2xl);
-    border: none;
+  .save-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin-top: var(--space-xl);
+    padding: var(--space-md) var(--space-lg);
+    border: 1px solid var(--border-default);
     border-radius: var(--radius-lg);
-    font-size: var(--text-base);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-lg);
+    animation: slide-up 160ms ease;
+  }
+
+  .save-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+  }
+
+  .save-text {
+    margin-right: auto;
     font-weight: 600;
-    cursor: pointer;
-    background: var(--accent);
-    color: white;
-    transition: all var(--transition-fast);
-    box-shadow: 0 2px 8px var(--accent-glow);
-  }
-
-  .save-btn:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px var(--accent-glow);
-  }
-
-  .save-btn:active {
-    transform: translateY(0);
-  }
-
-  .save-btn.saved {
-    background: var(--success);
-    box-shadow: 0 2px 8px rgba(76, 175, 80, 0.3);
   }
 </style>

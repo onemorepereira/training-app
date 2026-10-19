@@ -4,6 +4,8 @@
   import { api, extractError } from '$lib/tauri';
   import { computePmc, computeWeeklyTrends, extractFtpProgression, computeRampRate, currentWeekTss } from '$lib/utils/analytics';
   import MetricCard from '$lib/components/MetricCard.svelte';
+  import StateView from '$lib/ui/StateView.svelte';
+  import { SERIES } from '$lib/charts/theme';
   import PmcChart from '$lib/components/PmcChart.svelte';
   import TrendChart from '$lib/components/TrendChart.svelte';
 
@@ -11,7 +13,9 @@
   let loading = $state(true);
   let error = $state('');
 
-  onMount(async () => {
+  async function load() {
+    loading = true;
+    error = '';
     try {
       sessions = await api.listSessions();
     } catch (e) {
@@ -19,7 +23,9 @@
     } finally {
       loading = false;
     }
-  });
+  }
+
+  onMount(load);
 
   let pmcData = $derived(computePmc(sessions));
   let weeklyData = $derived(computeWeeklyTrends(sessions));
@@ -38,86 +44,85 @@
   let rampAccent = $derived.by(() => {
     if (!rampRate) return '';
     switch (rampRate.classification) {
-      case 'moderate': return '#4caf50';
-      case 'aggressive': return '#ff9800';
-      case 'excessive': return '#f44336';
-      default: return '#70708a';
+      case 'moderate': return 'var(--success)';
+      case 'aggressive': return 'var(--warning)';
+      case 'excessive': return 'var(--danger-text)';
+      default: return '';
     }
   });
 
   let thisWeekTss = $derived(currentWeekTss(weeklyData));
 </script>
 
-<div class="page">
-  <div class="page-header">
-    <h1>Analytics</h1>
-  </div>
-
-  {#if error}
-    <div class="error-banner">{error}</div>
-  {/if}
+<div class="page-wide" data-page="analytics">
+  <header class="page-header">
+    <h1 class="page-title">Analytics</h1>
+  </header>
 
   {#if loading}
-    <div class="empty-state">
-      <div class="empty-spinner"></div>
-      <p class="empty-text">Loading analytics...</p>
-    </div>
+    <StateView kind="loading" title="Loading your training data…" />
+  {:else if error}
+    <StateView
+      kind="error"
+      title="Couldn't load your training data"
+      message="Your rides are safe. Try again; if it keeps failing, restart the app."
+      details={error}
+      action={{ label: 'Retry', onclick: load }}
+    />
   {:else if sessions.length === 0}
-    <div class="empty-state">
-      <div class="empty-icon">
-        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-        </svg>
-      </div>
-      <p class="empty-text">No sessions yet</p>
-      <p class="empty-hint">Complete some rides to see your training trends</p>
-    </div>
+    <StateView kind="empty" title="Nothing to analyse yet" message="Analytics appear after your first ride. Start one from the Ride screen." />
   {:else}
-    <div class="summary-cards">
-      <MetricCard label="Fitness" value={currentCtl} unit="CTL" size="sm" accent="#4a90d9" />
-      <MetricCard label="Fatigue" value={currentAtl} unit="ATL" size="sm" accent="#ff4d6d" />
-      <MetricCard label="Form" value={currentTsb} unit="TSB" size="sm" accent="#4caf50" />
-      <MetricCard label="FTP" value={currentFtp} unit="W" size="sm" />
-      <MetricCard label="Week TSS" value={thisWeekTss} size="sm" />
-      <MetricCard
-        label="Ramp"
-        value={rampRate ? Math.round(rampRate.current * 10) / 10 : null}
-        unit="CTL/wk"
-        size="sm"
-        accent={rampAccent}
-      />
+    <div class="summary">
+      <div class="tile"><MetricCard label="Fitness" value={currentCtl} unit="CTL" size="sm" accent={SERIES.ctl} /></div>
+      <div class="tile"><MetricCard label="Fatigue" value={currentAtl} unit="ATL" size="sm" accent={SERIES.atl} /></div>
+      <div class="tile"><MetricCard label="Form" value={currentTsb} unit="TSB" size="sm" accent={SERIES.speed} /></div>
+      <div class="tile"><MetricCard label="FTP" value={currentFtp} unit="W" size="sm" /></div>
+      <div class="tile">
+        <MetricCard label="Week TSS" value={thisWeekTss} size="sm" />
+        {#if !thisWeekTss}<span class="tile-note">No rides yet this week</span>{/if}
+      </div>
+      <div class="tile">
+        <MetricCard
+          label="Ramp"
+          value={rampRate ? Math.round(rampRate.current * 10) / 10 : null}
+          unit="CTL/wk"
+          size="sm"
+          accent={rampAccent}
+        />
+        {#if rampRate}<span class="tile-note ramp-note">{rampRate.classification}</span>{/if}
+      </div>
     </div>
 
     <section class="chart-section">
-      <h2>Performance Management</h2>
+      <h2 class="section-title">Performance management</h2>
       <PmcChart {pmcData} />
     </section>
 
     <div class="chart-grid">
       <section class="chart-section">
-        <h2>Weekly Volume</h2>
+        <h2 class="section-title">Weekly volume</h2>
         <TrendChart
           labels={weeklyData.map((w) => w.weekStart)}
           barData={weeklyData.map((w) => Math.round(w.totalTss))}
           barLabel="TSS"
-          barColor="#4a90d9"
+          barColor={SERIES.ctl}
           lineData={weeklyData.map((w) => w.avgPower)}
           lineLabel="Avg Power"
-          lineColor="#ff4d6d"
+          lineColor={SERIES.power}
           lineUnit="W"
         />
       </section>
 
       <section class="chart-section">
-        <h2>HR Trends</h2>
+        <h2 class="section-title">Heart rate trends</h2>
         <TrendChart
           labels={weeklyData.map((w) => w.weekStart)}
           barData={weeklyData.map((w) => w.sessionCount)}
           barLabel="Sessions"
-          barColor="#64b5f6"
+          barColor={SERIES.cadence}
           lineData={weeklyData.map((w) => w.avgHr)}
           lineLabel="Avg HR"
-          lineColor="#f44336"
+          lineColor={SERIES.hr}
           lineUnit="bpm"
         />
       </section>
@@ -125,12 +130,12 @@
 
     {#if ftpPoints.length > 1}
       <section class="chart-section">
-        <h2>FTP Progression</h2>
+        <h2 class="section-title">FTP progression</h2>
         <TrendChart
           labels={ftpPoints.map((p) => p.date)}
           barData={ftpPoints.map((p) => p.ftp)}
           barLabel="FTP"
-          barColor="#4caf50"
+          barColor={SERIES.speed}
           barUnit="W"
         />
       </section>
@@ -139,67 +144,34 @@
 </div>
 
 <style>
-  .page {
-    max-width: 1100px;
-  }
-
-  .page-header {
-    margin-bottom: var(--space-xl);
-  }
-
-  h1 {
-    margin: 0;
-    font-size: var(--text-2xl);
-    font-weight: 800;
-  }
-
-  h2 {
-    margin: 0 0 var(--space-md) 0;
-    font-size: var(--text-lg);
-    font-weight: 700;
-    color: var(--text-primary);
-  }
-
-  .empty-state {
-    text-align: center;
-    padding: var(--space-3xl) var(--space-lg);
-    color: var(--text-muted);
-  }
-
-  .empty-icon {
-    margin-bottom: var(--space-md);
-    opacity: 0.4;
-  }
-
-  .empty-text {
-    font-size: var(--text-lg);
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin: 0 0 var(--space-xs);
-  }
-
-  .empty-hint {
-    font-size: var(--text-sm);
-    color: var(--text-muted);
-    margin: 0;
-  }
-
-  .empty-spinner {
-    display: inline-block;
-    width: 24px;
-    height: 24px;
-    border: 2.5px solid var(--border-strong);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin-bottom: var(--space-md);
-  }
-
-  .summary-cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  .summary {
+    display: flex;
+    flex-wrap: wrap;
     gap: var(--space-md);
     margin-bottom: var(--space-xl);
+  }
+
+  .tile {
+    flex: 1 1 180px;
+    max-width: 360px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+  }
+
+  /* MetricCard's small unit is 0.5em of 22px (11px); keep it at the 12px floor */
+  .tile :global(.unit) {
+    font-size: max(12px, 0.5em);
+  }
+
+  .tile-note {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  .ramp-note {
+    text-transform: capitalize;
   }
 
   .chart-section {
@@ -208,11 +180,13 @@
 
   .chart-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-xl);
+    grid-template-columns: 1fr;
+    gap: 0 var(--space-xl);
   }
 
-  .chart-grid .chart-section {
-    margin-bottom: 0;
+  @media (min-width: 1280px) {
+    .chart-grid {
+      grid-template-columns: 1fr 1fr;
+    }
   }
 </style>

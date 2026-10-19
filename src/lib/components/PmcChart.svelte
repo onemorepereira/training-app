@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import * as echarts from 'echarts';
   import type { PmcDay } from '$lib/utils/analytics';
+  import { SERIES, CHART_TEXT, withAlpha, axisLabel, splitLine, axisLine, legendDefaults, tooltipDefaults } from '$lib/charts/theme';
 
   interface Props {
     pmcData: PmcDay[];
@@ -17,23 +18,14 @@
       backgroundColor: 'transparent',
       animation: false,
       grid: {
-        left: 50,
-        right: 20,
-        top: 40,
-        bottom: 70,
+        left: 52,
+        right: 24,
+        top: 48,
+        bottom: 76,
       },
-      legend: {
-        top: 4,
-        textStyle: { color: '#a0a0b8', fontSize: 12, fontFamily: 'Outfit, sans-serif' },
-        itemWidth: 16,
-        itemHeight: 2,
-        itemGap: 16,
-      },
-      tooltip: {
+      legend: legendDefaults({ top: 4, itemHeight: 3 }),
+      tooltip: tooltipDefaults({
         trigger: 'axis',
-        backgroundColor: '#1c1c30',
-        borderColor: 'rgba(255,255,255,0.08)',
-        textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
         formatter(params: unknown) {
           const items = params as { seriesName: string; value: number; axisValueLabel: string; color: string }[];
           if (!Array.isArray(items) || items.length === 0) return '';
@@ -45,7 +37,7 @@
           }
           return html;
         },
-      },
+      }),
       dataZoom: [
         {
           type: 'slider',
@@ -54,8 +46,8 @@
           borderColor: 'rgba(255,255,255,0.06)',
           backgroundColor: 'rgba(255,255,255,0.02)',
           fillerColor: 'rgba(255,255,255,0.04)',
-          handleStyle: { color: '#70708a' },
-          textStyle: { color: '#70708a', fontSize: 10 },
+          handleStyle: { color: CHART_TEXT.axis.color },
+          textStyle: { color: CHART_TEXT.axis.color, fontSize: CHART_TEXT.axis.fontSize },
           dataBackground: {
             lineStyle: { color: 'rgba(255,255,255,0.1)' },
             areaStyle: { color: 'rgba(255,255,255,0.03)' },
@@ -66,16 +58,16 @@
       xAxis: {
         type: 'category',
         boundaryGap: false,
-        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
+        axisLine: axisLine(),
         axisTick: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10 },
+        axisLabel: axisLabel(),
         data: [],
       },
       yAxis: {
         type: 'value',
-        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.04)' } },
+        splitLine: splitLine(),
         axisLine: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10 },
+        axisLabel: axisLabel(),
       },
       series: [
         {
@@ -83,12 +75,12 @@
           type: 'line',
           smooth: true,
           symbol: 'none',
-          lineStyle: { color: '#4a90d9', width: 2 },
-          itemStyle: { color: '#4a90d9' },
+          lineStyle: { color: SERIES.ctl, width: 2 },
+          itemStyle: { color: SERIES.ctl },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(74, 144, 217, 0.2)' },
-              { offset: 1, color: 'rgba(74, 144, 217, 0)' },
+              { offset: 0, color: withAlpha(SERIES.ctl, 0.2) },
+              { offset: 1, color: withAlpha(SERIES.ctl, 0) },
             ]),
           },
           data: [],
@@ -98,8 +90,8 @@
           type: 'line',
           smooth: true,
           symbol: 'none',
-          lineStyle: { color: '#ff4d6d', width: 2 },
-          itemStyle: { color: '#ff4d6d' },
+          lineStyle: { color: SERIES.atl, width: 2 },
+          itemStyle: { color: SERIES.atl },
           data: [],
         },
         {
@@ -107,12 +99,13 @@
           type: 'line',
           smooth: true,
           symbol: 'none',
-          lineStyle: { color: '#4caf50', width: 2 },
-          itemStyle: { color: '#4caf50' },
+          lineStyle: { color: SERIES.speed, width: 2 },
+          itemStyle: { color: SERIES.speed },
           markLine: {
             silent: true,
             symbol: 'none',
-            lineStyle: { color: '#4caf50', type: 'dashed', width: 1, opacity: 0.5 },
+            label: { show: false },
+            lineStyle: { color: SERIES.speed, type: 'dashed', width: 1, opacity: 0.5 },
             data: [{ yAxis: 0 }],
           },
           data: [],
@@ -176,6 +169,6 @@
 
   .chart {
     width: 100%;
-    height: 400px;
+    height: clamp(320px, 45vh, 520px);
   }
 </style>
