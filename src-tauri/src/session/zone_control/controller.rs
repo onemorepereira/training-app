@@ -2,7 +2,7 @@
 //! See docs/design/zone-control-safety/design.md for the decisions referenced
 //! below (ADR-n).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,6 +77,8 @@ struct ControlLoopState {
     last_tick_at: Option<Instant>,
     /// Power zone percentages from user config (for HR mode power banding)
     power_zones: Option<[u16; 6]>,
+    /// Whether finalize's 0 W release was confirmed (None until finalize ran)
+    release_confirmed: Option<bool>,
 }
 
 impl ControlLoopState {
@@ -102,6 +104,7 @@ impl ControlLoopState {
             max_hr: None,
             last_tick_at: None,
             power_zones: None,
+            release_confirmed: None,
         }
     }
 
@@ -160,6 +163,8 @@ pub struct ZoneController<B: TrainerBackend = DeviceManagerBackend> {
     /// Latest run; brief std lock, never held across .await
     current: std::sync::Mutex<Option<Arc<Run>>>,
     next_gen: AtomicU64,
+    /// Set once app close begins; start() is refused from then on (ADR-26)
+    closing: AtomicBool,
 }
 
 impl<B: TrainerBackend> ZoneController<B> {
@@ -169,6 +174,7 @@ impl<B: TrainerBackend> ZoneController<B> {
             lifecycle: Mutex::new(()),
             current: std::sync::Mutex::new(None),
             next_gen: AtomicU64::new(1),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -191,6 +197,9 @@ impl<B: TrainerBackend> ZoneController<B> {
     ) -> Result<(), AppError> {
         target.validate()?;
         let _life = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(AppError::Session("App is closing".into()));
+        }
 
         if !self.sink.is_connected().await {
             return Err(AppError::Session("No trainer connected".into()));
@@ -315,6 +324,35 @@ impl<B: TrainerBackend> ZoneController<B> {
         }
     }
 
+    /// App close / exit (ADR-26): refuse new starts, then stop any run
+    /// (including one that raced this call) within `budget`.
+    pub async fn close(&self, budget: Duration) -> Option<StopReason> {
+        self.closing.store(true, Ordering::SeqCst);
+        self.stop_with_budget(StopReason::AppClosing, budget).await
+    }
+
+    fn is_run_active(&self) -> bool {
+        self.current_run()
+            .map(|run| run.done.borrow().is_none())
+            .unwrap_or(false)
+    }
+
+    /// Manual trainer commands must not fight a running zone ride.
+    pub fn ensure_manual_control_allowed(&self) -> Result<(), AppError> {
+        if self.is_run_active() {
+            Err(AppError::Session("Zone ride active — stop it first".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether the latest run's final 0 W release was confirmed.
+    pub async fn last_release_confirmed(&self) -> Option<bool> {
+        let run = self.current_run()?;
+        let confirmed = run.state.lock().await.release_confirmed;
+        confirmed
+    }
+
     fn send_to_live_run(&self, msg: ControlMsg) {
         if let Some(run) = self.current_run() {
             if run.done.borrow().is_none() {
@@ -324,12 +362,16 @@ impl<B: TrainerBackend> ZoneController<B> {
     }
 
     /// Pause control: the trainer is released until resume (ADR-13).
+    /// Waits for any in-flight start/stop so a pause during start reaches the
+    /// new run (ruling 6).
     pub async fn pause(&self) {
+        let _life = self.lifecycle.lock().await;
         self.send_to_live_run(ControlMsg::Pause);
     }
 
     /// Resume control: the target is re-sent on the next tick.
     pub async fn resume(&self) {
+        let _life = self.lifecycle.lock().await;
         self.send_to_live_run(ControlMsg::Resume);
     }
 
@@ -382,6 +424,7 @@ async fn finalize<B: TrainerBackend>(
     if outcome.delivered {
         log_trainer_command(&sensor_tx, 0);
     }
+    state.lock().await.release_confirmed = Some(outcome.delivered);
     mark_stopped(&state, reason.clone()).await;
     let _ = done_tx.send(Some(reason));
 }
@@ -1862,6 +1905,88 @@ pub(crate) mod task_tests {
         assert!(st.active);
         assert_eq!(st.stop_reason, None);
         assert_eq!(st.lower_bound, Some(300));
+    }
+
+    // --- ADR-26: closing flag ---
+
+    #[tokio::test(start_paused = true)]
+    async fn start_racing_app_close_never_leaves_a_run_sending() {
+        for start_first in [true, false] {
+            let (zc, fake, tx) = setup();
+            start(&zc, &tx, power_target(190, 210, None), None).await;
+            ride(&tx, 2, steady).await;
+            let (z1, z2, tx1) = (zc.clone(), zc.clone(), tx.clone());
+            let starter = async move {
+                z1.start_with_config(power_target(300, 320, None), tx1, Some(250), None, None, None)
+                    .await
+            };
+            let closer = async move { z2.close(APP_CLOSE_RELEASE_BUDGET).await };
+            let (started, closed) = if start_first {
+                let s = tokio::spawn(starter);
+                tokio::task::yield_now().await;
+                let c = tokio::spawn(closer);
+                (s.await.unwrap(), c.await.unwrap())
+            } else {
+                let c = tokio::spawn(closer);
+                tokio::task::yield_now().await;
+                let s = tokio::spawn(starter);
+                (s.await.unwrap(), c.await.unwrap())
+            };
+            assert!(closed.is_some());
+            if !start_first {
+                assert!(started.unwrap_err().to_string().contains("App is closing"));
+            }
+            let n = fake.attempts().len();
+            ride(&tx, 15, steady).await;
+            assert_eq!(fake.attempts().len(), n, "a run kept commanding after close (start_first={start_first})");
+            assert!(!zc.status().await.active);
+            let err = zc
+                .start_with_config(power_target(300, 320, None), tx.clone(), Some(250), None, None, None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("App is closing"), "{err}");
+        }
+    }
+
+    // --- ruling 6: manual commands and pause during start ---
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_trainer_commands_refused_while_zone_run_active() {
+        let (zc, _fake, tx) = setup();
+        assert!(zc.ensure_manual_control_allowed().is_ok());
+        start(&zc, &tx, power_target(190, 210, None), None).await;
+        let err = zc.ensure_manual_control_allowed().unwrap_err().to_string();
+        assert!(err.contains("Zone ride active — stop it first"), "{err}");
+        zc.pause().await;
+        assert!(zc.ensure_manual_control_allowed().is_err(), "paused run still owns the trainer");
+        zc.stop(StopReason::UserStopped).await;
+        assert!(zc.ensure_manual_control_allowed().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pause_during_start_applies_to_new_run() {
+        let (zc, fake, tx) = setup();
+        start(&zc, &tx, power_target(190, 210, None), None).await;
+        ride(&tx, 2, steady).await;
+        fake.queue(Behavior::Hang(Duration::from_secs(2))); // run A's release, inside B's start
+        let (z1, tx1) = (zc.clone(), tx.clone());
+        let starter = tokio::spawn(async move { start(&z1, &tx1, power_target(300, 320, None), None).await });
+        sleep(Duration::from_millis(10)).await;
+        zc.pause().await;
+        starter.await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        let st = zc.status().await;
+        assert_eq!(st.lower_bound, Some(300));
+        assert!(st.active && st.paused, "pause lost during start: {st:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_after_finish_returns_the_original_reason() {
+        // Documented contract: a stop after the run ended reports why it ended.
+        let (zc, _fake, tx) = setup();
+        start(&zc, &tx, power_target(190, 210, Some(2)), None).await;
+        ride(&tx, 4, steady).await;
+        assert_eq!(zc.stop(StopReason::UserStopped).await, Some(StopReason::DurationComplete));
     }
 
     // --- ADR-19: hard budget ---

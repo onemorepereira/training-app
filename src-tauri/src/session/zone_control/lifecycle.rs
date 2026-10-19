@@ -29,16 +29,17 @@ pub async fn on_session_resume<B: TrainerBackend>(zc: &ZoneController<B>) {
     zc.resume().await;
 }
 
-/// Window close / app exit: stop zone control within a hard 4 s budget.
+/// Window close / app exit: refuse new zone rides and stop any running one
+/// within a hard 4 s budget.
 pub async fn on_app_close<B: TrainerBackend>(zc: &ZoneController<B>) -> Option<StopReason> {
-    zc.stop_with_budget(StopReason::AppClosing, APP_CLOSE_RELEASE_BUDGET).await
+    zc.close(APP_CLOSE_RELEASE_BUDGET).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::controller::task_tests::{power_target, ride, setup, start};
     use super::super::trainer::fake::Behavior;
-    use super::super::trainer::TrainerCmd;
+    use super::super::trainer::{CommandOutcome, TrainerCmd};
     use super::*;
     use std::time::Duration;
     use tokio::time::{sleep, Instant};
@@ -57,6 +58,7 @@ mod tests {
         // Returned only after the (slow) 0 W release reached the trainer
         assert!(fake.commands().ends_with(&[TrainerCmd::Power(0), TrainerCmd::Resistance(0)]));
         assert_eq!(zc.status().await.stop_reason, Some(StopReason::SessionStopped));
+        assert_eq!(zc.last_release_confirmed().await, Some(true));
     }
 
     #[tokio::test(start_paused = true)]
@@ -99,9 +101,14 @@ mod tests {
         ride(&tx, 2, quiet).await;
         fake.set_power_behavior(Behavior::Err);
         assert_eq!(on_app_close(&zc).await, Some(StopReason::AppClosing));
-        // 0 W never reached the trainer; only the best-effort resistance step did
+        // The 0 W release was attempted, failed, and was reported unconfirmed;
+        // only the best-effort resistance step reached the trainer.
+        assert!(fake.attempts().iter().any(|(c, _)| *c == TrainerCmd::Power(0)));
+        let outcomes = fake.outcomes();
+        assert!(outcomes.contains(&(TrainerCmd::Power(0), CommandOutcome::Err)), "{outcomes:?}");
+        assert_eq!(outcomes.last(), Some(&(TrainerCmd::Resistance(0), CommandOutcome::Ok)));
+        assert_eq!(zc.last_release_confirmed().await, Some(false));
         let cmds = fake.commands();
-        assert_eq!(cmds.last(), Some(&TrainerCmd::Resistance(0)));
         assert_eq!(cmds.iter().filter(|c| **c == TrainerCmd::Power(0)).count(), 0);
     }
 }

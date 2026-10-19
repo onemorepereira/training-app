@@ -283,6 +283,7 @@ pub async fn get_primary_devices(
 #[tauri::command]
 pub async fn set_trainer_power(state: State<'_, AppState>, watts: i16) -> Result<(), AppError> {
     info!("Set trainer power: {}W", watts);
+    state.zone_controller.ensure_manual_control_allowed()?;
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -293,6 +294,7 @@ pub async fn set_trainer_power(state: State<'_, AppState>, watts: i16) -> Result
 #[tauri::command]
 pub async fn set_trainer_resistance(state: State<'_, AppState>, level: u8) -> Result<(), AppError> {
     info!("Set trainer resistance: level {}", level);
+    state.zone_controller.ensure_manual_control_allowed()?;
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -308,6 +310,7 @@ pub async fn set_trainer_simulation(
     cw: f32,
 ) -> Result<(), AppError> {
     info!("Set trainer simulation: grade={}, crr={}, cw={}", grade, crr, cw);
+    state.zone_controller.ensure_manual_control_allowed()?;
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
