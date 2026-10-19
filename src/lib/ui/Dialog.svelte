@@ -36,6 +36,8 @@
     if (open && !dialog.open) {
       opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       dialog.showModal();
+      // Focus the dialog itself (not its first button), so nothing looks pre-selected.
+      dialog.focus();
     } else if (!open && dialog.open) {
       dialog.close();
     }
@@ -61,7 +63,7 @@
   }
 </script>
 
-<dialog bind:this={dialog} class="dialog dialog-{width}" aria-labelledby={titleId} onclose={handleClose} {onclick}>
+<dialog bind:this={dialog} class="dialog dialog-{width}" tabindex="-1" aria-labelledby={titleId} onclose={handleClose} {onclick}>
   <header class="dialog-header">
     <div class="dialog-heading">
       <h2 id={titleId} class="dialog-title">{title}</h2>
@@ -91,6 +93,10 @@
     box-shadow: var(--shadow-lg);
     width: min(calc(100vw - 32px), var(--dlg-w));
     max-height: min(calc(100vh - 32px), 760px);
+  }
+
+  .dialog:focus {
+    outline: none;
   }
 
   .dialog[open] {

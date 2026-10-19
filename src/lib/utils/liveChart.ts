@@ -23,3 +23,25 @@ export function zoneMarkArea(band: ZoneBand | null): {
     ]],
   };
 }
+
+export interface SeriesPresence {
+  power: boolean;
+  hr: boolean;
+  cadence: boolean;
+  speed: boolean;
+  cmdPower: boolean;
+}
+
+/**
+ * Legend entries for the live chart: only series that have data, and the
+ * commanded-power line only while a zone ride is running.
+ */
+export function visibleSeries(p: SeriesPresence, zoneActive: boolean): string[] {
+  const names: string[] = [];
+  if (p.power) names.push('Power');
+  if (p.hr) names.push('HR');
+  if (p.cadence) names.push('Cadence');
+  if (p.speed) names.push('Speed');
+  if (zoneActive && p.cmdPower) names.push('Cmd Power');
+  return names;
+}

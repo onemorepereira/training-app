@@ -66,8 +66,8 @@
 
 <style>
   .retro-container {
-    /* Fill width but cap height at 70vh, shrink width to preserve 16:9 */
-    width: min(100%, calc(70vh * 384 / 216));
+    /* Fill the ride stage at 16:9: as wide as the stage allows without exceeding its height */
+    width: min(100%, calc(var(--stage-h, 70vh) * 384 / 216));
     aspect-ratio: 384 / 216;
     margin: 0 auto;
     position: relative;
@@ -86,17 +86,17 @@
 
   .mute-btn {
     position: absolute;
-    bottom: 6px;
-    right: 6px;
+    bottom: 8px;
+    right: 8px;
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 3px;
-    background: rgba(0, 0, 0, 0.5);
-    color: rgba(255, 255, 255, 0.5);
+    width: 36px;
+    height: 36px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-md);
+    background: rgba(0, 0, 0, 0.6);
+    color: rgba(255, 255, 255, 0.85);
     cursor: pointer;
     transition: all 0.15s;
     z-index: 1;

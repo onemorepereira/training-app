@@ -6,6 +6,40 @@
   import { createLatestWinsSender } from '$lib/utils/latestWins';
   import { zoneActive } from '$lib/stores/zoneRide';
   import { get } from 'svelte/store';
+  import SegmentedControl from '$lib/ui/SegmentedControl.svelte';
+
+  const MODES = [
+    { value: 'erg', label: 'ERG', title: 'Hold a target power' },
+    { value: 'resistance', label: 'RES', title: 'Fixed resistance' },
+    { value: 'simulation', label: 'SIM', title: 'Simulate a grade' },
+  ] as const satisfies readonly { value: TrainerMode; label: string; title: string }[];
+
+  const STEPS: Record<TrainerMode, { label: string; delta: number; aria: string }[]> = {
+    erg: [
+      { label: '−25', delta: -25, aria: 'Decrease target by 25 watts' },
+      { label: '−5', delta: -5, aria: 'Decrease target by 5 watts' },
+      { label: '+5', delta: 5, aria: 'Increase target by 5 watts' },
+      { label: '+25', delta: 25, aria: 'Increase target by 25 watts' },
+    ],
+    resistance: [
+      { label: '−10', delta: -10, aria: 'Decrease resistance by 10 percent' },
+      { label: '−1', delta: -1, aria: 'Decrease resistance by 1 percent' },
+      { label: '+1', delta: 1, aria: 'Increase resistance by 1 percent' },
+      { label: '+10', delta: 10, aria: 'Increase resistance by 10 percent' },
+    ],
+    simulation: [
+      { label: '−1', delta: -1, aria: 'Decrease grade by 1 percent' },
+      { label: '−.1', delta: -0.1, aria: 'Decrease grade by 0.1 percent' },
+      { label: '+.1', delta: 0.1, aria: 'Increase grade by 0.1 percent' },
+      { label: '+1', delta: 1, aria: 'Increase grade by 1 percent' },
+    ],
+  };
+
+  function adjust(delta: number) {
+    if (local.mode === 'erg') adjustErg(delta);
+    else if (local.mode === 'resistance') adjustResistance(delta);
+    else adjustGrade(delta);
+  }
 
   let local: TrainerState = $state({
     mode: 'erg',
@@ -114,70 +148,98 @@
 </script>
 
 <div class="trainer-strip">
-  {#if $zoneActive}
-    <p class="zone-lock-hint">Zone ride active — stop it to adjust the trainer manually</p>
-  {/if}
   <fieldset class="strip-fieldset" disabled={$zoneActive}>
-  <div class="strip-row">
-    <div class="mode-tabs">
-      <button class="tab" class:active={local.mode === 'erg'} onclick={() => setMode('erg')}>ERG</button>
-      <button class="tab" class:active={local.mode === 'resistance'} onclick={() => setMode('resistance')}>RES</button>
-      <button class="tab" class:active={local.mode === 'simulation'} onclick={() => setMode('simulation')}>SIM</button>
+    <legend class="sr-only">Trainer control</legend>
+    <SegmentedControl
+      size="lg"
+      label="Trainer mode"
+      options={MODES}
+      value={local.mode}
+      onchange={(m) => setMode(m)}
+      data-ride-control
+    />
+
+    <div class="strip-target" aria-live="polite">
+      {#if local.mode === 'erg'}
+        <span class="target-value data">{local.ergTarget}<span class="target-unit">W</span></span>
+        <span class="target-caption">target{#if $currentPower != null}{' · now '}<span class="data">{$currentPower} W</span>{/if}</span>
+      {:else if local.mode === 'resistance'}
+        <span class="target-value data">{local.resistanceLevel}<span class="target-unit">%</span></span>
+        <span class="target-caption">resistance</span>
+      {:else}
+        <span class="target-value data">{local.simGrade.toFixed(1)}<span class="target-unit">%</span></span>
+        <span class="target-caption">grade</span>
+      {/if}
     </div>
 
-    <div class="strip-divider"></div>
-
-    {#if local.mode === 'erg'}
-      <div class="strip-target">
-        <span class="target-value">{local.ergTarget}<span class="target-unit">W</span></span>
-        {#if $currentPower != null}
-          <span class="actual-value">{$currentPower}W</span>
-        {/if}
-      </div>
-      <div class="strip-adjust">
-        <button class="adj-btn" onclick={() => adjustErg(-25)}>-25</button>
-        <button class="adj-btn" onclick={() => adjustErg(-5)}>-5</button>
-        <button class="adj-btn" onclick={() => adjustErg(5)}>+5</button>
-        <button class="adj-btn" onclick={() => adjustErg(25)}>+25</button>
-      </div>
-    {:else if local.mode === 'resistance'}
-      <div class="strip-target">
-        <span class="target-value">{local.resistanceLevel}<span class="target-unit">%</span></span>
-      </div>
-      <div class="strip-adjust">
-        <button class="adj-btn" onclick={() => adjustResistance(-10)}>-10</button>
-        <button class="adj-btn" onclick={() => adjustResistance(-1)}>-1</button>
-        <button class="adj-btn" onclick={() => adjustResistance(1)}>+1</button>
-        <button class="adj-btn" onclick={() => adjustResistance(10)}>+10</button>
-      </div>
-    {:else}
-      <div class="strip-target">
-        <span class="target-value">{local.simGrade.toFixed(1)}<span class="target-unit">%</span></span>
-      </div>
-      <div class="strip-adjust">
-        <button class="adj-btn" onclick={() => adjustGrade(-1)}>-1</button>
-        <button class="adj-btn" onclick={() => adjustGrade(-0.1)}>-.1</button>
-        <button class="adj-btn" onclick={() => adjustGrade(0.1)}>+.1</button>
-        <button class="adj-btn" onclick={() => adjustGrade(1)}>+1</button>
-      </div>
-    {/if}
-
-  </div>
-</fieldset>
+    <div class="strip-adjust" role="group" aria-label="Adjust {local.mode === 'erg' ? 'target power' : local.mode === 'resistance' ? 'resistance' : 'grade'}">
+      {#each STEPS[local.mode] as step (step.label)}
+        <button type="button" class="btn btn-lg btn-secondary adj-btn data" data-ride-control onclick={() => adjust(step.delta)} aria-label={step.aria}>{step.label}</button>
+      {/each}
+    </div>
+  </fieldset>
+  {#if $zoneActive}
+    <p class="zone-lock-hint">Zone ride active. Stop it to adjust the trainer manually.</p>
+  {/if}
 </div>
 
 <style>
+  .trainer-strip {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    min-width: 0;
+  }
+
   .strip-fieldset {
-    display: contents;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-md);
     border: 0;
     margin: 0;
     padding: 0;
     min-width: 0;
   }
 
-  .strip-fieldset:disabled button {
-    opacity: 0.4;
-    cursor: not-allowed;
+  .strip-fieldset:disabled {
+    opacity: 0.5;
+  }
+
+  .strip-target {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 92px;
+    line-height: 1.1;
+  }
+
+  .target-value {
+    font-size: 1.75rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .target-unit {
+    margin-left: 2px;
+    font-size: 0.5em;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+
+  .target-caption {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
+  .strip-adjust {
+    display: flex;
+    gap: var(--space-xs);
+  }
+
+  .adj-btn {
+    min-width: 56px;
+    padding: 0 var(--space-sm);
   }
 
   .zone-lock-hint {
@@ -185,116 +247,4 @@
     font-size: var(--text-xs);
     color: var(--text-muted);
   }
-
-  .trainer-strip {
-    display: contents;
-  }
-
-  .strip-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-md);
-    flex-wrap: wrap;
-  }
-
-  .mode-tabs {
-    display: flex;
-    gap: 2px;
-    background: var(--bg-body);
-    border-radius: var(--radius-md);
-    padding: 2px;
-    flex-shrink: 0;
-  }
-
-  .tab {
-    padding: var(--space-xs) var(--space-md);
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: var(--text-xs);
-    font-weight: 700;
-    cursor: pointer;
-    border-radius: 5px;
-    transition: all var(--transition-fast);
-    letter-spacing: 0.04em;
-  }
-
-  .tab:hover {
-    color: var(--text-secondary);
-  }
-
-  .tab.active {
-    background: var(--bg-elevated);
-    color: var(--accent);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .strip-divider {
-    width: 1px;
-    height: 24px;
-    background: var(--border-default);
-    flex-shrink: 0;
-  }
-
-  .strip-target {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-sm);
-    flex-shrink: 0;
-  }
-
-  .target-value {
-    font-family: var(--font-data);
-    font-size: var(--text-xl);
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    color: var(--text-primary);
-    line-height: 1;
-  }
-
-  .target-unit {
-    font-size: 0.6em;
-    font-weight: 500;
-    color: var(--text-muted);
-    margin-left: 1px;
-  }
-
-  .actual-value {
-    font-family: var(--font-data);
-    font-size: var(--text-sm);
-    color: var(--info);
-    font-weight: 500;
-  }
-
-  .strip-adjust {
-    display: flex;
-    gap: 4px;
-  }
-
-  .adj-btn {
-    padding: var(--space-xs) var(--space-sm);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-body);
-    color: var(--text-secondary);
-    font-family: var(--font-data);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    min-width: 36px;
-    text-align: center;
-  }
-
-  .adj-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .adj-btn:active {
-    transform: scale(0.95);
-  }
-
 </style>

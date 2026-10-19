@@ -169,6 +169,39 @@ export const SCENARIOS = [
     },
   },
   {
+    name: 'AC11 worst case: 800x600 zone ride with a notice',
+    route: 'ride',
+    state: 'riding-zone',
+    vp: { w: 800, h: 600 },
+    async run(page) {
+      const fails = [];
+      await page.evaluate(() => window.__mockEmit('device_reconnecting', { device_id: 'ble:C4:2F:90:11:7A:3E', device_type: 'HeartRate', attempt: 2 }));
+      await page.waitForTimeout(600);
+      if (!(await page.locator('[data-notice]').first().isVisible())) fails.push('reconnecting notice not shown');
+      const out = await page.evaluate(() => [...document.querySelectorAll('[data-ride-control]')].map((el) => {
+        const r = el.getBoundingClientRect();
+        return { t: (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 30), top: r.top, bottom: r.bottom, h: r.height };
+      }).filter((r) => r.h > 0 && (r.top < 0 || r.bottom > innerHeight + 0.5)));
+      for (const o of out) fails.push(`ride control off-screen: "${o.t}" bottom ${Math.round(o.bottom)}`);
+      const sizes = await page.evaluate(() => [...document.querySelectorAll('[data-metric-value]')].map((el) => ({ kind: el.dataset.metricValue, px: parseFloat(getComputedStyle(el).fontSize) })));
+      for (const v of sizes) {
+        const min = { power: 48, primary: 40, secondary: 28 }[v.kind];
+        if (min && v.px < min * 0.8) fails.push(`${v.kind} ${v.px}px < 80% of ${min}px with a notice shown`);
+      }
+      return fails;
+    },
+  },
+  {
+    name: 'AC13 idle values all read --',
+    route: 'ride',
+    state: 'empty',
+    async run(page) {
+      const texts = await page.evaluate(() => [...document.querySelectorAll('[data-metric-value]')].map((el) => ({ kind: el.dataset.metricValue, t: el.textContent.trim() })));
+      if (!texts.length) return ['no metric values found'];
+      return texts.filter((x) => x.t !== '--').map((x) => `${x.kind} shows "${x.t}" instead of --`);
+    },
+  },
+  {
     name: 'AC10 fullscreen hint and exit button',
     route: 'ride',
     state: 'riding',
@@ -181,7 +214,7 @@ export const SCENARIOS = [
       await page.clock.runFor(3200);
       await page.waitForTimeout(100);
       if (await hint.isVisible()) fails.push('hint still visible after 3 s');
-      const exit = page.getByRole('button', { name: 'Exit fullscreen' });
+      const exit = page.getByRole('button', { name: 'Exit fullscreen', exact: true });
       if ((await visibleOpacity(exit)) > 0.05) fails.push('exit button visible before any pointer movement');
       await page.mouse.move(400, 300);
       await page.mouse.move(420, 320);

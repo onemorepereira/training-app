@@ -24,11 +24,11 @@ export const AXIS_LINE = 'rgba(255, 255, 255, 0.12)';
 /** One colour per series, used by the live chart, ride detail and analytics alike. */
 export const SERIES = {
   power: '#ff4d6d',
-  hr: '#ff6b60',
+  hr: '#ffa726',
   cadence: '#64b5f6',
   speed: '#4caf50',
-  cmdPower: '#ffb74d',
-  ftp: '#ffb74d',
+  cmdPower: '#ffd54f',
+  ftp: '#ffd54f',
   ctl: '#4a90d9',
   atl: '#ff4d6d',
   tsb: '#9a9ab2',

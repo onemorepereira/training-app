@@ -71,6 +71,7 @@ A mocked-backend Playwright harness moves into the repo at `tools/ui-harness/`. 
     - one notice (≤ 52 px) leaves **328**.
     - Wide mode at 704×380: the gauge column is about 300 px wide (power about 64 px). The right column holds 2×2 primaries at **150 px** per row (2×150 + an 8 px gap = 308; values about 48 px), then an 8 px gap, then the 64 px secondary strip. Total 308 + 8 + 64 = **380**.
     - At 704×328 (notice shown), the secondary strip hides first, and the primaries get 2×160.
+    - *Build note (S4):* at 704 px wide, the primaries are limited by **width** (about 41.7 px), not height, so at 704×328 the strip still fits and stays. It hides only when keeping it would push primaries below the minimum, for example at 704×240. Stacked mode uses a 2×2 card grid, not 4 across, because 4 across failed the 40 px minimum on tall, narrow windows such as 800×1000. The constants live in `rideLayout.ts` (Plex Mono at 0.6 em per glyph; the widest value "1:02:09" is about 4.3 em).
   - **Other reference sizes:**
     - **1280×800:** the sidebar shows (≥ 1100), so stage width = 1280 − 200 − 32 = **1048**. That is below 1100, so rows A and B **don't** merge (control bar 120). Stage height = 800 − 32 − 56 − 120 − 12 = **580**.
     - **1920×1080 windowed:** the sidebar is 200 px, so stage width = **1688**. Rows merge at ≥ 1100 stage width (control bar 68). Stage height = 1080 − 32 − 56 − 68 − 12 = **912**.
@@ -119,6 +120,7 @@ A mocked-backend Playwright harness moves into the repo at `tools/ui-harness/`. 
     - tsb `#9a9ab2`.
   - `POWER_ZONE_COLORS[7]` and `HR_ZONE_COLORS[5]`. These replace the five palettes in settings, ZoneRideStatus, ZoneDistribution, PowerHistogram and HrHistogram, using the ZoneDistribution values as the canonical set. PowerGauge bands derive from `POWER_ZONE_COLORS`.
   - Helpers `axisDefaults()`, `legendDefaults()`, `tooltipDefaults()` and `gridDefaults()`, each returning an object to spread into an option.
+- *Build note (S5):* HR red (`#ff6b60`) was too close to Power pink (`#ff4d6d`) when both lines are drawn on one chart. HR is orange (`#ffa726`, as the live chart already had) on every chart, and commanded power and FTP are yellow (`#ffd54f`). The HR *card* on the ride screen keeps its red heart-rate accent, because that is a label colour, not a series colour.
 - **Test:** `theme.test.ts` asserts every `fontSize` is ≥ 12, and that each text colour has contrast ≥ 4.5 against `CHART_BG` (`--bg-surface`).
 
 ### ADR-6: Page width containers
