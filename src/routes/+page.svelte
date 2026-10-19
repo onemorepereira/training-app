@@ -18,6 +18,7 @@
   import { api, extractError, type SessionConfig, type ZoneTarget } from '$lib/tauri';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import { formatDuration } from '$lib/utils/format';
+  import { toggleFullscreen } from '$lib/stores/fullscreen';
 
   let error = $state('');
   /** Zone-ride notice the user dismissed (the result itself is kept until saved). */
@@ -86,10 +87,6 @@
     } catch (e) {
       error = extractError(e);
     }
-  }
-
-  function toggleFullscreen() {
-    window.dispatchEvent(new CustomEvent('toggle-fullscreen'));
   }
 </script>
 

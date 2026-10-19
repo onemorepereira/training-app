@@ -460,6 +460,14 @@
     'plugin:app|identifier': () => 'com.training-app',
     'plugin:opener|open_url': ({ url }) => { console.info('[tauri-mock] open_url', url); return null; },
     'plugin:opener|open_path': () => null,
+    // Window plugin: fullscreen is state-only here (no DOM Fullscreen API), and a
+    // resize event is emitted on change like the real backend does.
+    'plugin:window|is_fullscreen': () => fullscreen,
+    'plugin:window|set_fullscreen': ({ value }) => {
+      fullscreen = !!value;
+      emit('tauri://resize', { width: innerWidth, height: innerHeight });
+      return null;
+    },
     'plugin:event|listen': ({ event, handler }) => {
       const id = nextEventId++;
       if (!listeners.has(event)) listeners.set(event, []);
@@ -475,7 +483,9 @@
     'plugin:event|emit_to': ({ event, payload }) => { emit(event, payload); return null; },
   };
 
-  const NEVER_FAIL = (cmd) => cmd.startsWith('plugin:event|') || cmd.startsWith('plugin:app|') || cmd.startsWith('plugin:opener|');
+  let fullscreen = false;
+  window.__mockFullscreen = () => fullscreen;
+  const NEVER_FAIL = (cmd) => cmd.startsWith('plugin:event|') || cmd.startsWith('plugin:app|') || cmd.startsWith('plugin:opener|') || cmd.startsWith('plugin:window|');
 
   async function invoke(cmd, args = {}, _options) {
     calls.push([cmd, args]);

@@ -80,4 +80,126 @@ export function summarize(engine, results) {
  * Scripted scenarios: { name, route, state?, vp?, run(page) -> string[] failures }.
  * The clock is installed (page.clock) before navigation; use page.clock.runFor() instead of sleeps.
  */
-export const SCENARIOS = [];
+const visibleOpacity = (loc) => loc.evaluate((el) => {
+  let o = 1;
+  for (let e = el; e; e = e.parentElement) o *= parseFloat(getComputedStyle(e).opacity);
+  return o;
+});
+
+async function tabTo(page, predicate, max = 25, arg = null) {
+  for (let i = 0; i < max; i++) {
+    await page.keyboard.press('Tab');
+    if (await page.evaluate(predicate, arg)) return true;
+  }
+  return false;
+}
+
+export const SCENARIOS = [
+  {
+    name: 'AC8 rail tooltips on keyboard focus',
+    route: 'history',
+    vp: { w: 800, h: 600 },
+    async run(page) {
+      const fails = [];
+      const links = page.locator('nav .nav-links a');
+      const n = await links.count();
+      if (n !== 6) fails.push(`expected 6 nav links, found ${n}`);
+      for (let i = 0; i < n; i++) {
+        const href = await links.nth(i).getAttribute('href');
+        const ok = await tabTo(page, (h) => document.activeElement?.getAttribute('href') === h && document.activeElement.closest('nav'), 30, href).catch(() => false);
+        if (!ok) { fails.push(`could not Tab to nav link ${href}`); continue; }
+        const tip = links.nth(i).locator('[role="tooltip"]');
+        await page.waitForTimeout(250);
+        if ((await tip.count()) === 0 || (await visibleOpacity(tip)) < 0.9) fails.push(`no visible tooltip on focus for ${href}`);
+      }
+      return fails;
+    },
+  },
+  {
+    name: 'AC8 sidebar shows labels; device indicator is named',
+    route: 'history',
+    vp: { w: 1280, h: 800 },
+    async run(page) {
+      const fails = [];
+      const labels = await page.locator('nav .nav-links a').allInnerTexts();
+      for (const want of ['Ride', 'Devices', 'History', 'Analytics', 'Settings', 'About'])
+        if (!labels.some((t) => t.trim() === want)) fails.push(`no visible label "${want}"`);
+      const name = await page.locator('nav a[href="/devices"].device-status, nav .device-status').first().getAttribute('aria-label');
+      if (!/^(\d+ devices? connected|No devices connected)$/.test(name ?? '')) fails.push(`device indicator name "${name}"`);
+      const text = await page.locator('nav .device-status').innerText();
+      if (!/\d+ connected|None connected/.test(text)) fails.push(`device indicator text "${text}"`);
+      return fails;
+    },
+  },
+  {
+    name: 'AC9 Esc closes the dialog and leaves the nav alone',
+    route: 'history-detail',
+    async run(page) {
+      const fails = [];
+      await page.getByRole('button', { name: /^Edit/ }).click();
+      await page.waitForTimeout(300);
+      if (!(await page.locator('dialog[open]').count())) return ['Edit dialog did not open'];
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      if (await page.locator('dialog[open]').count()) fails.push('dialog still open after Esc');
+      if (!(await page.locator('nav').isVisible())) fails.push('nav hidden after Esc');
+      return fails;
+    },
+  },
+  {
+    name: 'AC9 Esc in a dialog during fullscreen only closes the dialog',
+    route: 'history-detail',
+    async run(page) {
+      const fails = [];
+      const fs = () => page.evaluate(() => window.__mockFullscreen());
+      await page.keyboard.press('F11');
+      await page.waitForTimeout(300);
+      if (!(await fs())) return ['F11 did not enter fullscreen'];
+      await page.getByRole('button', { name: /^Edit/ }).click();
+      await page.waitForTimeout(300);
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      if (await page.locator('dialog[open]').count()) fails.push('dialog still open after first Esc');
+      if (!(await fs())) fails.push('first Esc (closing the dialog) also left fullscreen');
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      if (await fs()) fails.push('second Esc did not leave fullscreen');
+      if (!(await page.locator('nav').isVisible())) fails.push('nav not restored after leaving fullscreen');
+      return fails;
+    },
+  },
+  {
+    name: 'AC10 fullscreen hint and exit button',
+    route: 'ride',
+    state: 'riding',
+    async run(page) {
+      const fails = [];
+      await page.keyboard.press('F11');
+      await page.waitForTimeout(200);
+      const hint = page.getByText('to exit fullscreen');
+      if (!(await hint.isVisible())) fails.push('hint not shown on entering fullscreen');
+      await page.clock.runFor(3200);
+      await page.waitForTimeout(100);
+      if (await hint.isVisible()) fails.push('hint still visible after 3 s');
+      const exit = page.getByRole('button', { name: 'Exit fullscreen' });
+      if ((await visibleOpacity(exit)) > 0.05) fails.push('exit button visible before any pointer movement');
+      await page.mouse.move(400, 300);
+      await page.mouse.move(420, 320);
+      await page.waitForTimeout(300);
+      if ((await visibleOpacity(exit)) < 0.9) fails.push('exit button not shown after pointer movement');
+      await page.clock.runFor(2700);
+      await page.waitForTimeout(400);
+      if ((await visibleOpacity(exit)) > 0.05) fails.push('exit button still shown 2.5 s after pointer stopped');
+      const focused = await tabTo(page, () => document.activeElement?.textContent?.includes('Exit fullscreen'), 40);
+      if (!focused) fails.push('exit button not reachable with Tab');
+      else {
+        await page.waitForTimeout(300);
+        if ((await visibleOpacity(exit)) < 0.9) fails.push('exit button not visible on keyboard focus');
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(300);
+        if (await page.evaluate(() => window.__mockFullscreen())) fails.push('exit button did not leave fullscreen');
+      }
+      return fails;
+    },
+  },
+];

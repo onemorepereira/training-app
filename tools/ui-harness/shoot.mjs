@@ -77,11 +77,10 @@ const INTERACTIONS = [
   ['ride-normal-trainer-res', 'ride', 'normal', async (p) => { await p.getByRole('button', { name: 'RES', exact: true }).click(); }],
   ['ride-riding-graphs', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: 'Graphs' }).click(); await p.waitForTimeout(2500); }],
   ['ride-riding-retro', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: 'Retro' }).click(); await p.waitForTimeout(1500); }],
-  ['ride-riding-fullscreen', 'ride', 'riding', async (p) => { await p.keyboard.press('Escape'); await p.waitForTimeout(400); }],
-  ['ride-riding-fullscreen-event', 'ride', 'riding', async (p) => { await p.evaluate(() => window.dispatchEvent(new CustomEvent('toggle-fullscreen'))); await p.waitForTimeout(400); }],
+  ['ride-riding-fullscreen', 'ride', 'riding', async (p) => { await p.keyboard.press('F11'); await p.waitForTimeout(3600); }],
   ['ride-riding-postride-modal', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: /Stop/ }).first().click(); await p.waitForTimeout(800); }],
   ['ride-riding-paused', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: /Pause/ }).click(); await p.waitForTimeout(600); }],
-  ['ride-normal-nav-tooltip', 'ride', 'normal', async (p) => { await p.hover('a[aria-label="History"]'); await p.waitForTimeout(300); }],
+  ['ride-normal-nav-tooltip', 'ride', 'normal', async (p) => { await p.hover('nav a[href="/history"]'); await p.waitForTimeout(400); }],
   ['history-normal-table', 'history', 'normal', async (p) => { await p.getByRole('button', { name: 'Table view' }).click(); await p.waitForTimeout(400); }],
   ['history-detail-normal-editmodal', 'history-detail', 'normal', async (p) => { await p.getByRole('button', { name: /Edit/ }).click(); await p.waitForTimeout(500); }],
   ['history-detail-normal-zonetooltip', 'history-detail', 'normal', async (p) => { const bar = p.locator('.zone-dist .zone-bar, .zone-dist [class*="bar"]').first(); await bar.scrollIntoViewIfNeeded(); await bar.hover(); await p.waitForTimeout(300); }],
@@ -428,7 +427,7 @@ async function runEngine(engine, base) {
         // Time until the nav rail is painted & visible
         let firstUi = null;
         try {
-          await page.waitForSelector('nav.nav-rail', { state: 'visible', timeout: 20000 });
+          await page.waitForSelector('nav', { state: 'visible', timeout: 20000 });
           firstUi = Date.now() - t0;
         } catch { firstUi = '>20000'; }
         const loadMs = await page.waitForLoadState('load', { timeout: mode === 'hang' ? 8000 : 30000 }).then(() => Date.now() - t0).catch(() => `>${mode === 'hang' ? 8000 : 30000}`);
