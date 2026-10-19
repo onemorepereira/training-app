@@ -1,76 +1,15 @@
-use log::{debug, error, info, warn};
-use serde::Deserialize;
+use log::{error, info, warn};
 use std::path::{Path, PathBuf};
 
 use super::fsio::{io_error, remove_durable, write_durable};
 use super::power_curves::replace_power_curve_in_tx;
+use super::sensor_codec;
 use super::Storage;
-use crate::device::types::{CommandSource, SensorReading};
+use crate::device::types::SensorReading;
 use crate::error::AppError;
 use crate::session::analysis::PowerCurvePoint;
 use crate::session::metrics::SummaryMetrics;
 use crate::session::types::{SessionSummary, ZoneSnapshot};
-
-/// Legacy sensor reading format: Power variant lacked pedal_balance field because
-/// #[serde(skip_serializing_if)] silently dropped it from bincode output.
-#[derive(Deserialize)]
-enum LegacySensorReading {
-    Power {
-        watts: u16,
-        epoch_ms: u64,
-        #[serde(default)]
-        device_id: String,
-    },
-    HeartRate {
-        bpm: u8,
-        epoch_ms: u64,
-        #[serde(default)]
-        device_id: String,
-    },
-    Cadence {
-        rpm: f32,
-        epoch_ms: u64,
-        #[serde(default)]
-        device_id: String,
-    },
-    Speed {
-        kmh: f32,
-        epoch_ms: u64,
-        #[serde(default)]
-        device_id: String,
-    },
-    TrainerCommand {
-        target_watts: u16,
-        epoch_ms: u64,
-        source: CommandSource,
-    },
-}
-
-impl From<LegacySensorReading> for SensorReading {
-    fn from(legacy: LegacySensorReading) -> Self {
-        match legacy {
-            LegacySensorReading::Power { watts, epoch_ms, device_id } => SensorReading::Power {
-                watts,
-                timestamp: None,
-                epoch_ms,
-                device_id,
-                pedal_balance: None,
-            },
-            LegacySensorReading::HeartRate { bpm, epoch_ms, device_id } => {
-                SensorReading::HeartRate { bpm, timestamp: None, epoch_ms, device_id }
-            }
-            LegacySensorReading::Cadence { rpm, epoch_ms, device_id } => {
-                SensorReading::Cadence { rpm, timestamp: None, epoch_ms, device_id }
-            }
-            LegacySensorReading::Speed { kmh, epoch_ms, device_id } => {
-                SensorReading::Speed { kmh, timestamp: None, epoch_ms, device_id }
-            }
-            LegacySensorReading::TrainerCommand { target_watts, epoch_ms, source } => {
-                SensorReading::TrainerCommand { target_watts, epoch_ms, source }
-            }
-        }
-    }
-}
 
 /// Result of [`Storage::save_session`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,21 +284,7 @@ impl Storage {
         let data = std::fs::read(&raw_file)
             .map_err(|e| AppError::Serialization(format!("Failed to read sensor data: {}", e)))?;
 
-        // Try current format first; fall back to legacy format (before pedal_balance
-        // was added to Power). The old code used #[serde(skip_serializing_if)] on
-        // pedal_balance which is broken with bincode — it omitted the field during
-        // serialization but the deserializer always expected it.
-        bincode::deserialize::<Vec<SensorReading>>(&data).or_else(|_| {
-            debug!("Using legacy format fallback for session {}", session_id);
-            let legacy: Vec<LegacySensorReading> = bincode::deserialize(&data)
-                .map_err(|e| {
-                    AppError::Serialization(format!(
-                        "Failed to deserialize sensor data: {}",
-                        e
-                    ))
-                })?;
-            Ok(legacy.into_iter().map(SensorReading::from).collect())
-        })
+        sensor_codec::decode(&data)
     }
 
     /// Replace a session's user metadata. Full-replace contract: every call

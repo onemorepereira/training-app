@@ -2,21 +2,21 @@ use log::{error, info, warn};
 use std::path::PathBuf;
 
 use super::fsio::{remove_durable, write_durable};
+use super::sensor_codec;
 use super::{SaveOutcome, Storage};
 use crate::commands::validate_session_id;
 use crate::device::types::SensorReading;
 use crate::error::AppError;
 use crate::session::types::SessionSummary;
 
-/// Serialize an autosave: 4-byte JSON length (LE) + JSON summary + bincode log.
+/// Serialize an autosave: 4-byte JSON length (LE) + JSON summary + encoded sensor log.
 fn encode_autosave(
     summary: &SessionSummary,
     sensor_log: &[SensorReading],
 ) -> Result<Vec<u8>, AppError> {
     let json_bytes =
         serde_json::to_vec(summary).map_err(|e| AppError::Serialization(e.to_string()))?;
-    let sensor_bytes =
-        bincode::serialize(sensor_log).map_err(|e| AppError::Serialization(e.to_string()))?;
+    let sensor_bytes = sensor_codec::encode(sensor_log);
     let mut data = Vec::with_capacity(4 + json_bytes.len() + sensor_bytes.len());
     data.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
     data.extend_from_slice(&json_bytes);
@@ -64,12 +64,8 @@ impl Storage {
                 false
             }
         };
-        let raw = bincode::serialize(sensor_log)
-            .map_err(|e| AppError::Serialization(e.to_string()));
-        let saved = match raw {
-            Ok(raw) => self.save_session(summary, &raw).await,
-            Err(e) => Err(e),
-        };
+        let raw = sensor_codec::encode(sensor_log);
+        let saved = self.save_session(summary, &raw).await;
         if let Err(e) = saved {
             error!("Saving session {} failed: {}", summary.id, e);
             let kept = if autosave_ok {

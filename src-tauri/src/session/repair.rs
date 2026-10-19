@@ -271,7 +271,7 @@ mod tests {
     }
 
     async fn save(storage: &Storage, summary: &SessionSummary, readings: &[SensorReading]) {
-        let raw = bincode::serialize(readings).unwrap();
+        let raw = crate::session::storage::sensor_codec::encode(readings);
         storage.save_session(summary, &raw).await.unwrap();
     }
 
@@ -454,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn repair_skips_corrupt_raw_log() {
         let (s, _tmp) = storage().await;
-        s.save_session(&stale_summary("r8"), b"\x01not bincode").await.unwrap();
+        s.save_session(&stale_summary("r8"), b"\x01not a sensor log").await.unwrap();
         save(&s, &stale_summary("r8b"), &ride()).await;
 
         let report = run_metrics_repair(s.clone()).await.unwrap();

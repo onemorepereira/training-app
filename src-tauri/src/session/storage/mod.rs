@@ -5,6 +5,7 @@ mod fsio;
 mod meta;
 mod power_curves;
 mod schema;
+pub(crate) mod sensor_codec;
 mod sessions;
 
 pub use meta::verify_sqlite_file;
@@ -612,7 +613,7 @@ mod tests {
             },
         ];
 
-        let raw = bincode::serialize(&readings).unwrap();
+        let raw = sensor_codec::encode(&readings);
         let summary = make_summary("rt-1");
         storage.save_session(&summary, &raw).await.unwrap();
 
@@ -674,7 +675,7 @@ mod tests {
     async fn load_sensor_data_empty_round_trip() {
         let (storage, _tmp) = test_storage().await;
         let readings: Vec<SensorReading> = vec![];
-        let raw = bincode::serialize(&readings).unwrap();
+        let raw = sensor_codec::encode(&readings);
         let summary = make_summary("rt-empty");
         storage.save_session(&summary, &raw).await.unwrap();
 
@@ -920,7 +921,7 @@ mod tests {
     }
 
     fn raw(n: u64) -> Vec<u8> {
-        bincode::serialize(&power_log(n)).unwrap()
+        sensor_codec::encode(&power_log(n))
     }
 
     fn sessions_dir(storage: &Storage) -> std::path::PathBuf {
