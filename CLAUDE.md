@@ -15,7 +15,7 @@ Every test must answer: **"What breaks if this test is deleted?"** Tests verify 
 ## Rust Conventions
 
 - Inline test modules: `#[cfg(test)] mod tests { use super::*; ... }`
-- Use `assert_approx(actual, expected, epsilon, msg)` helper for float comparisons with explicit epsilon
+- Use `assert_approx(actual, expected, epsilon, msg)` helper for float comparisons with explicit epsilon (defined per test module, e.g. `session/metrics.rs`; copy it into new modules)
 - Epsilon guidance: watts ±0.1, ratios ±0.01, TSS ±0.5
 
 ## Project Commands
@@ -23,8 +23,9 @@ Every test must answer: **"What breaks if this test is deleted?"** Tests verify 
 ```bash
 cd src-tauri && cargo test          # Run all Rust tests
 cd src-tauri && cargo test --lib session::metrics  # Run metrics tests only
-npm test                            # Frontend unit tests (vitest)
+npm test                            # Frontend unit tests (Vitest, *.test.ts)
 npm run check                       # Frontend type checking
+npm run tauri dev                   # Run the app (dev build, includes sensor simulator)
 ```
 
 ## Schema Changes
