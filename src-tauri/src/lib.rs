@@ -306,11 +306,9 @@ pub fn run() {
                 tauri::async_runtime::block_on(async {
                     // Save active session before shutdown
                     if let Some((summary, sensor_log)) = session_mgr.stop_session_with_log().await {
-                        let raw_data = bincode::serialize(&sensor_log).unwrap_or_default();
-                        if let Err(e) = storage.save_session(&summary, &raw_data).await {
-                            log::warn!("Failed to save session on shutdown: {}", e);
+                        if let Err(e) = storage.finalize_session(&summary, &sensor_log).await {
+                            log::error!("Failed to save session on shutdown: {}", e);
                         }
-                        storage.remove_autosave(&summary.id);
                     }
                 });
             }

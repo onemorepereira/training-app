@@ -1,7 +1,8 @@
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use super::fsio::{io_error, remove_durable, write_durable};
 use super::Storage;
 use crate::device::types::{CommandSource, SensorReading};
 use crate::error::AppError;
@@ -68,6 +69,17 @@ impl From<LegacySensorReading> for SensorReading {
     }
 }
 
+/// Result of [`Storage::save_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// New row inserted (raw file written or already identical on disk).
+    Inserted,
+    /// Row and raw file already existed; nothing was written.
+    AlreadyExisted,
+    /// Row existed without a raw file (legacy crash); file written, metrics updated.
+    RepairedRaw,
+}
+
 #[derive(sqlx::FromRow)]
 struct SessionRow {
     id: String,
@@ -130,30 +142,89 @@ impl TryFrom<SessionRow> for SessionSummary {
 }
 
 impl Storage {
+    pub(crate) fn sessions_dir(&self) -> PathBuf {
+        Path::new(&self.data_dir).join("sessions")
+    }
+
+    pub(crate) fn raw_path(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir().join(format!("{}.bin", session_id))
+    }
+
+    pub(crate) async fn session_exists(&self, session_id: &str) -> Result<bool, AppError> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(AppError::Database)?;
+        Ok(row.is_some())
+    }
+
+    /// Persist a finished session so that the row's summary always describes the
+    /// raw file on disk. Never overwrites an existing session's raw log.
+    ///
+    /// Ordering: raw file is made durable first, then the row is inserted. So a
+    /// row implies its raw file exists. Cases (single writer per id is guaranteed:
+    /// recovery runs before any command; live sessions have fresh UUIDs):
+    ///
+    /// | row    | raw file           | action                                        |
+    /// |--------|--------------------|-----------------------------------------------|
+    /// | exists | exists             | nothing (`AlreadyExisted`)                    |
+    /// | exists | absent (legacy)    | write raw, update row metrics (`RepairedRaw`) |
+    /// | absent | absent / identical | write raw if needed, insert row (`Inserted`)  |
+    /// | absent | differs            | keep old as `.orphan-<ms>`, write, insert     |
     pub async fn save_session(
         &self,
         summary: &SessionSummary,
         raw_data: &[u8],
-    ) -> Result<(), AppError> {
+    ) -> Result<SaveOutcome, AppError> {
         info!(
             "Saving session: id={}, duration={}s",
             summary.id, summary.duration_secs
         );
-        let raw_file = Path::new(&self.data_dir)
-            .join("sessions")
-            .join(format!("{}.bin", summary.id));
+        let raw_file = self.raw_path(&summary.id);
+
+        if self.session_exists(&summary.id).await? {
+            let raw_present = tokio::fs::try_exists(&raw_file)
+                .await
+                .map_err(|e| io_error("Failed to stat", &raw_file, e))?;
+            if raw_present {
+                return Ok(SaveOutcome::AlreadyExisted);
+            }
+            warn!(
+                "Session {} has a row but no raw file; restoring it from the supplied data",
+                summary.id
+            );
+            write_durable(&raw_file, raw_data).await?;
+            self.update_session_summary(summary).await?;
+            return Ok(SaveOutcome::RepairedRaw);
+        }
+
+        match tokio::fs::read(&raw_file).await {
+            Ok(existing) if existing == raw_data => {}
+            Ok(_) => {
+                let ms = chrono::Utc::now().timestamp_millis();
+                let orphan = self
+                    .sessions_dir()
+                    .join(format!("{}.bin.orphan-{}", summary.id, ms));
+                warn!(
+                    "Raw file for unsaved session {} differs from the data being saved; \
+                     keeping it as {}",
+                    summary.id,
+                    orphan.display()
+                );
+                tokio::fs::rename(&raw_file, &orphan)
+                    .await
+                    .map_err(|e| io_error("Failed to move aside", &raw_file, e))?;
+                write_durable(&raw_file, raw_data).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                write_durable(&raw_file, raw_data).await?;
+            }
+            Err(e) => return Err(io_error("Failed to read", &raw_file, e)),
+        }
+
         let raw_file_path = raw_file.to_string_lossy().to_string();
-        let start_time = summary.start_time.to_rfc3339();
-        let duration_secs = summary.duration_secs as i64;
-        let avg_power = summary.avg_power.map(|v| v as i32);
-        let max_power = summary.max_power.map(|v| v as i32);
-        let np = summary.normalized_power.map(|v| v as i32);
-        let avg_hr = summary.avg_hr.map(|v| v as i32);
-        let max_hr = summary.max_hr.map(|v| v as i32);
-        // INSERT first — a row without a file is visible in history;
-        // a file without a row is invisible (data loss on crash).
-        let ftp = summary.ftp.map(|v| v as i32);
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT OR IGNORE INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
              normalized_power, tss, intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, \
              work_kj, variability_index, distance_km, \
@@ -161,16 +232,16 @@ impl Storage {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&summary.id)
-        .bind(&start_time)
-        .bind(duration_secs)
-        .bind(ftp)
-        .bind(avg_power)
-        .bind(max_power)
-        .bind(np)
+        .bind(summary.start_time.to_rfc3339())
+        .bind(summary.duration_secs as i64)
+        .bind(summary.ftp.map(|v| v as i32))
+        .bind(summary.avg_power.map(|v| v as i32))
+        .bind(summary.max_power.map(|v| v as i32))
+        .bind(summary.normalized_power.map(|v| v as i32))
         .bind(summary.tss)
         .bind(summary.intensity_factor)
-        .bind(avg_hr)
-        .bind(max_hr)
+        .bind(summary.avg_hr.map(|v| v as i32))
+        .bind(summary.max_hr.map(|v| v as i32))
         .bind(summary.avg_cadence)
         .bind(summary.avg_speed)
         .bind(summary.work_kj.map(|v| v as f64))
@@ -184,13 +255,41 @@ impl Storage {
         .execute(&self.pool)
         .await
         .map_err(AppError::Database)?;
-        // Write raw data file after DB row exists
-        tokio::fs::create_dir_all(raw_file.parent().unwrap())
-            .await
-            .map_err(|e| AppError::Database(sqlx::Error::Io(e)))?;
-        tokio::fs::write(&raw_file, raw_data)
-            .await
-            .map_err(|e| AppError::Database(sqlx::Error::Io(e)))?;
+        Ok(if result.rows_affected() == 1 {
+            SaveOutcome::Inserted
+        } else {
+            SaveOutcome::AlreadyExisted
+        })
+    }
+
+    /// Overwrite a row's computed metrics (not user metadata) from `summary`.
+    async fn update_session_summary(&self, summary: &SessionSummary) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE sessions SET start_time = ?, duration_secs = ?, ftp = ?, avg_power = ?, \
+             max_power = ?, normalized_power = ?, tss = ?, intensity_factor = ?, avg_hr = ?, \
+             max_hr = ?, avg_cadence = ?, avg_speed = ?, work_kj = ?, variability_index = ?, \
+             distance_km = ?, raw_file_path = ? WHERE id = ?",
+        )
+        .bind(summary.start_time.to_rfc3339())
+        .bind(summary.duration_secs as i64)
+        .bind(summary.ftp.map(|v| v as i32))
+        .bind(summary.avg_power.map(|v| v as i32))
+        .bind(summary.max_power.map(|v| v as i32))
+        .bind(summary.normalized_power.map(|v| v as i32))
+        .bind(summary.tss)
+        .bind(summary.intensity_factor)
+        .bind(summary.avg_hr.map(|v| v as i32))
+        .bind(summary.max_hr.map(|v| v as i32))
+        .bind(summary.avg_cadence)
+        .bind(summary.avg_speed)
+        .bind(summary.work_kj.map(|v| v as f64))
+        .bind(summary.variability_index.map(|v| v as f64))
+        .bind(summary.distance_km.map(|v| v as f64))
+        .bind(self.raw_path(&summary.id).to_string_lossy().to_string())
+        .bind(&summary.id)
+        .execute(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
         Ok(())
     }
 
@@ -273,28 +372,36 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete a session. Order matters (see design ADR-3):
+    /// 1. remove any leftover autosave for the id — if that fails, abort with
+    ///    nothing changed, otherwise a later recovery could resurrect the ride;
+    /// 2. delete power-curve rows and the session row in ONE transaction;
+    /// 3. remove the raw file — failure here only leaves an invisible orphan file,
+    ///    so it is logged and the delete still succeeds.
     pub async fn delete_session(&self, session_id: &str) -> Result<(), AppError> {
         info!("Deleting session: {}", session_id);
-        // Delete file first, then DB rows. A row without a file is visible in
-        // history (gracefully handleable). A file without a row is an orphan
-        // that wastes disk space silently forever.
-        let path = Path::new(&self.data_dir)
-            .join("sessions")
-            .join(format!("{}.bin", session_id));
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| AppError::Session(format!("Failed to delete session file: {}", e)))?;
-        }
+        self.remove_autosave(session_id).await?;
+
+        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
         sqlx::query("DELETE FROM session_power_curves WHERE session_id = ?")
             .bind(session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
         sqlx::query("DELETE FROM sessions WHERE id = ?")
             .bind(session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::Database)?;
+
+        let path = self.raw_path(session_id);
+        if let Err(e) = remove_durable(&path).await {
+            error!(
+                "Session {} deleted from the database but its raw file remains: {}",
+                session_id, e
+            );
+        }
         Ok(())
     }
 

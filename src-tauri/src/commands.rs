@@ -122,10 +122,9 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSu
             "Session stopped: id={}, duration={}s",
             summary.id, summary.duration_secs
         );
-        let raw_data = bincode::serialize(sensor_log)
-            .map_err(|e| AppError::Serialization(e.to_string()))?;
-        state.storage.save_session(summary, &raw_data).await?;
-        state.storage.remove_autosave(&summary.id);
+        // Never drops data: on failure the full log stays on disk as an autosave
+        // and the error tells the user it will be recovered on next launch.
+        state.storage.finalize_session(summary, sensor_log).await?;
 
         // Save power curve in background
         let storage = state.storage.clone();
