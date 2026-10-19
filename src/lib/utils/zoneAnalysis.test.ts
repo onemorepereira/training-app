@@ -74,29 +74,42 @@ describe('computeTimeInZone', () => {
 });
 
 describe('computeTimeToZone', () => {
+  // Points carry elapsed_secs (1 Hz, may skip seconds); value is the zone channel.
+  const at = (values: (number | null)[]) =>
+    values.map((v, i) => ({ elapsed_secs: i, value: v }));
+
   it('returns seconds until first in-zone reading', () => {
     // First 3 out of zone, then in zone
-    const ts = [50, 60, 70, 150, 160].map((v) => ({ value: v }));
-    expect(computeTimeToZone(ts, 100, 200, 1)).toBe(3);
+    expect(computeTimeToZone(at([50, 60, 70, 150, 160]), 100, 200)).toBe(3);
   });
 
   it('returns 0 when first reading is in zone', () => {
-    const ts = [150, 160, 170].map((v) => ({ value: v }));
-    expect(computeTimeToZone(ts, 100, 200, 1)).toBe(0);
+    expect(computeTimeToZone(at([150, 160, 170]), 100, 200)).toBe(0);
   });
 
   it('returns null when never reaching zone', () => {
-    const ts = [50, 60, 70].map((v) => ({ value: v }));
-    expect(computeTimeToZone(ts, 100, 200, 1)).toBeNull();
-  });
-
-  it('respects intervalSecs', () => {
-    const ts = [50, 60, 150].map((v) => ({ value: v }));
-    expect(computeTimeToZone(ts, 100, 200, 5)).toBe(10);
+    expect(computeTimeToZone(at([50, 60, 70]), 100, 200)).toBeNull();
   });
 
   it('skips null values (does not count as in-zone)', () => {
-    const ts = [{ value: null }, { value: null }, { value: 150 }];
-    expect(computeTimeToZone(ts, 100, 200, 1)).toBe(2);
+    expect(computeTimeToZone(at([null, null, 150]), 100, 200)).toBe(2);
+  });
+
+  it('uses elapsed_secs when a second is missing from the series', () => {
+    // Second 2 absent (no data): in-zone point is at elapsed 3, array index 2
+    const ts = [
+      { elapsed_secs: 0, value: 50 },
+      { elapsed_secs: 1, value: 60 },
+      { elapsed_secs: 3, value: 150 },
+    ];
+    expect(computeTimeToZone(ts, 100, 200)).toBe(3);
+  });
+
+  it('measures from the first point when the series starts after 0', () => {
+    const ts = [
+      { elapsed_secs: 10, value: 50 },
+      { elapsed_secs: 25, value: 150 },
+    ];
+    expect(computeTimeToZone(ts, 100, 200)).toBe(15);
   });
 });
