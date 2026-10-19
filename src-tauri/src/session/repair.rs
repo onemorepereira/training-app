@@ -130,11 +130,25 @@ pub async fn run_metrics_repair(storage: Arc<Storage>) -> Result<RepairReport, A
     let mut report = RepairReport::default();
     let mut failed_ids: Vec<String> = Vec::new();
     for session in &sessions {
-        let loader = storage.clone();
+        // Load + recompute is CPU/IO-bound: run it on the blocking pool, one
+        // session at a time, so the async runtime stays responsive at startup.
+        let worker = storage.clone();
         let sid = session.id.clone();
-        let readings = match tokio::task::spawn_blocking(move || loader.load_sensor_data(&sid)).await {
-            Ok(Ok(r)) if !r.is_empty() => r,
-            Ok(Ok(_)) => {
+        let (ftp, update_if_and_tss) = effective_ftp(session);
+        let duration_secs = session.duration_secs;
+        let computed = tokio::task::spawn_blocking(move || {
+            let readings = worker.load_sensor_data(&sid)?;
+            if readings.is_empty() {
+                return Ok(None);
+            }
+            let m = metrics::summarize_readings(&readings, ftp, duration_secs);
+            let curve = analysis::compute_power_curve_from_readings(&readings);
+            Ok::<_, AppError>(Some((m, curve)))
+        })
+        .await;
+        let (m, curve) = match computed {
+            Ok(Ok(Some(v))) => v,
+            Ok(Ok(None)) => {
                 report.skipped += 1;
                 continue;
             }
@@ -144,16 +158,13 @@ pub async fn run_metrics_repair(storage: Arc<Storage>) -> Result<RepairReport, A
                 continue;
             }
             Err(e) => {
-                warn!("Metrics repair: loading session {} panicked: {}", session.id, e);
+                warn!("Metrics repair: recomputing session {} panicked: {}", session.id, e);
                 report.failed += 1;
                 failed_ids.push(session.id.clone());
                 continue;
             }
         };
 
-        let (ftp, update_if_and_tss) = effective_ftp(session);
-        let m = metrics::summarize_readings(&readings, ftp, session.duration_secs);
-        let curve = analysis::compute_power_curve_from_readings(&readings);
         match storage
             .replace_session_metrics(&session.id, &m, update_if_and_tss, &curve)
             .await
