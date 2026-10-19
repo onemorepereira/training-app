@@ -298,7 +298,8 @@ impl RealIo {
 
         let trainer = if info.device_type == DeviceType::FitnessTrainer {
             match TrainerController::new(peripheral.clone()) {
-                Ok(c) => {
+                Ok(mut c) => {
+                    c.read_resistance_range().await;
                     info!("[{}] FTMS trainer controller created", device_id);
                     Some(TrainerBackend::Ftms(c))
                 }
