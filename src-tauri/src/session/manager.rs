@@ -13,6 +13,20 @@ use crate::config;
 
 pub struct SessionManager {
     current_session: Arc<Mutex<Option<ActiveSession>>>,
+    /// Serializes autosave writes with stop. Lock order: `autosave_gate` before
+    /// `current_session`, always. Holding it across snapshot + file write means
+    /// no autosave can be written for a session after stop has taken it, so stop
+    /// can never be followed by a stale autosave reappearing on disk.
+    autosave_gate: Mutex<()>,
+}
+
+/// A snapshot of the active session for autosave. While it is alive, stop is
+/// blocked; drop it only after the autosave file has been written.
+pub struct AutosaveTicket<'a> {
+    pub gate: tokio::sync::MutexGuard<'a, ()>,
+    pub session_id: String,
+    pub summary: SessionSummary,
+    pub delta: Vec<SensorReading>,
 }
 
 /// Maximum gap between readings before we stop counting elapsed time.
@@ -42,6 +56,7 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             current_session: Arc::new(Mutex::new(None)),
+            autosave_gate: Mutex::new(()),
         }
     }
 
@@ -79,6 +94,8 @@ impl SessionManager {
     pub async fn stop_session_with_log(
         &self,
     ) -> Option<(SessionSummary, Vec<SensorReading>)> {
+        // Wait for any in-flight autosave write to finish (see `autosave_gate`).
+        let _gate = self.autosave_gate.lock().await;
         let mut lock = self.current_session.lock().await;
         let session = lock.take()?;
         info!("Session stopped: {}", session.id);
@@ -230,6 +247,19 @@ impl SessionManager {
         let delta = session.sensor_log[session.autosave_cursor..].to_vec();
         session.autosave_cursor = session.sensor_log.len();
         Some((session.id.clone(), summary, delta))
+    }
+
+    /// Take the autosave gate and snapshot the active session. None if no
+    /// session is active (e.g. stop already ran) — then nothing must be written.
+    pub async fn autosave_ticket(&self) -> Option<AutosaveTicket<'_>> {
+        let gate = self.autosave_gate.lock().await;
+        let (session_id, summary, delta) = self.snapshot_for_autosave().await?;
+        Some(AutosaveTicket {
+            gate,
+            session_id,
+            summary,
+            delta,
+        })
     }
 
     #[allow(dead_code)]
