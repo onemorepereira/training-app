@@ -142,6 +142,14 @@ pub trait DeviceIo: Send + Sync + 'static {
     fn disconnect(&self, device_id: &str) -> impl Future<Output = Result<(), AppError>> + Send;
     /// Report link state for the given ids.
     fn probe(&self, ids: Vec<String>) -> impl Future<Output = Vec<(String, LinkState)>> + Send;
+    /// ANT+: wait (async, polling the shared last-seen handle, never the AntSlot)
+    /// for a page newer than the moment of the call. False on timeout or cancel.
+    fn await_data(
+        &self,
+        device_id: &str,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> impl Future<Output = bool> + Send;
     /// BLE GATT details for a connected device.
     fn ble_details(&self, device_id: &str) -> impl Future<Output = Result<DeviceDetails, AppError>> + Send;
     /// Snapshot of ANT+ common-page metadata.
@@ -332,7 +340,7 @@ impl RealIo {
                 if cancel_flag.load(Ordering::SeqCst) {
                     return Err(AppError::Cancelled);
                 }
-                let info = ant.connect(&id, ctx.tx, Some(ctx.primaries))?;
+                let info = ant.connect(&id, ctx.tx, Some(ctx.primaries), &cancel_flag)?;
                 let fec = if info.device_type == DeviceType::FitnessTrainer {
                     ant.get_fec_channel(&id)
                 } else {
@@ -472,6 +480,28 @@ impl DeviceIo for RealIo {
         out
     }
 
+    async fn await_data(&self, device_id: &str, timeout: Duration, cancel: &CancelToken) -> bool {
+        let link = self.links.lock().unwrap_or_else(|e| e.into_inner()).get(device_id).cloned();
+        let Some(link) = link else {
+            return false;
+        };
+        let start = link.last_seen.load(Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if link.last_seen.load(Ordering::SeqCst) != start {
+                return true;
+            }
+            if link.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = cancel.cancelled() => return false,
+            }
+        }
+        false
+    }
+
     async fn ble_details(&self, device_id: &str) -> Result<DeviceDetails, AppError> {
         match self.ble.get() {
             Some(ble) => ble.get_device_details(device_id).await,
@@ -528,6 +558,8 @@ pub mod fake {
         pub links: StdMutex<HashMap<String, LinkState>>,
         /// Number of listener tasks currently alive.
         pub listeners_alive: Arc<AtomicUsize>,
+        /// await_data: delay after which data "arrives" for an id (absent = never).
+        pub data_after: StdMutex<HashMap<String, Duration>>,
         pub trainer_commands: Arc<AtomicUsize>,
     }
 
@@ -557,9 +589,9 @@ pub mod fake {
     }
 
     pub fn device_type_for(id: &str) -> DeviceType {
-        if id.contains("trainer") {
+        if id.contains("trainer") || id.starts_with("ant:17:") {
             DeviceType::FitnessTrainer
-        } else if id.contains("hr") {
+        } else if id.contains("hr") || id.starts_with("ant:120:") {
             DeviceType::HeartRate
         } else if id.contains("pm") {
             DeviceType::Power
@@ -643,6 +675,22 @@ pub mod fake {
                     (id, s)
                 })
                 .collect()
+        }
+
+        async fn await_data(&self, device_id: &str, timeout: Duration, cancel: &CancelToken) -> bool {
+            let after = self.data_after.lock().unwrap().get(device_id).copied();
+            let wait = after.unwrap_or(timeout).min(timeout);
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = cancel.cancelled() => return false,
+            }
+            match after {
+                Some(a) if a <= timeout => {
+                    self.links.lock().unwrap().insert(device_id.to_string(), LinkState::Alive);
+                    true
+                }
+                _ => false,
+            }
         }
 
         async fn ble_details(&self, device_id: &str) -> Result<DeviceDetails, AppError> {

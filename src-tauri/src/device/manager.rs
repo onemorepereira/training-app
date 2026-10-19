@@ -11,7 +11,9 @@
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::time::Instant;
 use tokio::task::JoinHandle;
 
 use super::dedup::compute_device_groups;
@@ -26,6 +28,12 @@ use crate::session::storage::Storage;
 /// Maximum concurrently running auto-reconnect attempts.
 const RECONNECT_CONCURRENCY: usize = 2;
 
+/// An ANT+ device silent this long in background search is given up (ADR-2c).
+const ANT_GIVE_UP: Duration = Duration::from_secs(600);
+
+/// How long a manual connect to a Reconnecting ANT+ device waits for data (ADR-2b).
+const ANT_REJOIN_WAIT: Duration = Duration::from_secs(5);
+
 /// Shared handle used by commands and background tasks.
 pub type SharedDeviceManager<Io = RealIo> = Arc<Mutex<DeviceManager<Io>>>;
 
@@ -34,6 +42,8 @@ pub type SharedDeviceManager<Io = RealIo> = Arc<Mutex<DeviceManager<Io>>>;
 enum Phase {
     /// Delivering data.
     Connected,
+    /// ANT+: no data, channel still open in background search (ADR-2).
+    Stale { since: Instant, ticks: u32 },
     /// Link lost; transport teardown not yet performed. The gate holder runs it (NB1).
     LostPendingTeardown { give_up: bool },
     /// Transport torn down; waiting for auto-reconnect.
@@ -67,6 +77,8 @@ pub enum ConnectOutcome {
     Connected(DeviceInfo),
     /// Already connected: no-op success.
     AlreadyConnected(DeviceInfo),
+    /// ANT+ device still in background search after a manual connect (not an error).
+    StillReconnecting(DeviceInfo),
     /// Auto-reconnect skipped (device busy or no longer a target).
     Skipped,
 }
@@ -256,7 +268,9 @@ impl<Io: DeviceIo> DeviceManager<Io> {
         tx: broadcast::Sender<SensorReading>,
     ) -> Result<DeviceInfo, AppError> {
         match Self::connect_with_origin(dm, device_id, tx, ConnectOrigin::Manual).await? {
-            ConnectOutcome::Connected(i) | ConnectOutcome::AlreadyConnected(i) => Ok(i),
+            ConnectOutcome::Connected(i)
+            | ConnectOutcome::AlreadyConnected(i)
+            | ConnectOutcome::StillReconnecting(i) => Ok(i),
             ConnectOutcome::Skipped => Err(AppError::Cancelled),
         }
     }
@@ -295,7 +309,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
         Self::run_pending_teardown(dm, device_id).await;
 
         // Phase 3 (lock): re-check, then register the in-flight token (NB2: post-gate).
-        let token = {
+        let (token, stale) = {
             let mut g = dm.lock().await;
             if g.disconnect_epoch.get(device_id).copied().unwrap_or(0) != epoch {
                 // A disconnect was requested after this connect started.
@@ -312,10 +326,42 @@ impl<Io: DeviceIo> DeviceManager<Io> {
                 }
                 g.reconnect.record_attempt(device_id);
             }
+            let stale = g
+                .records
+                .get(device_id)
+                .is_some_and(|r| matches!(r.phase, Phase::Stale { .. }));
             let token = CancelToken::new();
             g.in_flight.insert(device_id.to_string(), token.clone());
-            token
+            (token, stale)
         };
+
+        // ADR-2b: the channel is still open and searching. Never open a second one;
+        // wait briefly for the device to show up on it.
+        if stale {
+            let got_data = io.await_data(device_id, ANT_REJOIN_WAIT, &token).await;
+            let mut g = dm.lock().await;
+            if g.in_flight.get(device_id).is_some_and(|t| t.same_as(&token)) {
+                g.in_flight.remove(device_id);
+            }
+            if token.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            let Some(rec) = g.records.get_mut(device_id) else {
+                return Err(AppError::Cancelled);
+            };
+            if got_data && matches!(rec.phase, Phase::Stale { .. }) {
+                rec.set_phase(Phase::Connected);
+                let info = rec.info.clone();
+                g.auto_set_primary(info.device_type, device_id);
+                g.pending_report
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reconnected
+                    .push(device_id.to_string());
+                return Ok(ConnectOutcome::Connected(info));
+            }
+            return Ok(ConnectOutcome::StillReconnecting(rec.info.clone()));
+        }
 
         // Phase 4: transport I/O without the DM lock.
         let ctx = ListenerCtx { tx, primaries };
@@ -503,7 +549,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
             let ids: Vec<String> = g
                 .records
                 .iter()
-                .filter(|(_, r)| r.phase == Phase::Connected)
+                .filter(|(_, r)| matches!(r.phase, Phase::Connected | Phase::Stale { .. }))
                 .map(|(id, _)| id.clone())
                 .collect();
             (g.io.clone(), ids)
@@ -513,23 +559,52 @@ impl<Io: DeviceIo> DeviceManager<Io> {
         let mut report = WatchdogReport::default();
         let (teardowns, due) = {
             let mut g = dm.lock().await;
+            let now = Instant::now();
             let mut teardowns = Vec::new();
             for (id, state) in states {
-                if state == LinkState::Alive {
-                    continue;
-                }
                 let Some(rec) = g.records.get_mut(&id) else { continue };
-                if rec.phase != Phase::Connected {
-                    continue;
+                match (rec.phase, state) {
+                    (Phase::Connected, LinkState::Alive) => {}
+                    (Phase::Connected, LinkState::Stale) => {
+                        // ADR-2: keep the channel searching; only the status changes.
+                        warn!("[{}] Connection watchdog: no ANT+ data, searching", id);
+                        rec.set_phase(Phase::Stale { since: now, ticks: 0 });
+                        g.remove_primary(&id);
+                        report.disconnected.push(id);
+                    }
+                    (Phase::Stale { .. }, LinkState::Alive) => {
+                        info!("[{}] ANT+ data resumed on the same channel", id);
+                        rec.set_phase(Phase::Connected);
+                        let device_type = rec.info.device_type;
+                        g.auto_set_primary(device_type, &id);
+                        report.reconnected.push(id);
+                    }
+                    (Phase::Stale { since, ticks }, LinkState::Stale) => {
+                        if now.duration_since(since) >= ANT_GIVE_UP {
+                            warn!("[{}] ANT+ device silent for {:?}; giving up", id, ANT_GIVE_UP);
+                            rec.set_phase(Phase::LostPendingTeardown { give_up: true });
+                            g.trainer_backends.remove(&id);
+                            report.disconnected.push(id.clone());
+                            teardowns.push(id);
+                        } else {
+                            rec.set_phase(Phase::Stale { since, ticks: ticks + 1 });
+                            report.reconnecting.push((rec.info.clone(), ticks + 1));
+                        }
+                    }
+                    (Phase::Connected | Phase::Stale { .. }, LinkState::Lost) => {
+                        warn!("[{}] Connection watchdog: {:?} link lost", id, rec.info.device_type);
+                        rec.set_phase(Phase::LostPendingTeardown { give_up: false });
+                        let info = rec.info.clone();
+                        g.remove_primary(&id);
+                        g.trainer_backends.remove(&id);
+                        g.reconnect.register(info);
+                        if !report.disconnected.contains(&id) {
+                            report.disconnected.push(id.clone());
+                        }
+                        teardowns.push(id);
+                    }
+                    _ => {}
                 }
-                warn!("[{}] Connection watchdog: {:?} link {:?}", id, rec.info.device_type, state);
-                rec.set_phase(Phase::LostPendingTeardown { give_up: false });
-                let info = rec.info.clone();
-                g.remove_primary(&id);
-                g.trainer_backends.remove(&id);
-                g.reconnect.register(info);
-                report.disconnected.push(id.clone());
-                teardowns.push(id);
             }
             let due: Vec<DeviceInfo> = g
                 .reconnect
@@ -1359,5 +1434,176 @@ mod lifecycle_tests {
         let g = dm.lock().await;
         assert!(!g.records.contains_key("ble-hr"), "user took over; failed connect leaves it Disconnected");
         assert!(!g.reconnect.contains("ble-hr"));
+    }
+}
+
+#[cfg(test)]
+mod ant_lifecycle_tests {
+    //! ANT+ persistent-channel lifecycle (design ADR-2, 2a-2c) against FakeIo.
+    use super::*;
+    use crate::device::io::fake::{FakeIo, IoEvent};
+    use std::sync::atomic::Ordering;
+
+    type Dm = SharedDeviceManager<FakeIo>;
+    const ID: &str = "ant:120:4242";
+
+    fn dm() -> Dm {
+        Arc::new(Mutex::new(DeviceManager::with_io(FakeIo::default())))
+    }
+
+    fn tx() -> broadcast::Sender<SensorReading> {
+        broadcast::channel(16).0
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn connected(dm: &Dm) -> Arc<FakeIo> {
+        DeviceManager::connect_shared(dm, ID, tx()).await.unwrap();
+        dm.lock().await.io()
+    }
+
+    async fn phase(dm: &Dm) -> Option<Phase> {
+        dm.lock().await.records.get(ID).map(|r| r.phase)
+    }
+
+    fn count(io: &FakeIo, e: IoEvent) -> usize {
+        io.events().iter().filter(|x| **x == e).count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stale_ant_marked_reconnecting_not_connected() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        let report = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        assert_eq!(report.disconnected, vec![ID.to_string()]);
+        let g = dm.lock().await;
+        assert_eq!(g.records[ID].info.status, ConnectionStatus::Reconnecting);
+        assert!(g.connected_trainer_id().is_none());
+        assert!(!g.reconnect.contains(ID), "a searching channel needs no reconnect");
+        assert!(!g.primaries_handle().read().unwrap().values().any(|v| v == ID), "claims released");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stale_ant_reports_reconnecting_each_tick() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        let r2 = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        let r3 = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        assert!(r2.disconnected.is_empty(), "device_disconnected only once");
+        assert_eq!(r2.reconnecting.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(r3.reconnecting.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stale_ant_recovers_without_new_channel() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        io.set_link(ID, LinkState::Alive);
+        let report = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        settle().await;
+        assert_eq!(report.reconnected, vec![ID.to_string()]);
+        assert_eq!(phase(&dm).await, Some(Phase::Connected));
+        assert_eq!(count(&io, IoEvent::Connect(ID.into())), 1, "no second channel");
+        assert_eq!(count(&io, IoEvent::Disconnect(ID.into())), 0);
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1, "single listener, no duplicates");
+        assert_eq!(dm.lock().await.primaries_handle().read().unwrap().get(&DeviceType::HeartRate).map(String::as_str), Some(ID));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_lost_ant_tears_down_before_reconnect() {
+        let dm = dm();
+        let tx = tx();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Lost); // channel closed by the radio
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(crate::config::RECONNECT_INITIAL_BACKOFF_MS + 1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        assert_eq!(
+            io.events(),
+            vec![IoEvent::Connect(ID.into()), IoEvent::Disconnect(ID.into()), IoEvent::Connect(ID.into())],
+        );
+        assert_eq!(phase(&dm).await, Some(Phase::Connected));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ant_reconnect_yields_single_listener() {
+        let dm = dm();
+        let tx = tx();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Lost);
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(crate::config::RECONNECT_INITIAL_BACKOFF_MS + 1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_connect_reconnecting_ant_reuses_channel_and_connects_on_data() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        io.data_after.lock().unwrap().insert(ID.into(), Duration::from_secs(2));
+        let info = DeviceManager::connect_shared(&dm, ID, tx()).await.unwrap();
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert_eq!(count(&io, IoEvent::Connect(ID.into())), 1, "existing channel reused");
+        assert_eq!(phase(&dm).await, Some(Phase::Connected));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_connect_reconnecting_ant_without_data_returns_ok_reconnecting() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        let start = Instant::now();
+        let info = DeviceManager::connect_shared(&dm, ID, tx()).await.unwrap();
+        assert_eq!(info.status, ConnectionStatus::Reconnecting, "never reported Connected without data");
+        assert!(start.elapsed() >= ANT_REJOIN_WAIT);
+        assert_eq!(count(&io, IoEvent::Connect(ID.into())), 1);
+        assert!(matches!(phase(&dm).await, Some(Phase::Stale { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ant_stale_ten_minutes_gives_up_to_disconnected() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        tokio::time::advance(ANT_GIVE_UP - Duration::from_secs(1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        assert!(matches!(phase(&dm).await, Some(Phase::Stale { .. })), "not yet");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let report = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        settle().await;
+        assert_eq!(report.disconnected, vec![ID.to_string()], "device_disconnected re-emitted");
+        assert_eq!(phase(&dm).await, None, "shown as Disconnected (known device only)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ant_give_up_frees_channel_and_registers_no_reconnect() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        tokio::time::advance(ANT_GIVE_UP + Duration::from_secs(1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        settle().await;
+        assert_eq!(count(&io, IoEvent::Disconnect(ID.into())), 1, "channel freed");
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 0);
+        assert!(!dm.lock().await.reconnect.contains(ID));
     }
 }

@@ -54,6 +54,43 @@ pub const PROFILE_FEC: AntProfile = AntProfile {
 pub const ALL_SCAN_PROFILES: &[AntProfile] =
     &[PROFILE_HR, PROFILE_POWER, PROFILE_CADENCE, PROFILE_SPEED, PROFILE_FEC];
 
+/// Something that can transmit ANT messages (the USB stick, or a test recorder).
+pub trait AntTx {
+    fn send(&self, msg: &AntMessage) -> Result<(), AppError>;
+}
+
+impl AntTx for AntUsb {
+    fn send(&self, msg: &AntMessage) -> Result<(), AppError> {
+        AntUsb::send(self, msg)
+    }
+}
+
+/// Search timeouts in 2.5 s units (D00000652 Rev 5.1 §9.5.2.5 high priority,
+/// §9.5.2.15 low priority; 0 = disabled, 0xFF = infinite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchConfig {
+    pub high_priority: u8,
+    /// `None` leaves the chip default (2 = 5 s).
+    pub low_priority: Option<u8>,
+}
+
+/// When false, connection channels use HP = 0 from the start (design ADR-2).
+pub const ANT_FAST_ACQUIRE: bool = false;
+
+/// Connection channels: never time out and never run high-priority search, which
+/// would interrupt other open channels (§9.5.2.15). A lost device is re-acquired by
+/// the background low-priority search on the same channel.
+pub const CONNECTION_SEARCH: SearchConfig = SearchConfig {
+    high_priority: if ANT_FAST_ACQUIRE { 2 } else { 0 },
+    low_priority: Some(0xFF),
+};
+
+/// Scan (wildcard) channels: short finite search; the scan window is 4 s.
+pub const SCAN_SEARCH: SearchConfig = SearchConfig { high_priority: 2, low_priority: None };
+
+/// How long a connect waits for the first data page before giving up.
+pub const ANT_FIRST_PAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Represents a configured ANT channel
 #[derive(Debug)]
 pub struct AntChannelConfig {
@@ -98,8 +135,9 @@ pub fn init_ant_stick(usb: &AntUsb) -> Result<(), AppError> {
 /// If the channel is in a bad state (e.g. leftover from a previous scan),
 /// automatically closes+unassigns and retries.
 pub fn open_channel(
-    usb: &AntUsb,
+    usb: &dyn AntTx,
     config: &AntChannelConfig,
+    search: SearchConfig,
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
 ) -> Result<(), AppError> {
     let ch = config.channel_number;
@@ -175,12 +213,21 @@ pub fn open_channel(
     })?;
     poll_response(response_queue, ch, MSG_SET_CHANNEL_FREQUENCY)?;
 
-    // Set search timeout (30 seconds = 30 * 2.5s units = 12)
+    // High-priority search timeout (2.5 s units)
     usb.send(&AntMessage {
         msg_id: MSG_SET_CHANNEL_SEARCH_TIMEOUT,
-        data: vec![ch, 12],
+        data: vec![ch, search.high_priority],
     })?;
     poll_response(response_queue, ch, MSG_SET_CHANNEL_SEARCH_TIMEOUT)?;
+
+    // Low-priority search timeout (2.5 s units, 0xFF = infinite)
+    if let Some(lp) = search.low_priority {
+        usb.send(&AntMessage {
+            msg_id: MSG_SET_LP_SEARCH_TIMEOUT,
+            data: vec![ch, lp],
+        })?;
+        poll_response(response_queue, ch, MSG_SET_LP_SEARCH_TIMEOUT)?;
+    }
 
     // Open channel
     usb.send(&AntMessage {
@@ -195,7 +242,7 @@ pub fn open_channel(
 /// Close and unassign a channel.
 /// Uses the response_queue (router must be running).
 pub fn close_channel(
-    usb: &AntUsb,
+    usb: &dyn AntTx,
     channel_number: u8,
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
 ) -> Result<(), AppError> {
@@ -229,6 +276,46 @@ pub fn close_channel(
     poll_response(response_queue, channel_number, MSG_UNASSIGN_CHANNEL)?;
 
     Ok(())
+}
+
+/// Wait for the first data page on a freshly opened channel.
+/// Returns `None` on timeout or cancellation (checked at least every 50 ms).
+pub fn wait_first_page(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    timeout: Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let slice = (deadline - now).min(Duration::from_millis(50));
+        match rx.recv_timeout(slice) {
+            Ok(page) if page.len() >= 8 => return Some(page),
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+/// If `msg` is a channel event meaning the radio closed the channel by itself
+/// (search timeout or channel closed, §9.5.6.1), return the channel number.
+pub fn closed_channel_event(msg: &AntMessage) -> Option<u8> {
+    if msg.msg_id == MSG_CHANNEL_RESPONSE
+        && msg.data.len() >= 3
+        && msg.data[1] == CHANNEL_EVENT
+        && (msg.data[2] == EVENT_RX_SEARCH_TIMEOUT || msg.data[2] == EVENT_CHANNEL_CLOSED)
+    {
+        Some(msg.data[0])
+    } else {
+        None
+    }
 }
 
 /// Send an acknowledged data message on a channel (used for FE-C control)
@@ -309,4 +396,120 @@ fn wait_for_response_direct(usb: &AntUsb, expected_msg_id: u8) -> Result<(), App
         "Timeout waiting for response to {:#x}",
         expected_msg_id
     )).into())
+}
+
+#[cfg(test)]
+pub mod test_stick {
+    //! Records sent messages and answers like a stick (RESPONSE_NO_ERROR for every
+    //! configuration command, EVENT_CHANNEL_CLOSED after a close).
+    use super::*;
+
+    pub struct RecordingStick {
+        pub sent: Mutex<Vec<AntMessage>>,
+        pub queue: Arc<Mutex<Vec<AntMessage>>>,
+    }
+
+    impl RecordingStick {
+        pub fn new() -> Self {
+            Self { sent: Mutex::new(Vec::new()), queue: Arc::new(Mutex::new(Vec::new())) }
+        }
+        pub fn sent(&self) -> Vec<(u8, Vec<u8>)> {
+            self.sent.lock().unwrap().iter().map(|m| (m.msg_id, m.data.clone())).collect()
+        }
+    }
+
+    impl AntTx for RecordingStick {
+        fn send(&self, msg: &AntMessage) -> Result<(), AppError> {
+            self.sent.lock().unwrap().push(msg.clone());
+            let ch = msg.data.first().copied().unwrap_or(0);
+            let mut q = self.queue.lock().unwrap();
+            if msg.msg_id == MSG_CLOSE_CHANNEL {
+                q.push(AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![ch, MSG_CLOSE_CHANNEL, 0] });
+                q.push(AntMessage {
+                    msg_id: MSG_CHANNEL_RESPONSE,
+                    data: vec![ch, CHANNEL_EVENT, EVENT_CHANNEL_CLOSED],
+                });
+            } else if msg.msg_id != MSG_ACKNOWLEDGED_DATA && msg.msg_id != MSG_REQUEST_MESSAGE {
+                q.push(AntMessage {
+                    msg_id: MSG_CHANNEL_RESPONSE,
+                    data: vec![ch, msg.msg_id, RESPONSE_NO_ERROR],
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_stick::RecordingStick;
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn hr_config(ch: u8) -> AntChannelConfig {
+        AntChannelConfig {
+            channel_number: ch,
+            profile: PROFILE_HR,
+            device_number: 0x1234,
+            transmission_type: 1,
+        }
+    }
+
+    #[test]
+    fn ant_connection_channel_search_config_bytes() {
+        let stick = RecordingStick::new();
+        open_channel(&stick, &hr_config(3), CONNECTION_SEARCH, &stick.queue).unwrap();
+        let sent = stick.sent();
+        // D00000652 §9.5.2.5: HP timeout 0 = HP search disabled;
+        // §9.5.2.15: LP timeout 0xFF = infinite background search
+        assert!(sent.contains(&(MSG_SET_CHANNEL_SEARCH_TIMEOUT, vec![3, 0])), "{:?}", sent);
+        assert!(sent.contains(&(MSG_SET_LP_SEARCH_TIMEOUT, vec![3, 0xFF])), "{:?}", sent);
+        // Channel ID: device 0x1234 LE, HR device type 120, transmission type 1
+        assert!(sent.contains(&(MSG_SET_CHANNEL_ID, vec![3, 0x34, 0x12, 120, 1])));
+        assert_eq!(sent.last(), Some(&(MSG_OPEN_CHANNEL, vec![3])));
+    }
+
+    #[test]
+    fn scan_channel_uses_finite_search_and_chip_default_lp() {
+        let stick = RecordingStick::new();
+        open_channel(&stick, &hr_config(0), SCAN_SEARCH, &stick.queue).unwrap();
+        let sent = stick.sent();
+        assert!(sent.contains(&(MSG_SET_CHANNEL_SEARCH_TIMEOUT, vec![0, 2])));
+        assert!(!sent.iter().any(|(id, _)| *id == MSG_SET_LP_SEARCH_TIMEOUT));
+    }
+
+    #[test]
+    fn wait_first_page_returns_first_page() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![0x84, 0, 0, 0, 0, 0, 0, 142]).unwrap();
+        let page = wait_first_page(&rx, Duration::from_millis(20), &AtomicBool::new(false));
+        assert_eq!(page, Some(vec![0x84, 0, 0, 0, 0, 0, 0, 142]));
+    }
+
+    #[test]
+    fn wait_first_page_times_out_without_data() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let start = Instant::now();
+        assert_eq!(wait_first_page(&rx, Duration::from_millis(20), &AtomicBool::new(false)), None);
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn wait_first_page_stops_on_cancel() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let start = Instant::now();
+        assert_eq!(wait_first_page(&rx, Duration::from_secs(5), &AtomicBool::new(true)), None);
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn closed_channel_event_detects_search_timeout_and_close() {
+        let ev = |code| AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![4, CHANNEL_EVENT, code] };
+        assert_eq!(closed_channel_event(&ev(EVENT_RX_SEARCH_TIMEOUT)), Some(4));
+        assert_eq!(closed_channel_event(&ev(EVENT_CHANNEL_CLOSED)), Some(4));
+        assert_eq!(closed_channel_event(&ev(EVENT_RX_FAIL_GO_TO_SEARCH)), None, "still searching");
+        // A command response whose code byte happens to be 0x07 is not an event
+        let resp = AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![4, MSG_CLOSE_CHANNEL, 0x07] };
+        assert_eq!(closed_channel_event(&resp), None);
+    }
 }

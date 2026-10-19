@@ -27,13 +27,25 @@ pub const MSG_BROADCAST_DATA: u8 = 0x4E;
 pub const MSG_ACKNOWLEDGED_DATA: u8 = 0x4F;
 pub const MSG_CHANNEL_RESPONSE: u8 = 0x40;
 pub const MSG_CHANNEL_ID: u8 = 0x51;
+/// Set Low Priority Search Timeout (D00000652 Rev 5.1 §9.5.2.15)
+pub const MSG_SET_LP_SEARCH_TIMEOUT: u8 = 0x63;
+/// Add Channel ID to List (§9.5.2.10)
+pub const MSG_ADD_CHANNEL_ID_TO_LIST: u8 = 0x59;
+/// Config ID List (§9.5.2.12)
+pub const MSG_CONFIG_ID_LIST: u8 = 0x5A;
 
 // Channel types
 pub const CHANNEL_TYPE_SLAVE: u8 = 0x00; // Receive
 
-// Channel response event codes
+// Channel events: MSG_CHANNEL_RESPONSE with byte 1 = 0x01 (D00000652 Rev 5.1 §9.5.6.1)
+pub const CHANNEL_EVENT: u8 = 0x01;
+pub const EVENT_RX_SEARCH_TIMEOUT: u8 = 0x01;
+pub const EVENT_TRANSFER_TX_COMPLETED: u8 = 0x05;
+pub const EVENT_TRANSFER_TX_FAILED: u8 = 0x06;
 pub const EVENT_CHANNEL_CLOSED: u8 = 0x07;
+pub const EVENT_RX_FAIL_GO_TO_SEARCH: u8 = 0x08;
 pub const RESPONSE_NO_ERROR: u8 = 0x00;
+pub const TRANSFER_IN_PROGRESS: u8 = 0x1F;
 
 /// A decoded ANT message
 #[derive(Debug, Clone)]

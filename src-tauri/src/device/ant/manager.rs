@@ -170,7 +170,7 @@ impl AntManager {
                     device_number: 0,     // wildcard
                     transmission_type: 0, // wildcard
                 };
-                if let Err(e) = open_channel(&self.usb, &config, &self.response_queue) {
+                if let Err(e) = open_channel(&*self.usb, &config, SCAN_SEARCH, &self.response_queue) {
                     warn!(
                         "Failed to open scan channel {} for {:?}: {}",
                         ch, profile.device_type, e
@@ -254,7 +254,7 @@ impl AntManager {
 
         // Close scan channels
         for (ch, _) in &scan_channels {
-            let _ = close_channel(&self.usb, *ch, &self.response_queue);
+            let _ = close_channel(&*self.usb, *ch, &self.response_queue);
         }
 
         // Build device info list
@@ -296,6 +296,7 @@ impl AntManager {
         device_id: &str,
         tx: broadcast::Sender<SensorReading>,
         primaries: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
+        cancel: &AtomicBool,
     ) -> Result<DeviceInfo, AppError> {
         // Idempotent: never open a second channel for a device that is still live.
         // A connection whose channel has closed is torn down and reopened.
@@ -321,14 +322,26 @@ impl AntManager {
             device_number: discovered.device_number,
             transmission_type: discovered.transmission_type,
         };
-        open_channel(&self.usb, &config, &self.response_queue)?;
-
-        // Create mpsc channel for this device and register with router
+        // Register with the router before opening so the first page is not missed.
         let (data_tx, data_rx) = std::sync::mpsc::channel();
         {
             let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
             senders.insert(channel_number, data_tx);
         }
+        if let Err(e) = open_channel(&*self.usb, &config, CONNECTION_SEARCH, &self.response_queue) {
+            self.release_connect_channel(channel_number);
+            return Err(e);
+        }
+
+        // Connected only once the device actually delivers a page (design ADR-2).
+        let Some(first_page) = wait_first_page(&data_rx, ANT_FIRST_PAGE_TIMEOUT, cancel) else {
+            self.release_connect_channel(channel_number);
+            if cancel.load(Ordering::SeqCst) {
+                return Err(AppError::Cancelled);
+            }
+            return Err(AntError::Channel(format!("No data from {} within {:?}", device_id, ANT_FIRST_PAGE_TIMEOUT)).into());
+        };
+        let first_page: Option<[u8; 8]> = first_page[..8].try_into().ok();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
@@ -339,6 +352,7 @@ impl AntManager {
 
         // Lock-free link handles for the watchdog heartbeat
         let last_seen_ts = Arc::new(AtomicI64::new(0));
+        super::listener::atomic_now(&last_seen_ts);
         let closed = Arc::new(AtomicBool::new(false));
         {
             let mut links = self.links.lock().unwrap_or_else(|e| e.into_inner());
@@ -350,7 +364,7 @@ impl AntManager {
         let closed_clone = closed.clone();
 
         let listener_handle = tokio::task::spawn_blocking(move || {
-            listen_ant_channel(data_rx, device_type, tx, stop_clone, did, metadata, dtype_id, last_seen_ts, primaries);
+            listen_ant_channel(data_rx, first_page, device_type, tx, stop_clone, did, metadata, dtype_id, last_seen_ts, primaries);
             closed_clone.store(true, Ordering::SeqCst);
         });
 
@@ -389,6 +403,17 @@ impl AntManager {
         Ok(info)
     }
 
+    /// Undo a connect that failed after the channel was registered/opened.
+    fn release_connect_channel(&self, channel_number: u8) {
+        {
+            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
+            senders.remove(&channel_number);
+        }
+        if let Err(e) = close_channel(&*self.usb, channel_number, &self.response_queue) {
+            warn!("ANT+ ch{}: close after failed connect failed: {}", channel_number, e);
+        }
+    }
+
     /// Disconnect from an ANT+ device
     pub fn disconnect(&mut self, device_id: &str) -> Result<(), AppError> {
         if let Some(mut conn) = self.connected.remove(device_id) {
@@ -410,7 +435,7 @@ impl AntManager {
             }
             // Tolerate a channel the radio already closed (search timeout, stick reset):
             // the bookkeeping above is what matters for a clean reopen.
-            if let Err(e) = close_channel(&self.usb, conn.channel_number, &self.response_queue) {
+            if let Err(e) = close_channel(&*self.usb, conn.channel_number, &self.response_queue) {
                 warn!("[{}] Closing ANT+ channel {} failed (treated as closed): {}", device_id, conn.channel_number, e);
             }
         }
@@ -501,6 +526,14 @@ fn router_loop(
                     let _ = sender.send(page_data);
                 }
             } else {
+                // The radio closed a channel by itself (search timeout / close event):
+                // drop its sender so the listener exits and marks the link closed.
+                if let Some(ch) = closed_channel_event(&msg) {
+                    let mut senders = channel_senders.lock().unwrap_or_else(|e| e.into_inner());
+                    if senders.remove(&ch).is_some() {
+                        warn!("ANT+ ch{} closed by the radio", ch);
+                    }
+                }
                 // Channel responses, Channel IDs, etc. go to the response queue
                 let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
                 queue.push(msg);
@@ -514,5 +547,7 @@ fn router_loop(
         }
     }
 
+    // Router gone: no connection can deliver data any more.
+    channel_senders.lock().unwrap_or_else(|e| e.into_inner()).clear();
     info!("ANT+ router thread stopped");
 }

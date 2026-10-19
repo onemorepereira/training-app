@@ -88,6 +88,7 @@ fn decode_common_page_82(data: &[u8; 8], meta: &mut AntDeviceMetadata) {
 /// This runs in a blocking thread (call from tokio::task::spawn_blocking).
 pub fn listen_ant_channel(
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    initial: Option<[u8; 8]>,
     device_type: DeviceType,
     tx: broadcast::Sender<SensorReading>,
     stop: Arc<AtomicBool>,
@@ -101,9 +102,16 @@ pub fn listen_ant_channel(
 
     info!("[{}] ANT+ channel listener started for {:?}", device_id, device_type);
 
+    // The page that proved the device is present (consumed by connect) is decoded first.
+    let mut pending = initial.map(|p| p.to_vec());
+
     while !stop.load(Ordering::Relaxed) {
         // recv_timeout so we periodically check the stop flag
-        let page_data = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+        let next = match pending.take() {
+            Some(p) => Ok(p),
+            None => rx.recv_timeout(std::time::Duration::from_millis(200)),
+        };
+        let page_data = match next {
             Ok(data) => data,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
