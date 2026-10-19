@@ -417,7 +417,10 @@ export const SCENARIOS = [
       await page.route((url) => !['localhost', '127.0.0.1'].includes(url.hostname), (route) => { attempted.push(route.request().url()); });
       await page.reload({ waitUntil: 'commit' });
       const ok = await page.locator('nav').waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false);
-      const fcp = await page.evaluate(() => performance.getEntriesByName('first-contentful-paint')[0]?.startTime ?? null);
+      // WebKit can record the paint entry a frame after the nav is visible; wait for it, then judge its timestamp.
+      const fcp = await page
+        .waitForFunction(() => performance.getEntriesByName('first-contentful-paint')[0]?.startTime ?? null, null, { timeout: 3000 })
+        .then((h) => h.jsonValue(), () => null);
       const fails = [];
       if (!ok) fails.push('nav not visible within 5 s');
       if (fcp == null || fcp > 1000) fails.push(`first contentful paint ${fcp == null ? 'missing' : Math.round(fcp) + ' ms'} (> 1000 ms)`);
