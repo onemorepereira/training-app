@@ -543,6 +543,48 @@ Recorded during Phase 2. Nothing here changes a ruling.
 8. **An HR sensor silent for 15–30 s ("holding power") also freezes the PID,** like the other no-delivery conditions.
 9. **`stop_zone_control` returns `None`** when no run ever existed, as specified in Data and contracts.
 
+### Verify-review rulings (ADR-24 to ADR-28)
+These follow the verify review (2026-10-18) and were implemented test-first in `840a8ad`, `0a210c2` and `b1cec04`.
+
+### ADR-24: Wall-clock bound on an undelivered safety cut (amends ADR-15)
+- A pending safety override (cadence-zero or HR-ceiling) that stays undelivered stops the ride with `TrainerUnresponsive` after **3 ticks or 6 s of `tokio::time::Instant` time, whichever comes first** (`SAFETY_UNDELIVERED_STOP`).
+- The episode starts on the first tick where the override is pending but not delivered.
+- Each send within the episode is capped at the remaining time, so a trainer that hangs until every timeout still stops at 6 s rather than about 9 s.
+- Test: `hung_safety_cut_stops_within_6s_wall_clock`. It failed at 9 s before the change.
+
+### ADR-25: Power-mode restore after a cadence cut (amends ADR-4; spec AC5 amended)
+- In power mode the cadence-zero cut is **latched**. The target is restored only once cadence ≥ 40 rpm has been **sustained for 2 s** (`POWER_RESTORE_CADENCE_RPM` / `POWER_RESTORE_CADENCE_SECS`). The full target is then sent on the next reconcile. This avoids putting a rider who is grinding at low cadence back into ERG (the "spiral of death").
+- HR mode is unchanged, because it already ramps up from 0 W (ADR-14). Resume and reconnect in power mode still re-send the target directly. In HR mode a reconnect re-sends the last confirmed watts (accepted).
+- Tests:
+  - `power_mode_restores_target_within_2_ticks_after_cadence_sustained_2s`: restored ≥ 2 s and ≤ 4 s after cadence returns.
+  - `power_mode_keeps_cut_while_cadence_below_40rpm`: covers 30 rpm, and a 1 s burst at 90 rpm.
+
+### ADR-26: Closing flag
+- `ZoneController::close(budget)` (called by `lifecycle::on_app_close`) sets `closing` **before** it takes the lifecycle lock, then stops within the budget.
+- `start_with_config` checks the flag **under** the lifecycle lock and refuses with `AppError::Session("App is closing")`.
+- A start that won the lock before close is stopped by close, because close waits for that lock.
+- Tests: `start_racing_app_close_never_leaves_a_run_sending` covers both orderings, plus a start after close.
+
+### ADR-27: 1 bpm error deadband (amends ADR-1)
+- Context: with seeded ±3 bpm measurement noise and a rising start 30 bpm below target, the near-zone gains hunted power by up to 14 W over the last 5 min. The Python prototype `scratchpad/sim/noisy.py` failed 9 of 18 grid cases; the Rust test failed too.
+- Options compared: Kp 0.5 (7/18 fail), deadband 2 (0/18), deadband 1 (0/18, worst swing 8 W).
+- Decision: an error with |e| ≤ 1 bpm counts as zero for P and I (`HR_ERROR_DEADBAND_BPM`). D still acts on the measurement.
+- The noiseless results are unchanged: all grid cases still pass.
+- Tests:
+  - `hr_pid_ignores_error_within_1bpm_deadband`
+  - `hr_plant_noisy_rising_start_settles_across_grid` (18 cases, same pass criteria)
+  - `hr_plant_noisy_rising_start_settles_through_on_tick`: one case driven through the control task's real `on_tick`, `on_reading` and trainer-sink path under paused time.
+
+### ADR-28: Manual commands, pause during start, attempt recording
+- **Manual commands:** `set_trainer_power`, `set_trainer_resistance` and `set_trainer_simulation` call `ZoneController::ensure_manual_control_allowed()`. While a run is active, paused included, they return `AppError::Session("Zone ride active — stop it first")`. The frontend shows the serialized `AppError` message.
+- **Pause and resume** now wait on the lifecycle lock (option chosen over routing). A pause issued during a start therefore reaches the new run; a pause during a stop waits and then becomes a no-op. Test: `pause_during_start_applies_to_new_run`.
+- **Stop after a run has finished** returns the reason the run ended, not the reason passed in. This is documented contract. Test: `stop_after_finish_returns_the_original_reason`.
+- **Attempt recording:**
+  - `TrainerBackend::on_outcome` (no-op by default) receives the outcome the caller saw for every command: Ok, Err or Timeout.
+  - `FakeTrainer` records every attempt (with its start time) and every outcome.
+  - Each run records whether its final 0 W release was confirmed (`ZoneController::last_release_confirmed`).
+  - `on_app_close_reports_unconfirmed_release_when_zero_watt_fails` now asserts the attempt, the `Err` outcome and `Some(false)`.
+
 ## Failure modes
 
 | Failure | Detection | Behavior | Recovery |
@@ -576,7 +618,7 @@ Recorded during Phase 2. Nothing here changes a ruling.
 | AC2 | `hr_power_band` | `custom_hr_zone_band_is_min_to_150pct_ftp`, `custom_hr_zone_without_ftp_caps_at_400`, `custom_hr_150_160_commands_above_55pct_ftp` |
 | AC3 | `ZoneTarget::validate`, `hr_power_band`, `validate_user_config(&SessionConfig)` | `power_zone_8_rejected`, `hr_zone_6_rejected`, `zone_0_custom_accepted`, `lower_equal_upper_rejected`, `power_bound_above_2000_rejected`, `hr_bound_above_250_rejected`, `midpoint_of_max_bounds_does_not_overflow`, `hr_band_floor_never_exceeds_ceiling_for_any_ftp` (FTP 1..=2000 × zone 0..=7), `initial_power_with_tiny_ftp_does_not_panic`, `ftp_below_50_rejected`, `ftp_above_1000_rejected`, `non_increasing_hr_zones_rejected` (already passes; regression) |
 | AC4 | supervisor, `finalize` | `control_task_panic_reports_controller_fault_and_releases_trainer` (FakeTrainer panics on first `set_power`), `self_stop_on_duration_complete_releases_trainer` |
-| AC5 | reconcile-send, ADR-14 re-seed | `power_mode_restores_target_within_2_ticks_after_cadence_returns`, `target_resent_within_2_ticks_after_trainer_reconnect`, `trainer_lost_without_override_waits_30s` |
+| AC5 | reconcile-send, ADR-14 re-seed, ADR-25 cadence gate | `power_mode_restores_target_within_2_ticks_after_cadence_sustained_2s`, `power_mode_keeps_cut_while_cadence_below_40rpm`, `target_resent_within_2_ticks_after_trainer_reconnect`, `trainer_lost_without_override_waits_30s` |
 | AC6 | `ZoneController::{stop,stop_with_budget,pause,resume}`, `finalize`, `TrainerSink::release`, `lifecycle.rs`, safety-cut bound | `release_sends_zero_watts_before_resistance_zero`, `release_delivered_iff_zero_watts_ok`, `release_not_confirmed_when_zero_watts_fails_even_if_resistance_ok`, `pause_releases_trainer_and_resume_resends_target`, `failed_pause_release_is_retried_next_tick`, `paused_trainer_lost_30s_stops_trainer_disconnected`, `sensor_lost_stop_releases_trainer`, `stop_when_inactive_is_noop`, `undelivered_cadence_cut_for_3_ticks_stops_trainer_unresponsive`, `undelivered_hr_ceiling_cut_for_3_ticks_stops_trainer_unresponsive`, `hr_ceiling_clears_only_after_two_samples_below_ceiling_minus_3`, `single_sample_below_clear_threshold_keeps_override`, `on_session_stop_releases_trainer_before_returning`, `on_session_pause_releases_and_resume_resends`, `on_app_close_respects_4s_budget_with_hung_trainer`, `on_app_close_logs_unconfirmed_release_when_zero_watt_fails`; lifecycle/stop races: `stop_then_start_old_generation_never_commands_after_new_initial`, `two_concurrent_stops_both_return_after_release`, `start_during_in_flight_stop_waits_for_release`, `self_finalize_racing_start_does_not_touch_new_run_status`, `stale_generation_command_dropped_by_sink`. One-line Tauri wiring: manual check |
 | AC7 | `config::clamp_trainer_watts`, manager.rs line, `DeviceManagerSink` | `clamp_trainer_watts_caps_at_2000`, `clamp_trainer_watts_negative_is_zero`, `clamp_trainer_watts_u16_max_does_not_wrap` |
 | AC8 | `last_tick_at` advances every tick, dt cap | `pause_10_minutes_adds_zero_time_in_zone`, `first_tick_after_resume_uses_normal_dt` |
@@ -638,7 +680,7 @@ Each slice is one commit with its tests (failing test first). The riskiest work 
 8. **Final.** Full `cargo test` and `npm run check`; `design.md` Status: Current with a Verification section; `spec.md` Status: Built.
 
 ## Verification
-- **Rust:** `cd src-tauri && cargo test`: 347 passed (289 at baseline; 85 in `session::zone_control`, plus config and commands tests). The zone-control suite was run 6 times in a row with the same result. `cargo check --features production` is clean.
+- **Rust:** `cd src-tauri && cargo test`: **356 passed** (289 at baseline; 94 in `session::zone_control`, plus config and commands tests). After the verify-review follow-ups the zone-control suite was run 4 more times in a row with the same result. `cargo check --features production` is clean.
 - **Frontend:** `npm test` (71 passed) and `npm run check` (0 errors, 0 warnings); no frontend files changed.
 
 **"Fails before" evidence:**
@@ -647,16 +689,22 @@ Each slice is one commit with its tests (failing test first). The riskiest work 
   - Disabling the safety-cut counter fails both `undelivered_*` tests.
   - Removing the PID re-seed fails both ramp tests.
   - Making `stop()` return without waiting for finalize fails 8 lifecycle and race tests.
+  - Dropping the closing-flag check fails `start_racing_app_close_never_leaves_a_run_sending`.
+  - Removing pause's lifecycle wait fails `pause_during_start_applies_to_new_run`.
+- **Verify-review follow-ups:**
+  - `hung_safety_cut_stops_within_6s_wall_clock` failed before the change (stopped after 9 s).
+  - The two cadence-gate tests failed before the change (target restored at once).
+  - Both noisy-plant tests failed before the deadband (power swing 14 W and 12 W).
 - The other new tests target APIs or behaviour that did not exist before: validation, band function, generations, release, pause release. They are written against the specified contract.
 
 | AC | Test(s) | Location |
 |---|---|---|
-| AC1 | `hr_plant_20bpm_below_settles_without_overshoot_or_oscillation`, `hr_plant_grid_settles_across_lag_and_delay`, `hr_pid_zero_error_stable_hr_holds_power`, `hr_pid_integral_frozen_while_at_band_ceiling`, `hr_pid_integral_frozen_while_rate_limited`, `hr_pid_integral_unwinds_when_error_reverses_at_ceiling`, `hr_pid_first_tick_reference_value`, `pid_state_unchanged_during_override`, `hr_ceiling_override_30s_first_post_override_command_at_most_delivered_plus_max_up`, `hr_mode_after_cadence_zero_ramps_up_from_zero`, `output_below_band_ramps_into_band_under_rate_limit` | `pid.rs`, `controller.rs` |
+| AC1 | `hr_plant_20bpm_below_settles_without_overshoot_or_oscillation`, `hr_plant_grid_settles_across_lag_and_delay`, `hr_plant_noisy_rising_start_settles_across_grid`, `hr_plant_noisy_rising_start_settles_through_on_tick`, `hr_pid_ignores_error_within_1bpm_deadband`, `hr_pid_zero_error_stable_hr_holds_power`, `hr_pid_integral_frozen_while_at_band_ceiling`, `hr_pid_integral_frozen_while_rate_limited`, `hr_pid_integral_unwinds_when_error_reverses_at_ceiling`, `hr_pid_first_tick_reference_value`, `pid_state_unchanged_during_override`, `hr_ceiling_override_30s_first_post_override_command_at_most_delivered_plus_max_up`, `hr_mode_after_cadence_zero_ramps_up_from_zero`, `output_below_band_ramps_into_band_under_rate_limit` | `pid.rs`, `controller.rs` |
 | AC2 | `custom_hr_zone_band_is_min_to_150pct_ftp`, `custom_hr_zone_without_ftp_caps_at_400`, `custom_hr_150_160_commands_above_55pct_ftp` | `controller.rs` |
 | AC3 | `power_zone_8_rejected`, `power_zone_7_accepted`, `hr_zone_6_rejected`, `zone_0_custom_accepted`, `lower_equal_upper_rejected`, `power_bound_above_2000_rejected`, `hr_bound_above_250_rejected`, `midpoint_of_max_bounds_does_not_overflow`, `hr_band_floor_never_exceeds_ceiling_for_any_ftp`, `initial_power_with_tiny_ftp_does_not_panic`, `initial_power_estimate_clamped_into_hr_band`, `ftp_below_50_rejected`, `ftp_above_1000_rejected`, `non_increasing_hr_zones_rejected` (regression; already rejected before), `hr_zone_above_250_rejected`, `zero_power_zone_percentage_rejected` | `types.rs`, `controller.rs`, `commands.rs` |
 | AC4 | `control_task_panic_reports_controller_fault_and_releases_trainer`, `finalize_panic_reports_controller_fault_to_stop`, `self_stop_on_duration_complete_releases_trainer` | `controller.rs` |
-| AC5 | `power_mode_restores_target_within_2_ticks_after_cadence_returns`, `target_resent_within_2_ticks_after_trainer_reconnect`, `trainer_lost_without_override_waits_30s` | `controller.rs` |
-| AC6 | `release_sends_zero_watts_before_resistance_zero`, `release_delivered_iff_zero_watts_ok`, `release_not_confirmed_when_zero_watts_fails_even_if_resistance_ok`, `release_respects_budget_when_trainer_hangs` (`trainer.rs`); `stop_releases_trainer_with_zero_watts_then_resistance`, `stop_when_inactive_is_noop`, `second_stop_after_finish_returns_first_reason_without_commands`, `sensor_lost_stop_releases_trainer`, `pause_releases_trainer_and_resume_resends_target`, `failed_pause_release_is_retried_next_tick`, `paused_trainer_lost_30s_stops_trainer_disconnected`, `paused_with_cadence_zero_sends_release_and_never_trainer_unresponsive`, `undelivered_cadence_cut_for_3_ticks_stops_trainer_unresponsive`, `undelivered_hr_ceiling_cut_for_3_ticks_stops_trainer_unresponsive`, `hr_ceiling_clears_only_after_two_samples_below_ceiling_minus_3`, `single_sample_below_clear_threshold_keeps_override`, `two_concurrent_stops_both_return_after_release`, `start_during_in_flight_stop_waits_for_release`, `stop_then_start_old_generation_never_commands_after_new_initial`, `self_finalize_racing_start_does_not_touch_new_run_status`, `stop_with_budget_returns_at_budget_when_release_hangs`, `stale_generation_command_dropped_by_sink` (`controller.rs`, `trainer.rs`); `on_session_stop_releases_trainer_before_returning`, `on_session_stop_without_zone_ride_is_noop`, `on_session_pause_releases_and_resume_resends`, `on_app_close_respects_4s_budget_with_hung_trainer`, `on_app_close_reports_unconfirmed_release_when_zero_watt_fails` (`lifecycle.rs`) | see column |
+| AC5 | `power_mode_restores_target_within_2_ticks_after_cadence_sustained_2s`, `power_mode_keeps_cut_while_cadence_below_40rpm`, `target_resent_within_2_ticks_after_trainer_reconnect`, `trainer_lost_without_override_waits_30s` | `controller.rs` |
+| AC6 | `release_sends_zero_watts_before_resistance_zero`, `release_delivered_iff_zero_watts_ok`, `release_not_confirmed_when_zero_watts_fails_even_if_resistance_ok`, `release_respects_budget_when_trainer_hangs` (`trainer.rs`); `stop_releases_trainer_with_zero_watts_then_resistance`, `stop_when_inactive_is_noop`, `second_stop_after_finish_returns_first_reason_without_commands`, `sensor_lost_stop_releases_trainer`, `pause_releases_trainer_and_resume_resends_target`, `failed_pause_release_is_retried_next_tick`, `paused_trainer_lost_30s_stops_trainer_disconnected`, `paused_with_cadence_zero_sends_release_and_never_trainer_unresponsive`, `undelivered_cadence_cut_for_3_ticks_stops_trainer_unresponsive`, `undelivered_hr_ceiling_cut_for_3_ticks_stops_trainer_unresponsive`, `hung_safety_cut_stops_within_6s_wall_clock`, `hr_ceiling_clears_only_after_two_samples_below_ceiling_minus_3`, `single_sample_below_clear_threshold_keeps_override`, `start_racing_app_close_never_leaves_a_run_sending`, `manual_trainer_commands_refused_while_zone_run_active`, `pause_during_start_applies_to_new_run`, `stop_after_finish_returns_the_original_reason`, `two_concurrent_stops_both_return_after_release`, `start_during_in_flight_stop_waits_for_release`, `stop_then_start_old_generation_never_commands_after_new_initial`, `self_finalize_racing_start_does_not_touch_new_run_status`, `stop_with_budget_returns_at_budget_when_release_hangs`, `stale_generation_command_dropped_by_sink` (`controller.rs`, `trainer.rs`); `on_session_stop_releases_trainer_before_returning`, `on_session_stop_without_zone_ride_is_noop`, `on_session_pause_releases_and_resume_resends`, `on_app_close_respects_4s_budget_with_hung_trainer`, `on_app_close_reports_unconfirmed_release_when_zero_watt_fails` (`lifecycle.rs`) | see column |
 | AC7 | `clamp_trainer_watts_caps_at_2000`, `clamp_trainer_watts_negative_is_zero`, `clamp_trainer_watts_u16_max_does_not_wrap`; one-line clamp in `DeviceManager::set_target_power` | `config.rs`, `device/manager.rs` |
 | AC8 | `pause_10_minutes_adds_zero_time_in_zone`, `first_tick_after_resume_uses_normal_dt` | `controller.rs` |
 | AC9 | `integral_decays_when_smoothed_hr_falls_between_ticks`, `no_integral_decay_when_smoothed_hr_rises_above_zone`, `no_integral_decay_when_hr_below_target_and_falling` | `pid.rs` |
