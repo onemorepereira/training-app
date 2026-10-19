@@ -1,7 +1,7 @@
 # Storage, infra & security — Spec
 
 **Track:** Standard   **Product stage:** Introduction/early Growth
-**Status:** Agreed   **Last updated:** 2026-10-18
+**Status:** Built   **Last updated:** 2026-10-18
 **Findings:** E1–E7
 
 ## Problem
