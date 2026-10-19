@@ -42,7 +42,7 @@ pub struct AntManager {
     usb: Arc<AntUsb>,
     router_stop: Arc<AtomicBool>,
     router_handle: Option<std::thread::JoinHandle<()>>,
-    channel_senders: Arc<Mutex<HashMap<u8, std::sync::mpsc::Sender<Vec<u8>>>>>,
+    book: Arc<Mutex<ChannelBook>>,
     response_queue: Arc<Mutex<Vec<AntMessage>>>,
     discovered: HashMap<String, DiscoveredDevice>,
     connected: HashMap<String, ActiveConnection>,
@@ -81,15 +81,14 @@ impl AntManager {
 
         let usb = Arc::new(usb);
         let router_stop = Arc::new(AtomicBool::new(false));
-        let channel_senders: Arc<Mutex<HashMap<u8, std::sync::mpsc::Sender<Vec<u8>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let book: Arc<Mutex<ChannelBook>> = Arc::new(Mutex::new(ChannelBook::default()));
         let response_queue: Arc<Mutex<Vec<AntMessage>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Start the router thread
         let router_handle = {
             let usb = usb.clone();
             let stop = router_stop.clone();
-            let senders = channel_senders.clone();
+            let senders = book.clone();
             let queue = response_queue.clone();
 
             std::thread::spawn(move || {
@@ -102,7 +101,7 @@ impl AntManager {
             usb,
             router_stop,
             router_handle: Some(router_handle),
-            channel_senders,
+            book,
             response_queue,
             discovered: HashMap::new(),
             connected: HashMap::new(),
@@ -137,6 +136,7 @@ impl AntManager {
 
         // Clean up channels a previous scan may have left open (errors expected for idle ones).
         for &ch in &free {
+            self.note_close_issued(ch);
             let _ = self.usb.send(&AntMessage { msg_id: MSG_CLOSE_CHANNEL, data: vec![ch] });
             std::thread::sleep(Duration::from_millis(50));
             let _ = self.usb.send(&AntMessage { msg_id: MSG_UNASSIGN_CHANNEL, data: vec![ch] });
@@ -191,6 +191,7 @@ impl AntManager {
         let mut receivers: HashMap<u8, std::sync::mpsc::Receiver<Vec<u8>>> = HashMap::new();
         let mut excluded: HashMap<u8, Vec<FoundId>> = HashMap::new();
         let mut open: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        let mut no_id_lists: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
         for &(ch, profile) in batch {
             let config = AntChannelConfig {
@@ -261,15 +262,17 @@ impl AntManager {
                 list.push(id);
 
                 // Look for further devices of this profile on the same channel.
-                if list.len() <= MAX_ID_LIST {
+                if list.len() <= MAX_ID_LIST && !no_id_lists.contains(&ch) {
                     self.unregister_sender(ch);
                     receivers.remove(&ch);
-                    match reopen_excluding(&*self.usb, ch, list, &self.response_queue) {
-                        Ok(()) => {
-                            receivers.insert(ch, self.register_sender(ch));
-                        }
-                        Err(e) => warn!("ANT+ scan ch{}: reopen with exclusion list failed: {}", ch, e),
+                    self.note_close_issued(ch);
+                    if let Err(e) = reopen_excluding(&*self.usb, ch, list, &self.response_queue) {
+                        // Stick without ID lists: fall back to one device per profile.
+                        warn!("ANT+ scan ch{}: exclusion list unsupported ({}); single device per profile", ch, e);
+                        no_id_lists.insert(ch);
+                        let _ = self.usb.send(&AntMessage { msg_id: MSG_OPEN_CHANNEL, data: vec![ch] });
                     }
+                    receivers.insert(ch, self.register_sender(ch));
                 }
             }
 
@@ -278,6 +281,7 @@ impl AntManager {
 
         for &ch in &open {
             self.unregister_sender(ch);
+            self.note_close_issued(ch);
             if let Err(e) = release_scan_channel(&*self.usb, ch, &self.response_queue) {
                 warn!("ANT+ scan ch{}: release failed: {}", ch, e);
             }
@@ -285,13 +289,15 @@ impl AntManager {
     }
 
     fn register_sender(&self, ch: u8) -> std::sync::mpsc::Receiver<Vec<u8>> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.channel_senders.lock().unwrap_or_else(|e| e.into_inner()).insert(ch, tx);
-        rx
+        self.book.lock().unwrap_or_else(|e| e.into_inner()).register(ch)
     }
 
     fn unregister_sender(&self, ch: u8) {
-        self.channel_senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&ch);
+        self.book.lock().unwrap_or_else(|e| e.into_inner()).unregister(ch);
+    }
+
+    fn note_close_issued(&self, ch: u8) {
+        self.book.lock().unwrap_or_else(|e| e.into_inner()).note_close_issued(ch);
     }
 
     /// Connect to a discovered ANT+ device.
@@ -328,11 +334,7 @@ impl AntManager {
             transmission_type: discovered.transmission_type,
         };
         // Register with the router before opening so the first page is not missed.
-        let (data_tx, data_rx) = std::sync::mpsc::channel();
-        {
-            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-            senders.insert(channel_number, data_tx);
-        }
+        let data_rx = self.register_sender(channel_number);
         if let Err(e) = open_channel(&*self.usb, &config, CONNECTION_SEARCH, &self.response_queue) {
             self.release_connect_channel(channel_number);
             return Err(e);
@@ -410,10 +412,8 @@ impl AntManager {
 
     /// Undo a connect that failed after the channel was registered/opened.
     fn release_connect_channel(&self, channel_number: u8) {
-        {
-            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-            senders.remove(&channel_number);
-        }
+        self.unregister_sender(channel_number);
+        self.note_close_issued(channel_number);
         if let Err(e) = close_channel(&*self.usb, channel_number, &self.response_queue) {
             warn!("ANT+ ch{}: close after failed connect failed: {}", channel_number, e);
         }
@@ -426,10 +426,7 @@ impl AntManager {
             conn.stop_flag.store(true, Ordering::Relaxed);
 
             // Remove the sender from the router so the listener's receiver disconnects
-            {
-                let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-                senders.remove(&conn.channel_number);
-            }
+            self.unregister_sender(conn.channel_number);
 
             if let Some(handle) = conn.listener_handle.take() {
                 handle.abort();
@@ -440,6 +437,7 @@ impl AntManager {
             }
             // Tolerate a channel the radio already closed (search timeout, stick reset):
             // the bookkeeping above is what matters for a clean reopen.
+            self.note_close_issued(conn.channel_number);
             if let Err(e) = close_channel(&*self.usb, conn.channel_number, &self.response_queue) {
                 warn!("[{}] Closing ANT+ channel {} failed (treated as closed): {}", device_id, conn.channel_number, e);
             }
@@ -482,10 +480,7 @@ impl Drop for AntManager {
         }
 
         // Remove all channel senders to unblock listeners
-        {
-            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-            senders.clear();
-        }
+        self.book.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -494,7 +489,7 @@ impl Drop for AntManager {
 /// - Everything else (responses, Channel IDs, etc.): push to response_queue
 fn router_loop(
     usb: Arc<AntUsb>,
-    channel_senders: Arc<Mutex<HashMap<u8, std::sync::mpsc::Sender<Vec<u8>>>>>,
+    book: Arc<Mutex<ChannelBook>>,
     response_queue: Arc<Mutex<Vec<AntMessage>>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -527,29 +522,12 @@ fn router_loop(
         };
 
         for msg in messages {
-            if msg.msg_id == MSG_BROADCAST_DATA && msg.data.len() >= 9 {
-                // Broadcast data: byte 0 = channel, bytes 1-8 = data page
-                let channel = msg.data[0];
-                let page_data = msg.data[1..9].to_vec();
-
-                let senders = channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(sender) = senders.get(&channel) {
-                    // If send fails, the receiver is gone (disconnected); just ignore
-                    let _ = sender.send(page_data);
-                }
-            } else {
-                // The radio closed a channel by itself (search timeout / close event):
-                // drop its sender so the listener exits and marks the link closed.
-                if let Some(ch) = closed_channel_event(&msg) {
-                    let mut senders = channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-                    if senders.remove(&ch).is_some() {
-                        warn!("ANT+ ch{} closed by the radio", ch);
-                    }
-                }
-                // Channel responses, Channel IDs, etc. go to the response queue
+            // Broadcast pages go to the channel's listener; everything else
+            // (responses, events, Channel IDs) to the response queue.
+            let to_queue = book.lock().unwrap_or_else(|e| e.into_inner()).route(msg);
+            if let Some(msg) = to_queue {
                 let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
                 queue.push(msg);
-
                 // Prevent unbounded growth: keep only the most recent 256 responses
                 if queue.len() > 256 {
                     let excess = queue.len() - 256;
@@ -560,6 +538,6 @@ fn router_loop(
     }
 
     // Router gone: no connection can deliver data any more.
-    channel_senders.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    book.lock().unwrap_or_else(|e| e.into_inner()).clear();
     info!("ANT+ router thread stopped");
 }

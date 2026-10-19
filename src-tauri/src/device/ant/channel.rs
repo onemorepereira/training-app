@@ -1,6 +1,7 @@
 use super::usb::*;
 use crate::device::types::DeviceType;
 use crate::error::{AntError, AppError};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -124,9 +125,82 @@ pub fn exclusion_messages(ch: u8, excluded: &[FoundId]) -> Vec<AntMessage> {
 }
 
 /// Config ID List with size 0: disables the channel's inclusion/exclusion list.
-fn reset_id_list(usb: &dyn AntTx, ch: u8, response_queue: &Arc<Mutex<Vec<AntMessage>>>) -> Result<(), AppError> {
-    usb.send(&AntMessage { msg_id: MSG_CONFIG_ID_LIST, data: vec![ch, 0, 0] })?;
-    poll_response(response_queue, ch, MSG_CONFIG_ID_LIST)
+/// Best effort: only the multi-device scan depends on ID lists, so a stick that
+/// rejects 0x5A must not break opening or releasing channels.
+fn reset_id_list(usb: &dyn AntTx, ch: u8, response_queue: &Arc<Mutex<Vec<AntMessage>>>) {
+    let result = usb
+        .send(&AntMessage { msg_id: MSG_CONFIG_ID_LIST, data: vec![ch, 0, 0] })
+        .and_then(|_| poll_response(response_queue, ch, MSG_CONFIG_ID_LIST));
+    if let Err(e) = result {
+        log::warn!("ANT+ ch{}: resetting the ID list failed (continuing): {}", ch, e);
+    }
+}
+
+/// Per-channel data senders for the router, tagged with a generation so a late
+/// EVENT_CHANNEL_CLOSED from an earlier close cannot kill a sender registered after
+/// that close was issued (channel numbers are reused).
+#[derive(Default)]
+pub struct ChannelBook {
+    senders: HashMap<u8, (u64, std::sync::mpsc::Sender<Vec<u8>>)>,
+    /// Generation stamped when we issued a close on the channel.
+    close_issued: HashMap<u8, u64>,
+    next_gen: u64,
+}
+
+impl ChannelBook {
+    fn bump(&mut self) -> u64 {
+        self.next_gen += 1;
+        self.next_gen
+    }
+
+    pub fn register(&mut self, ch: u8) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gen = self.bump();
+        self.senders.insert(ch, (gen, tx));
+        rx
+    }
+
+    pub fn unregister(&mut self, ch: u8) {
+        self.senders.remove(&ch);
+    }
+
+    /// Record that we are about to close `ch` (call right before sending the close).
+    pub fn note_close_issued(&mut self, ch: u8) {
+        let gen = self.bump();
+        self.close_issued.insert(ch, gen);
+    }
+
+    pub fn clear(&mut self) {
+        self.senders.clear();
+    }
+
+    /// Router step: broadcast pages go to the channel's sender (returns None);
+    /// everything else is returned for the response queue. A close/search-timeout
+    /// event drops the sender unless that sender is newer than the close we issued.
+    pub fn route(&mut self, msg: AntMessage) -> Option<AntMessage> {
+        if msg.msg_id == MSG_BROADCAST_DATA && msg.data.len() >= 9 {
+            if let Some((_, sender)) = self.senders.get(&msg.data[0]) {
+                // A send error means the listener is gone; nothing to do.
+                let _ = sender.send(msg.data[1..9].to_vec());
+            }
+            return None;
+        }
+        if let Some(ch) = closed_channel_event(&msg) {
+            let issued = if msg.data[2] == EVENT_CHANNEL_CLOSED { self.close_issued.remove(&ch) } else { None };
+            let sender_gen = self.senders.get(&ch).map(|(g, _)| *g);
+            match (sender_gen, issued) {
+                (Some(g), Some(close_gen)) if g > close_gen => {
+                    log::debug!("ANT+ ch{}: late close event ignored (channel re-registered)", ch);
+                }
+                (Some(_), _) => {
+                    self.senders.remove(&ch);
+                    log::warn!("ANT+ ch{} closed by the radio", ch);
+                }
+                (None, _) => {}
+            }
+        }
+        Some(msg)
+    }
 }
 
 /// Something that can transmit ANT messages (the USB stick, or a test recorder).
@@ -260,7 +334,7 @@ pub fn open_channel(
     }
 
     // A reused channel number must never inherit a previous scan's exclusion list.
-    reset_id_list(usb, ch, response_queue)?;
+    reset_id_list(usb, ch, response_queue);
 
     // Set channel ID (device number, device type, transmission type)
     let dn = config.device_number.to_le_bytes();
@@ -394,7 +468,7 @@ pub fn release_scan_channel(
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
 ) -> Result<(), AppError> {
     close_only(usb, ch, response_queue)?;
-    reset_id_list(usb, ch, response_queue)?;
+    reset_id_list(usb, ch, response_queue);
     usb.send(&AntMessage { msg_id: MSG_UNASSIGN_CHANNEL, data: vec![ch] })?;
     poll_response(response_queue, ch, MSG_UNASSIGN_CHANNEL)
 }
@@ -612,11 +686,16 @@ pub mod test_stick {
     pub struct RecordingStick {
         pub sent: Mutex<Vec<AntMessage>>,
         pub queue: Arc<Mutex<Vec<AntMessage>>>,
+        /// Commands answered with an error code (e.g. a stick without ID lists).
+        pub reject: Option<u8>,
     }
 
     impl RecordingStick {
         pub fn new() -> Self {
-            Self { sent: Mutex::new(Vec::new()), queue: Arc::new(Mutex::new(Vec::new())) }
+            Self { sent: Mutex::new(Vec::new()), queue: Arc::new(Mutex::new(Vec::new())), reject: None }
+        }
+        pub fn rejecting(msg_id: u8) -> Self {
+            Self { reject: Some(msg_id), ..Self::new() }
         }
         pub fn sent(&self) -> Vec<(u8, Vec<u8>)> {
             self.sent.lock().unwrap().iter().map(|m| (m.msg_id, m.data.clone())).collect()
@@ -635,10 +714,8 @@ pub mod test_stick {
                     data: vec![ch, CHANNEL_EVENT, EVENT_CHANNEL_CLOSED],
                 });
             } else if msg.msg_id != MSG_ACKNOWLEDGED_DATA && msg.msg_id != MSG_REQUEST_MESSAGE {
-                q.push(AntMessage {
-                    msg_id: MSG_CHANNEL_RESPONSE,
-                    data: vec![ch, msg.msg_id, RESPONSE_NO_ERROR],
-                });
+                let code = if self.reject == Some(msg.msg_id) { 0x28 /* INVALID_MESSAGE */ } else { RESPONSE_NO_ERROR };
+                q.push(AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![ch, msg.msg_id, code] });
             }
             Ok(())
         }
@@ -924,5 +1001,69 @@ mod tests {
         reopen_excluding(&stick, 3, &found, &stick.queue).unwrap();
         let ids: Vec<u8> = stick.sent().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![MSG_CLOSE_CHANNEL, MSG_ADD_CHANNEL_ID_TO_LIST, MSG_CONFIG_ID_LIST, MSG_OPEN_CHANNEL]);
+    }
+
+    // ---- Router channel generations / best-effort ID lists ----
+
+    fn closed_event(ch: u8) -> AntMessage {
+        AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![ch, CHANNEL_EVENT, EVENT_CHANNEL_CLOSED] }
+    }
+
+    fn broadcast(ch: u8, page: [u8; 8]) -> AntMessage {
+        let mut data = vec![ch];
+        data.extend_from_slice(&page);
+        AntMessage { msg_id: MSG_BROADCAST_DATA, data }
+    }
+
+    #[test]
+    fn late_close_event_does_not_kill_recovered_channel() {
+        let mut book = ChannelBook::default();
+        let _old = book.register(3); // previous connection on ch3
+        book.unregister(3);
+        book.note_close_issued(3); // close sent; its event is delayed
+        let rx = book.register(3); // reconnect reuses ch3
+        assert!(book.route(closed_event(3)).is_some(), "event still reaches the response queue");
+        book.route(broadcast(3, [0x84, 0, 0, 0, 0, 0, 0, 140]));
+        // The recovery connect's first-page wait succeeds the first time.
+        let page = wait_first_page(&rx, Duration::from_millis(250), &AtomicBool::new(false));
+        assert_eq!(page.map(|p| p[7]), Some(140));
+    }
+
+    #[test]
+    fn unsolicited_close_event_drops_sender() {
+        let mut book = ChannelBook::default();
+        let rx = book.register(2);
+        book.route(closed_event(2));
+        assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn close_event_for_sender_older_than_close_drops_it() {
+        let mut book = ChannelBook::default();
+        let rx = book.register(4);
+        book.note_close_issued(4);
+        book.route(closed_event(4));
+        assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn open_channel_succeeds_when_stick_rejects_id_list() {
+        let stick = RecordingStick::rejecting(MSG_CONFIG_ID_LIST);
+        open_channel(&stick, &hr_config(1), CONNECTION_SEARCH, &stick.queue).unwrap();
+        assert_eq!(stick.sent().last(), Some(&(MSG_OPEN_CHANNEL, vec![1])));
+    }
+
+    #[test]
+    fn release_scan_channel_unassigns_when_stick_rejects_id_list() {
+        let stick = RecordingStick::rejecting(MSG_CONFIG_ID_LIST);
+        release_scan_channel(&stick, 2, &stick.queue).unwrap();
+        assert_eq!(stick.sent().last(), Some(&(MSG_UNASSIGN_CHANNEL, vec![2])));
+    }
+
+    #[test]
+    fn reopen_excluding_reports_unsupported_id_list() {
+        let stick = RecordingStick::rejecting(MSG_ADD_CHANNEL_ID_TO_LIST);
+        let found = [FoundId { device_number: 7, device_type: 120, transmission_type: 1 }];
+        assert!(reopen_excluding(&stick, 0, &found, &stick.queue).is_err(), "scan falls back on this error");
     }
 }
