@@ -72,11 +72,11 @@ const MATRIX = [
 
 // Interactive surfaces: [name, routeSlug, state, async (page) => void]
 const INTERACTIONS = [
-  ['ride-normal-zonebuilder', 'ride', 'normal', async (p) => { await p.getByRole('button', { name: 'Toggle zone ride panel' }).click(); }],
-  ['ride-normal-trainer-sim', 'ride', 'normal', async (p) => { await p.getByRole('button', { name: 'SIM', exact: true }).click(); }],
-  ['ride-normal-trainer-res', 'ride', 'normal', async (p) => { await p.getByRole('button', { name: 'RES', exact: true }).click(); }],
-  ['ride-riding-graphs', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: 'Graphs' }).click(); await p.waitForTimeout(2500); }],
-  ['ride-riding-retro', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: 'Retro' }).click(); await p.waitForTimeout(1500); }],
+  ['ride-normal-zonebuilder', 'ride', 'normal', async (p) => { await p.getByRole('button', { name: 'Zone ride' }).click(); }],
+  ['ride-normal-trainer-sim', 'ride', 'normal', async (p) => { await p.getByRole('radio', { name: 'SIM', exact: true }).click(); }],
+  ['ride-normal-trainer-res', 'ride', 'normal', async (p) => { await p.getByRole('radio', { name: 'RES', exact: true }).click(); }],
+  ['ride-riding-graphs', 'ride', 'riding', async (p) => { await p.getByRole('radio', { name: 'Graphs' }).click(); await p.waitForTimeout(2500); }],
+  ['ride-riding-retro', 'ride', 'riding', async (p) => { await p.getByRole('radio', { name: 'Retro' }).click(); await p.waitForTimeout(1500); }],
   ['ride-riding-fullscreen', 'ride', 'riding', async (p) => { await p.keyboard.press('F11'); await p.waitForTimeout(3600); }],
   ['ride-riding-postride-modal', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: /Stop/ }).first().click(); await p.waitForTimeout(800); }],
   ['ride-riding-paused', 'ride', 'riding', async (p) => { await p.getByRole('button', { name: /Pause/ }).click(); await p.waitForTimeout(600); }],

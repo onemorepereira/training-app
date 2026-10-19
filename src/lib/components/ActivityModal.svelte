@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import type { SessionSummary } from '$lib/tauri';
   import { formatDuration, formatDate, autoTitle } from '$lib/utils/format';
+  import Dialog from '$lib/ui/Dialog.svelte';
 
   const ACTIVITY_TYPES = [
     { value: 'endurance', label: 'Endurance' },
@@ -34,18 +35,7 @@
     mode?: 'post-ride' | 'edit';
   } = $props();
 
-  let dialogEl = $state<HTMLDialogElement | null>(null);
-
-  $effect(() => {
-    if (dialogEl && !dialogEl.open) {
-      dialogEl.showModal();
-    }
-  });
-
-  function handleClose() {
-    dialogEl?.close();
-    onClose();
-  }
+  let open = $state(true);
 
   // Modal is freshly mounted each time — snapshot initial values (one-time read)
   const init = untrack(() => ({
@@ -91,368 +81,128 @@
   }
 </script>
 
-<dialog bind:this={dialogEl} class="modal-dialog" onclose={handleClose}>
-  <div class="modal">
-    <div class="modal-header">
-      <h2>{mode === 'post-ride' ? 'Save Activity' : 'Edit Activity'}</h2>
-      <button class="close-btn" onclick={handleClose} aria-label="Close">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
-      </button>
-    </div>
-
-    <div class="session-summary">
-      <span class="summary-item">{formatDate(session.start_time)}</span>
-      <span class="summary-sep"></span>
-      <span class="summary-item">{formatDuration(session.duration_secs)}</span>
-      {#if session.normalized_power != null}
-        <span class="summary-sep"></span>
-        <span class="summary-item">{session.normalized_power}W NP</span>
-      {/if}
-      {#if session.tss != null}
-        <span class="summary-sep"></span>
-        <span class="summary-item">{Math.round(session.tss)} TSS</span>
-      {/if}
-    </div>
-
-    <div class="form-group">
-      <label class="form-label" for="activity-title">Title</label>
-      <input
-        id="activity-title"
-        class="form-input"
-        type="text"
-        bind:value={title}
-        placeholder="Activity title..."
-      />
-    </div>
-
-    <div class="form-group" role="group" aria-label="Activity Type">
-      <span class="form-label">Activity Type</span>
-      <div class="type-grid">
-        {#each ACTIVITY_TYPES as type_}
-          <button
-            class="type-chip"
-            class:selected={selectedType === type_.value}
-            onclick={() => selectedType = selectedType === type_.value ? null : type_.value}
-          >
-            {type_.label}
-          </button>
-        {/each}
-      </div>
-    </div>
-
-    <div class="form-group" role="group" aria-label="RPE (1-10)">
-      <span class="form-label">RPE (1-10)</span>
-      <div class="rpe-row">
-        {#each Array.from({length: 10}, (_, i) => i + 1) as value}
-          <button
-            class="rpe-btn"
-            class:selected={selectedRpe === value}
-            style="--rpe-color: {rpeColor(value)}"
-            onclick={() => selectedRpe = selectedRpe === value ? null : value}
-          >
-            {value}
-          </button>
-        {/each}
-      </div>
-    </div>
-
-    <div class="form-group">
-      <label class="form-label" for="activity-notes">Notes</label>
-      <textarea
-        id="activity-notes"
-        class="form-textarea"
-        bind:value={notes}
-        placeholder="How did it feel?"
-        rows="3"
-      ></textarea>
-    </div>
-
-    <div class="modal-actions">
-      {#if mode === 'edit' && onDelete}
-        <button
-          class="btn-delete"
-          onclick={handleDelete}
-        >
-          {confirmingDelete ? 'Confirm Delete' : 'Delete'}
-        </button>
-      {/if}
-      <div class="actions-right">
-        <button class="btn-secondary" onclick={handleClose}>
-          {mode === 'post-ride' ? 'Skip' : 'Cancel'}
-        </button>
-        <button class="btn-primary" onclick={handleSave}>
-          Save
-        </button>
-      </div>
-    </div>
+<Dialog
+  bind:open
+  title={mode === 'post-ride' ? 'Ride saved' : 'Edit ride'}
+  description={mode === 'post-ride' ? 'Your ride is saved. Add details now, or later from History.' : undefined}
+  onclose={onClose}
+  width="md"
+>
+  <div class="summary">
+    <span>{formatDate(session.start_time)}</span>
+    <span class="data">{formatDuration(session.duration_secs)}</span>
+    {#if session.normalized_power != null}<span><span class="data">{session.normalized_power} W</span> NP</span>{/if}
+    {#if session.tss != null}<span><span class="data">{Math.round(session.tss)}</span> TSS</span>{/if}
   </div>
-</dialog>
+
+  <div class="form">
+    <label class="field">
+      <span class="field-label">Title</span>
+      <input type="text" bind:value={title} placeholder="Name this ride" />
+    </label>
+
+    <div class="field" role="group" aria-labelledby="am-type">
+      <span class="field-label" id="am-type">Type</span>
+      <div class="chips">
+        {#each ACTIVITY_TYPES as type_ (type_.value)}
+          <button
+            type="button"
+            class="btn btn-secondary chip"
+            aria-pressed={selectedType === type_.value}
+            onclick={() => (selectedType = selectedType === type_.value ? null : type_.value)}
+          >{type_.label}</button>
+        {/each}
+      </div>
+    </div>
+
+    <div class="field" role="group" aria-labelledby="am-rpe">
+      <span class="field-label" id="am-rpe">Effort (RPE)</span>
+      <div class="rpe">
+        {#each Array.from({ length: 10 }, (_, i) => i + 1) as value (value)}
+          <button
+            type="button"
+            class="btn btn-secondary rpe-btn data"
+            aria-pressed={selectedRpe === value}
+            aria-label="RPE {value}"
+            style="--rpe-color: {rpeColor(value)}"
+            onclick={() => (selectedRpe = selectedRpe === value ? null : value)}
+          >{value}</button>
+        {/each}
+      </div>
+      <div class="rpe-anchors" aria-hidden="true"><span>Easy</span><span>Max</span></div>
+    </div>
+
+    <label class="field">
+      <span class="field-label">Notes</span>
+      <textarea bind:value={notes} placeholder="How did it feel?" rows="3"></textarea>
+    </label>
+  </div>
+
+  {#snippet footer()}
+    {#if mode === 'edit' && onDelete}
+      <button type="button" class="btn btn-ghost btn-danger-text delete" onclick={handleDelete}>
+        {confirmingDelete ? 'Click again to delete' : 'Delete ride'}
+      </button>
+    {/if}
+    <button type="button" class="btn btn-secondary" onclick={() => (open = false)}>
+      {mode === 'post-ride' ? 'Done' : 'Cancel'}
+    </button>
+    <button type="button" class="btn btn-primary" onclick={handleSave}>
+      {mode === 'post-ride' ? 'Save details' : 'Save'}
+    </button>
+  {/snippet}
+</Dialog>
 
 <style>
-  .modal-dialog {
-    border: none;
-    background: transparent;
-    padding: 0;
-    max-width: none;
-    max-height: none;
-    overflow: visible;
-  }
-
-  .modal-dialog::backdrop {
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(4px);
-    animation: fade-in 150ms ease;
-  }
-
-  @keyframes fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  .modal {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-xl);
-    padding: var(--space-xl);
-    width: 480px;
-    max-width: 90vw;
-    max-height: 90vh;
-    overflow-y: auto;
-    box-shadow: var(--shadow-lg);
-    animation: slide-up 200ms ease;
-  }
-
-  @keyframes slide-up {
-    from { opacity: 0; transform: translateY(12px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-
-  .modal-header {
+  .summary {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--space-lg);
-  }
-
-  .modal-header h2 {
-    font-size: var(--text-lg);
-    font-weight: 700;
-    color: var(--text-primary);
-    margin: 0;
-  }
-
-  .close-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: none;
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .close-btn:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .session-summary {
-    display: flex;
-    align-items: center;
     flex-wrap: wrap;
-    gap: var(--space-sm);
-    padding: var(--space-md);
-    background: var(--bg-elevated);
-    border-radius: var(--radius-md);
-    margin-bottom: var(--space-xl);
-    font-size: var(--text-sm);
-    font-family: var(--font-data);
-    color: var(--text-secondary);
-  }
-
-  .summary-sep {
-    width: 3px;
-    height: 3px;
-    border-radius: 50%;
-    background: var(--text-faint);
-    flex-shrink: 0;
-  }
-
-  .form-group {
+    gap: var(--space-xs) var(--space-lg);
     margin-bottom: var(--space-lg);
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
   }
 
-  .form-label {
-    display: block;
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: var(--space-sm);
+  .form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-lg);
   }
 
-  .form-input, .form-textarea {
-    width: 100%;
-    padding: var(--space-sm) var(--space-md);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-input);
-    color: var(--text-primary);
-    font-size: var(--text-base);
-    font-family: var(--font-sans);
-    transition: border-color var(--transition-fast);
-    box-sizing: border-box;
-  }
-
-  .form-input:focus, .form-textarea:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent-soft);
-  }
-
-  .form-textarea {
-    resize: vertical;
-    min-height: 60px;
-  }
-
-  .type-grid {
+  .chips {
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-xs);
   }
 
-  .type-chip {
-    padding: var(--space-xs) var(--space-md);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    white-space: nowrap;
+  .chip {
+    font-weight: 500;
   }
 
-  .type-chip:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .type-chip.selected {
-    border-color: var(--accent);
-    background: var(--accent);
-    color: white;
-  }
-
-  .rpe-row {
-    display: flex;
-    gap: 4px;
+  .rpe {
+    display: grid;
+    grid-template-columns: repeat(10, minmax(36px, 1fr));
+    gap: var(--space-xs);
   }
 
   .rpe-btn {
-    flex: 1;
-    aspect-ratio: 1;
-    max-width: 40px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: var(--text-sm);
-    font-weight: 700;
-    font-family: var(--font-data);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    padding: 0;
   }
 
-  .rpe-btn:hover {
-    border-color: var(--rpe-color);
-    color: var(--rpe-color);
-    background: color-mix(in srgb, var(--rpe-color) 12%, transparent);
-  }
-
-  .rpe-btn.selected {
-    border-color: var(--rpe-color);
+  .rpe-btn[aria-pressed='true'] {
     background: var(--rpe-color);
-    color: white;
-    box-shadow: 0 0 8px color-mix(in srgb, var(--rpe-color) 40%, transparent);
+    border-color: var(--rpe-color);
+    color: #0f0f1a;
   }
 
-  .modal-actions {
+  .rpe-anchors {
     display: flex;
-    align-items: center;
     justify-content: space-between;
-    gap: var(--space-md);
-    padding-top: var(--space-lg);
-    border-top: 1px solid var(--border-subtle);
-    margin-top: var(--space-md);
-  }
-
-  .actions-right {
-    display: flex;
-    gap: var(--space-sm);
-    margin-left: auto;
-  }
-
-  .btn-primary {
-    padding: var(--space-sm) var(--space-xl);
-    border: none;
-    border-radius: var(--radius-md);
-    background: var(--accent);
-    color: white;
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .btn-primary:hover {
-    box-shadow: 0 0 12px var(--accent-glow);
-    filter: brightness(1.1);
-  }
-
-  .btn-secondary {
-    padding: var(--space-sm) var(--space-xl);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .btn-secondary:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .btn-delete {
-    padding: var(--space-sm) var(--space-md);
-    border: 1px solid rgba(244, 67, 54, 0.3);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--danger);
     font-size: var(--text-xs);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
+    color: var(--text-muted);
   }
 
-  .btn-delete:hover {
-    background: rgba(244, 67, 54, 0.1);
-    border-color: var(--danger);
+  .delete {
+    margin-right: auto;
   }
 </style>

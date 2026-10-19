@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import * as echarts from 'echarts';
-import { zoneMarkArea } from './liveChart';
+import { zoneMarkArea, visibleSeries } from './liveChart';
 
 describe('zoneMarkArea', () => {
   it('zone_mark_area_spans_band_bounds', () => {
@@ -31,5 +31,25 @@ describe('zoneMarkArea', () => {
     chart.setOption({ series: [{ markArea: zoneMarkArea(null) }] });
     expect(markAreaData()).toHaveLength(0);
     chart.dispose();
+  });
+});
+
+describe('visibleSeries', () => {
+  const all = { power: true, hr: true, cadence: true, speed: true, cmdPower: true };
+
+  it('lists only series that have data', () => {
+    expect(visibleSeries({ ...all, cadence: false, speed: false, cmdPower: false }, false)).toEqual(['Power', 'HR']);
+  });
+
+  it('hides Cmd Power when no zone ride is running, even if old data exists', () => {
+    expect(visibleSeries(all, false)).not.toContain('Cmd Power');
+  });
+
+  it('shows Cmd Power during a zone ride that has commanded data', () => {
+    expect(visibleSeries(all, true)).toEqual(['Power', 'HR', 'Cadence', 'Speed', 'Cmd Power']);
+  });
+
+  it('an empty chart has an empty legend', () => {
+    expect(visibleSeries({ power: false, hr: false, cadence: false, speed: false, cmdPower: false }, true)).toEqual([]);
   });
 });

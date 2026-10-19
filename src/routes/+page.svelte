@@ -7,6 +7,12 @@
   import ZoneRideBuilder from '$lib/components/ZoneRideBuilder.svelte';
   import ZoneRideStatus from '$lib/components/ZoneRideStatus.svelte';
   import ConnectionHealth from '$lib/components/ConnectionHealth.svelte';
+  import RideStage from '$lib/components/RideStage.svelte';
+  import SegmentedControl from '$lib/ui/SegmentedControl.svelte';
+  import IconButton from '$lib/ui/IconButton.svelte';
+  import Switch from '$lib/ui/Switch.svelte';
+  import Notice from '$lib/ui/Notice.svelte';
+  import { reconnectingDevices } from '$lib/stores/devices';
   import { currentPower, currentHR, currentCadence, currentSpeed, liveMetrics } from '$lib/stores/sensor';
   import { sessionActive, sessionPaused, dashboardView } from '$lib/stores/session';
   import { endSession, startSession, postRideSession, lifecycleError } from '$lib/stores/sessionLifecycle';
@@ -18,7 +24,7 @@
   import { api, extractError, type SessionConfig, type ZoneTarget } from '$lib/tauri';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import { formatDuration } from '$lib/utils/format';
-  import { toggleFullscreen } from '$lib/stores/fullscreen';
+  import { toggleFullscreen, fullscreen, fullscreenShortcut } from '$lib/stores/fullscreen';
 
   let error = $state('');
   /** Zone-ride notice the user dismissed (the result itself is kept until saved). */
@@ -26,6 +32,25 @@
   let zoneNotice = $derived($zoneRideResult && $zoneRideResult !== dismissedZoneResult ? $zoneRideResult : null);
   let showZoneBuilder = $state(false);
   let userConfig = $state<SessionConfig | null>(null);
+  let configError = $state('');
+  let pageWidth = $state(0);
+
+  const VIEWS = [
+    { value: 'gauges', label: 'Gauges' },
+    { value: 'graphs', label: 'Graphs' },
+    { value: 'retro', label: 'Retro' },
+  ] as const;
+
+  // One notice at a time, most important first; lower ones show once it clears.
+  let notice = $derived.by(() => {
+    if ($lifecycleError) return 'lifecycle';
+    if (error) return 'page';
+    if ($trainerError) return 'trainer';
+    if (Object.keys($reconnectingDevices).length > 0) return 'health';
+    if (configError) return 'config';
+    if (zoneNotice) return 'zone';
+    return null;
+  });
 
   let zoneBand = $derived.by(() => {
     const s = $zoneStatus;
@@ -33,9 +58,17 @@
     return { lower: s.lower_bound, upper: s.upper_bound };
   });
 
-  // Load user config for zone builder
+  // Load user config for zone bounds and the gauge's FTP
+  async function loadConfig() {
+    try {
+      userConfig = await api.getUserConfig();
+      configError = '';
+    } catch (e) {
+      configError = extractError(e);
+    }
+  }
   $effect(() => {
-    api.getUserConfig().then((c) => { userConfig = c; }).catch(() => {});
+    loadConfig();
   });
 
   async function toggleSession() {
@@ -90,184 +123,147 @@
   }
 </script>
 
-<div class="dashboard">
-  {#if error}
-    <div class="error-banner">{error}</div>
-  {/if}
-
-  <div class="dash-header">
-    <div class="view-toggle">
-      <button class="toggle-tab" class:active={$dashboardView === 'gauges'} onclick={() => $dashboardView = 'gauges'}>
-        Gauges
-      </button>
-      <button class="toggle-tab" class:active={$dashboardView === 'graphs'} onclick={() => $dashboardView = 'graphs'}>
-        Graphs
-      </button>
-      <button class="toggle-tab" class:active={$dashboardView === 'retro'} onclick={() => $dashboardView = 'retro'}>
-        Retro
-      </button>
-    </div>
-    <button class="fullscreen-btn" onclick={toggleFullscreen} aria-label="Toggle fullscreen (Esc)">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<div class="ride" data-page="ride" bind:clientWidth={pageWidth}>
+  <div class="ride-header">
+    <SegmentedControl size="lg" label="Dashboard view" options={VIEWS} bind:value={$dashboardView} />
+    {#if $autoSessionCountdown != null && !$sessionActive}
+      <span class="countdown" role="status">Starting in {$autoSessionCountdown}…</span>
+    {/if}
+    <IconButton
+      label={$fullscreen ? `Exit fullscreen (Esc)` : `Enter fullscreen (${fullscreenShortcut()})`}
+      size="lg"
+      variant="secondary"
+      tooltipSide="left"
+      onclick={toggleFullscreen}
+    >
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <polyline points="15 3 21 3 21 9"/>
         <polyline points="9 21 3 21 3 15"/>
         <line x1="21" y1="3" x2="14" y2="10"/>
         <line x1="3" y1="21" x2="10" y2="14"/>
       </svg>
-    </button>
+    </IconButton>
   </div>
 
-  <div class="dash-main">
-    {#if $dashboardView === 'gauges'}
-      <div class="gauge-section">
-        <PowerGauge power={$currentPower} ftp={userConfig?.ftp} />
-      </div>
+  <RideStage>
+    {#snippet children(layout)}
+      {#if $dashboardView === 'gauges'}
+        <div class="gauges gauges-{layout.mode}" class:no-strip={!layout.showSecondary}>
+          <div class="gauge-cell">
+            <PowerGauge power={$currentPower} ftp={userConfig?.ftp} />
+          </div>
+          <div class="primary-grid">
+            <MetricCard label="Heart Rate" kind="primary" size="stage" value={$currentHR} unit="bpm" accent="var(--danger-text)" />
+            <MetricCard label="Cadence" kind="primary" size="stage" value={$currentCadence != null ? Math.round($currentCadence) : null} unit="rpm" />
+            <MetricCard label="Speed" kind="primary" size="stage" value={$currentSpeed != null ? formatSpeed($currentSpeed, $unitSystem) : null} unit={$speedUnit} />
+            <MetricCard label="Time" kind="primary" size="stage" value={$liveMetrics ? formatDuration($liveMetrics.elapsed_secs) : null} />
+          </div>
+          {#if layout.showSecondary}
+            <div class="secondary-strip">
+              <MetricCard label="3s Power" kind="secondary" size="stage-sm" value={$liveMetrics?.avg_power_3s != null ? Math.round($liveMetrics.avg_power_3s) : null} unit="W" />
+              <MetricCard label="NP" kind="secondary" size="stage-sm" value={$liveMetrics?.normalized_power != null ? Math.round($liveMetrics.normalized_power) : null} unit="W" />
+              <MetricCard label="TSS" kind="secondary" size="stage-sm" value={$liveMetrics?.tss != null ? $liveMetrics.tss.toFixed(1) : null} />
+              <MetricCard label="IF" kind="secondary" size="stage-sm" value={$liveMetrics?.intensity_factor != null ? $liveMetrics.intensity_factor.toFixed(2) : null} />
+            </div>
+          {/if}
+        </div>
+      {:else if $dashboardView === 'graphs'}
+        <div class="graphs">
+          <MetricsChart {zoneBand} />
+        </div>
+      {:else if $dashboardView === 'retro'}
+        <div class="retro">
+          <RetroRide />
+        </div>
+      {/if}
+    {/snippet}
+  </RideStage>
 
-      <div class="metrics-grid">
-        <MetricCard label="Heart Rate" value={$currentHR} unit="bpm" accent="var(--danger)" size="lg" />
-        <MetricCard label="Cadence" value={$currentCadence != null ? Math.round($currentCadence) : null} unit="rpm" size="lg" />
-        <MetricCard label="Speed" value={$currentSpeed != null ? formatSpeed($currentSpeed, $unitSystem) : null} unit={$speedUnit} size="lg" />
-        <MetricCard
-          label="Time"
-          value={$liveMetrics ? formatDuration($liveMetrics.elapsed_secs) : '--'}
-          size="lg"
-        />
-      </div>
-    {:else if $dashboardView === 'graphs'}
-      <div class="chart-section">
-        <MetricsChart {zoneBand} />
-      </div>
-    {:else if $dashboardView === 'retro'}
-      <div class="retro-section">
-        <RetroRide />
-      </div>
+  <section class="controls" class:merged={pageWidth >= 1100} aria-label="Ride controls">
+    {#if notice === 'lifecycle'}
+      <Notice tone="error" ondismiss={() => lifecycleError.set('')}>{$lifecycleError}</Notice>
+    {:else if notice === 'page'}
+      <Notice tone="error" ondismiss={() => (error = '')}>{error}</Notice>
+    {:else if notice === 'trainer'}
+      <Notice tone="error" title="Trainer command failed" ondismiss={() => trainerError.set('')}>{$trainerError}</Notice>
+    {:else if notice === 'health'}
+      <ConnectionHealth />
+    {:else if notice === 'config'}
+      <Notice tone="warning" title="Couldn't load your settings" ondismiss={() => (configError = '')}>
+        Zones and the power dial use defaults (FTP 200 W).
+        {#snippet actions()}
+          <button type="button" class="btn btn-secondary" onclick={loadConfig}>Retry</button>
+        {/snippet}
+      </Notice>
+    {:else if notice === 'zone' && zoneNotice}
+      <Notice tone={zoneNotice.error != null ? 'error' : 'success'} title={describeZoneStop(zoneNotice)} ondismiss={() => { dismissedZoneResult = zoneNotice; }}>
+        {formatDuration(zoneNotice.config.time_in_zone_secs)} in zone.{#if zoneNotice.error} {zoneNotice.error}{/if}
+      </Notice>
     {/if}
-  </div>
 
-  <div class="dash-secondary">
-    <MetricCard
-      label="3s Power"
-      value={$liveMetrics?.avg_power_3s != null ? Math.round($liveMetrics.avg_power_3s) : null}
-      unit="W"
-      size="sm"
-    />
-    <MetricCard
-      label="NP"
-      value={$liveMetrics?.normalized_power != null ? Math.round($liveMetrics.normalized_power) : null}
-      unit="W"
-      size="sm"
-    />
-    <MetricCard
-      label="TSS"
-      value={$liveMetrics?.tss != null ? $liveMetrics.tss.toFixed(1) : null}
-      size="sm"
-    />
-    <MetricCard
-      label="IF"
-      value={$liveMetrics?.intensity_factor != null ? $liveMetrics.intensity_factor.toFixed(2) : null}
-      size="sm"
-    />
-  </div>
-
-  <ConnectionHealth />
-
-  <div class="dash-controls">
-    <!-- Session controls -->
-    <div class="session-row">
-      <div class="session-btn-wrap">
-        {#if $autoSessionCountdown != null && !$sessionActive}
-          <span class="countdown-badge">Starting in {$autoSessionCountdown}...</span>
-        {/if}
+    <div class="control-rows">
+      <div class="row row-session">
         <button
-          class="btn-session"
-          class:stop={$sessionActive}
+          type="button"
+          class="btn btn-lg session-btn {$sessionActive ? 'btn-danger' : 'btn-success'}"
+          data-ride-control
           onclick={toggleSession}
         >
           {#if $sessionActive}
-            <span class="btn-icon">&#x25A0;</span> Stop
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>
+            Stop
           {:else}
-            <span class="btn-icon">&#x25B6;</span> Start
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M7 4v16l13-8z" fill="currentColor"/></svg>
+            Start
           {/if}
         </button>
-      </div>
-      {#if $sessionActive}
-        <button class="btn-pause" onclick={togglePause}>
-          {#if $sessionPaused}
-            <span class="btn-icon">&#x25B6;</span> Resume
-          {:else}
-            <span class="btn-icon">&#x23F8;</span> Pause
-          {/if}
-        </button>
-      {/if}
-      <label class="auto-toggle">
-        <input type="checkbox" bind:checked={$autoSessionEnabled} />
-        <span class="auto-toggle-label">Auto</span>
-      </label>
-      {#if $zoneActive}
-        <span class="zone-active-badge">
-          <span class="zone-active-dot"></span>
-          Zone Ride
-        </span>
-      {/if}
-    </div>
-
-    {#if $lifecycleError}
-      <div class="inline-notice error" role="alert">
-        <span>{$lifecycleError}</span>
-        <button class="notice-dismiss" onclick={() => lifecycleError.set('')} aria-label="Dismiss">&times;</button>
-      </div>
-    {/if}
-    {#if zoneNotice}
-      <div class="inline-notice" class:error={zoneNotice.error != null} role="status">
-        <span>
-          {describeZoneStop(zoneNotice)}
-          &middot; {formatDuration(zoneNotice.config.time_in_zone_secs)} in zone
-          {#if zoneNotice.error}<br />{zoneNotice.error}{/if}
-        </span>
-        <button class="notice-dismiss" onclick={() => { dismissedZoneResult = zoneNotice; }} aria-label="Dismiss">&times;</button>
-      </div>
-    {/if}
-
-    <!-- Trainer controls -->
-    {#if $trainerConnected}
-      {#if $zoneActive}
-        <ZoneRideStatus onStop={handleStopZoneRide} />
-      {:else}
-        <div class="trainer-row">
-          <TrainerControl />
-          <button
-            class="btn-zone-toggle"
-            class:active={showZoneBuilder}
-            onclick={() => { showZoneBuilder = !showZoneBuilder; }}
-            aria-label="Toggle zone ride panel"
-          >
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-            Zone
+        {#if $sessionActive}
+          <button type="button" class="btn btn-lg btn-secondary" data-ride-control onclick={togglePause}>
+            {#if $sessionPaused}
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M7 4v16l13-8z" fill="currentColor"/></svg>
+              Resume
+            {:else}
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"/></svg>
+              Pause
+            {/if}
           </button>
-        </div>
-        {#if showZoneBuilder && userConfig}
-          <ZoneRideBuilder
-            config={userConfig}
-            trainerConnected={$trainerConnected}
-            onStart={handleStartZoneRide}
-            onClose={() => { showZoneBuilder = false; }}
-          />
         {/if}
-      {/if}
-    {/if}
-  </div>
+        <Switch size="lg" label="Auto start/stop" bind:checked={$autoSessionEnabled} data-ride-control title="Start when you begin pedalling and stop after you stop" />
+      </div>
 
-  {#if $trainerError}
-    <div class="trainer-error">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="10"/>
-        <line x1="12" y1="8" x2="12" y2="12"/>
-        <line x1="12" y1="16" x2="12.01" y2="16"/>
-      </svg>
-      <span>{$trainerError}</span>
+      {#if $trainerConnected}
+        <div class="row row-trainer">
+          {#if $zoneActive}
+            <ZoneRideStatus onStop={handleStopZoneRide} />
+          {:else}
+            <TrainerControl />
+            <button
+              type="button"
+              class="btn btn-lg btn-secondary"
+              data-ride-control
+              disabled={!userConfig}
+              title={userConfig ? undefined : 'Zone rides need your settings to load'}
+              onclick={() => { showZoneBuilder = true; }}
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+              Zone ride
+            </button>
+          {/if}
+        </div>
+      {/if}
     </div>
-  {/if}
+  </section>
 </div>
+
+{#if userConfig}
+  <ZoneRideBuilder
+    bind:open={showZoneBuilder}
+    config={userConfig}
+    trainerConnected={$trainerConnected}
+    onStart={handleStartZoneRide}
+    onClose={() => { showZoneBuilder = false; }}
+  />
+{/if}
 
 {#if $postRideSession}
   <ActivityModal
@@ -288,356 +284,148 @@
 {/if}
 
 <style>
-  .dashboard {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-md);
-    padding-bottom: var(--space-xl);
-  }
-
-  .dash-header {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-md);
-  }
-
-  .view-toggle {
-    display: flex;
-    gap: 2px;
-    background: var(--bg-body);
-    border-radius: var(--radius-md);
-    padding: 3px;
-    width: fit-content;
-  }
-
-  .toggle-tab {
+  .ride {
     flex: 1;
-    padding: var(--space-sm) var(--space-md);
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    border-radius: 6px;
-    transition: all var(--transition-fast);
-  }
-
-  .toggle-tab:hover {
-    color: var(--text-secondary);
-  }
-
-  .toggle-tab.active {
-    background: var(--bg-elevated);
-    color: var(--accent);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .fullscreen-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 32px;
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    position: relative;
-  }
-
-  .fullscreen-btn:hover {
-    color: var(--text-primary);
-    border-color: var(--border-default);
-    background: var(--bg-hover);
-  }
-
-  .gauge-section {
-    height: clamp(240px, 40vh, 500px);
-    position: relative;
-  }
-
-  .chart-section {
-    height: clamp(240px, 40vh, 500px);
-    position: relative;
-  }
-
-  .retro-section {
-    position: relative;
-  }
-
-  .metrics-grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: var(--space-md);
-  }
-
-  .dash-secondary {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: var(--space-sm);
-    opacity: 0.85;
-  }
-
-  @media (min-width: 640px) {
-    .metrics-grid {
-      grid-template-columns: repeat(4, 1fr);
-    }
-    .dash-secondary {
-      grid-template-columns: repeat(4, 1fr);
-    }
-  }
-
-  .dash-controls {
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    gap: 0;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    overflow: hidden;
-  }
-
-  .session-row {
-    display: flex;
-    align-items: center;
-    justify-content: center;
     gap: var(--space-md);
-    flex-wrap: wrap;
-    padding: var(--space-md) var(--space-lg);
   }
 
-  .trainer-row {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-md);
-    flex-wrap: wrap;
-    padding: var(--space-sm) var(--space-lg);
-    border-top: 1px solid var(--border-subtle);
-    background: var(--bg-elevated);
-  }
-
-  .btn-session {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-md) var(--space-2xl);
-    border: none;
-    border-radius: var(--radius-lg);
-    font-size: var(--text-lg);
-    font-weight: 600;
-    cursor: pointer;
-    background: var(--success);
-    color: white;
-    transition: all var(--transition-fast);
-    box-shadow: 0 2px 8px var(--success-glow);
-  }
-
-  .btn-session:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px var(--success-glow);
-  }
-
-  .btn-session:active {
-    transform: translateY(0);
-  }
-
-  .btn-session.stop {
-    background: var(--danger);
-    box-shadow: 0 2px 8px rgba(244, 67, 54, 0.3);
-  }
-
-  .btn-session.stop:hover {
-    box-shadow: 0 4px 12px rgba(244, 67, 54, 0.4);
-  }
-
-  .btn-pause {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-md) var(--space-xl);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-lg);
-    font-size: var(--text-lg);
-    font-weight: 600;
-    cursor: pointer;
-    background: var(--bg-elevated);
-    color: var(--text-primary);
-    transition: all var(--transition-fast);
-  }
-
-  .btn-pause:hover {
-    border-color: var(--text-muted);
-    background: var(--bg-hover);
-  }
-
-  .btn-icon {
-    font-size: 0.8em;
-  }
-
-  .session-btn-wrap {
-    position: relative;
-    display: inline-flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--space-xs);
-  }
-
-  .countdown-badge {
-    font-size: var(--text-sm);
-    font-weight: 600;
-    color: var(--accent);
-    animation: pulse 1s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-  }
-
-  .auto-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-xs);
-    cursor: pointer;
-    user-select: none;
-    padding: var(--space-sm) var(--space-md);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    background: var(--bg-elevated);
-    transition: all var(--transition-fast);
-  }
-
-  .auto-toggle:hover {
-    border-color: var(--border-strong);
-  }
-
-  .auto-toggle input[type="checkbox"] {
-    accent-color: var(--accent);
-    width: 16px;
-    height: 16px;
-    cursor: pointer;
-  }
-
-  .auto-toggle-label {
-    font-size: var(--text-sm);
-    font-weight: 600;
-    color: var(--text-secondary);
-  }
-
-  .zone-active-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: var(--space-xs) var(--space-md);
-    border: 1px solid var(--accent);
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--accent);
-    font-size: var(--text-xs);
-    font-weight: 700;
-    letter-spacing: 0.03em;
-    animation: slide-up 200ms ease;
-  }
-
-  .zone-active-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--accent);
-    animation: pulse 2s ease-in-out infinite;
-  }
-
-  .btn-zone-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: var(--space-xs) var(--space-md);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-body);
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
-    font-weight: 700;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    letter-spacing: 0.04em;
-  }
-
-  .btn-zone-toggle:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .btn-zone-toggle.active {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .btn-zone-toggle svg {
-    opacity: 0.7;
-  }
-
-  .inline-notice {
+  .ride-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: var(--space-sm);
-    padding: var(--space-sm) var(--space-lg);
-    border-top: 1px solid var(--border-subtle);
-    background: var(--accent-soft);
-    color: var(--accent);
+    gap: var(--space-md);
+    min-height: var(--control-h-lg);
+  }
+
+  .countdown {
+    padding: 6px 14px;
+    border-radius: var(--radius-full);
+    background: rgba(76, 175, 80, 0.12);
+    border: 1px solid rgba(76, 175, 80, 0.4);
+    color: var(--text-primary);
+    font-weight: 600;
     font-size: var(--text-sm);
-    animation: slide-up 150ms ease;
   }
 
-  .inline-notice.error {
-    background: rgba(244, 67, 54, 0.08);
-    color: var(--danger);
+  /* ── Gauges view ── */
+  .gauges {
+    height: 100%;
+    display: grid;
+    gap: 8px 12px;
   }
 
-  .notice-dismiss {
-    flex-shrink: 0;
-    border: none;
-    background: transparent;
-    color: inherit;
-    font-size: var(--text-lg);
-    line-height: 1;
-    cursor: pointer;
-    opacity: 0.7;
+  .gauges-wide {
+    grid-template-columns: 1fr 1.5fr;
+    grid-template-rows: 1fr var(--strip-px);
+    grid-template-areas: 'gauge primary' 'strip strip';
   }
 
-  .notice-dismiss:hover {
-    opacity: 1;
+  .gauges-stacked {
+    grid-template-columns: 1fr;
+    grid-template-rows: 0.45fr 0.55fr var(--strip-px);
+    grid-template-areas: 'gauge' 'primary' 'strip';
   }
 
-  .trainer-error {
+  .gauges-wide.no-strip {
+    grid-template-rows: 1fr;
+    grid-template-areas: 'gauge primary';
+  }
+
+  .gauges-stacked.no-strip {
+    grid-template-rows: 0.45fr 0.55fr;
+    grid-template-areas: 'gauge' 'primary';
+  }
+
+  .gauge-cell {
+    grid-area: gauge;
+    min-height: 0;
     display: flex;
     align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-sm) var(--space-md);
-    background: rgba(244, 67, 54, 0.08);
-    border: 1px solid rgba(244, 67, 54, 0.2);
-    border-radius: var(--radius-md);
-    color: var(--danger);
-    font-size: var(--text-sm);
-    animation: slide-up 150ms ease;
+    justify-content: center;
+    border-radius: var(--radius-lg);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
   }
 
-  .trainer-error svg {
+  .primary-grid {
+    grid-area: primary;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .secondary-strip {
+    grid-area: strip;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+  }
+
+  /* ── Graphs / Retro ── */
+  .graphs {
+    position: relative;
+    height: 100%;
+  }
+
+  .retro {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ── Control bar: never scrolls away ── */
+  .controls {
     flex-shrink: 0;
-    opacity: 0.7;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: var(--space-md);
+    border-radius: var(--radius-lg);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
   }
 
-  .trainer-error span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .control-rows {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+  }
+
+  .controls.merged .control-rows {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-xl);
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-sm) var(--space-md);
+  }
+
+  .row-trainer {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .controls.merged .row-trainer {
+    justify-content: flex-end;
+  }
+
+  .row-trainer :global(.zone-status) {
+    flex: 1;
+  }
+
+  .session-btn {
+    min-width: 140px;
   }
 </style>

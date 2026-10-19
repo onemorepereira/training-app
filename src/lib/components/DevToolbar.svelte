@@ -50,7 +50,8 @@
   .dev-toolbar {
     position: fixed;
     top: 6px;
-    right: 6px;
+    left: 50%;
+    transform: translateX(-50%);
     display: flex;
     align-items: center;
     gap: 6px;

@@ -57,6 +57,8 @@
 <style>
   .segmented {
     display: inline-flex;
+    width: fit-content;
+    max-width: 100%;
     gap: 2px;
     padding: 2px;
     border: 1px solid var(--border-default);

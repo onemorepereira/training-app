@@ -4,7 +4,8 @@
   import { metricHistory } from '$lib/stores/sensor';
   import { get } from 'svelte/store';
   import { unitSystem, kmhToMph, speedUnit } from '$lib/stores/units';
-  import { zoneMarkArea } from '$lib/utils/liveChart';
+  import { zoneMarkArea, visibleSeries } from '$lib/utils/liveChart';
+  import { SERIES, withAlpha, axisLabel, axisNameStyle, splitLine, axisLine, legendDefaults, tooltipDefaults } from '$lib/charts/theme';
 
   let {
     zoneBand = null,
@@ -17,12 +18,13 @@
   let chartEl: HTMLDivElement;
   let chart = $state<echarts.ECharts | null>(null);
 
-  const COLORS = {
-    power: '#ff4d6d',
-    hr: '#ffa726',
-    cadence: '#64b5f6',
-    speed: '#4caf50',
-  };
+  const COLORS = SERIES;
+  const fade = (c: string, a: number) =>
+    new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+      { offset: 0, color: withAlpha(c, a) },
+      { offset: 1, color: withAlpha(c, 0) },
+    ]);
+  let legendKey = '';
 
   function formatRelativeTime(ts: number, now: number): string {
     const secsAgo = Math.round((now - ts) / 1000);
@@ -36,52 +38,41 @@
       backgroundColor: 'transparent',
       animation: false,
       grid: {
-        left: 50,
-        right: 50,
-        top: 40,
-        bottom: 30,
+        left: 56,
+        right: 56,
+        top: 48,
+        bottom: 32,
       },
-      legend: {
-        top: 4,
-        textStyle: { color: '#a0a0b8', fontSize: 12, fontFamily: 'Outfit, sans-serif' },
-        itemWidth: 16,
-        itemHeight: 2,
-        itemGap: 16,
-      },
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: '#1c1c30',
-        borderColor: 'rgba(255,255,255,0.08)',
-        textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
-      },
+      legend: legendDefaults({ top: 4, itemHeight: 3, data: [] }),
+      tooltip: tooltipDefaults({ trigger: 'axis' }),
       xAxis: {
         type: 'category',
         boundaryGap: false,
-        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
+        axisLine: axisLine(),
         axisTick: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10 },
+        axisLabel: axisLabel(),
         data: [],
       },
       yAxis: [
         {
           type: 'value',
           name: 'W / bpm',
-          nameTextStyle: { color: '#70708a', fontSize: 10 },
+          nameTextStyle: axisNameStyle(),
           min: 0,
           max: 500,
-          splitLine: { lineStyle: { color: 'rgba(255,255,255,0.04)' } },
+          splitLine: splitLine(),
           axisLine: { show: false },
-          axisLabel: { color: '#70708a', fontSize: 10 },
+          axisLabel: axisLabel(),
         },
         {
           type: 'value',
           name: `rpm / ${get(unitSystem) === 'imperial' ? 'mph' : 'km/h'}`,
-          nameTextStyle: { color: '#70708a', fontSize: 10 },
+          nameTextStyle: axisNameStyle(),
           min: 0,
           max: 150,
           splitLine: { show: false },
           axisLine: { show: false },
-          axisLabel: { color: '#70708a', fontSize: 10 },
+          axisLabel: axisLabel(),
         },
       ],
       series: [
@@ -93,12 +84,7 @@
           symbol: 'none',
           lineStyle: { color: COLORS.power, width: 2 },
           itemStyle: { color: COLORS.power },
-          areaStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(255, 77, 109, 0.25)' },
-              { offset: 1, color: 'rgba(255, 77, 109, 0)' },
-            ]),
-          },
+          areaStyle: { color: fade(COLORS.power, 0.25) },
           data: [],
         },
         {
@@ -109,12 +95,7 @@
           symbol: 'none',
           lineStyle: { color: COLORS.hr, width: 1.5 },
           itemStyle: { color: COLORS.hr },
-          areaStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(255, 167, 38, 0.15)' },
-              { offset: 1, color: 'rgba(255, 167, 38, 0)' },
-            ]),
-          },
+          areaStyle: { color: fade(COLORS.hr, 0.15) },
           data: [],
         },
         {
@@ -125,12 +106,7 @@
           symbol: 'none',
           lineStyle: { color: COLORS.cadence, width: 1.5 },
           itemStyle: { color: COLORS.cadence },
-          areaStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(100, 181, 246, 0.12)' },
-              { offset: 1, color: 'rgba(100, 181, 246, 0)' },
-            ]),
-          },
+          areaStyle: { color: fade(COLORS.cadence, 0.12) },
           data: [],
         },
         {
@@ -141,12 +117,7 @@
           symbol: 'none',
           lineStyle: { color: COLORS.speed, width: 1.5 },
           itemStyle: { color: COLORS.speed },
-          areaStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(76, 175, 80, 0.12)' },
-              { offset: 1, color: 'rgba(76, 175, 80, 0)' },
-            ]),
-          },
+          areaStyle: { color: fade(COLORS.speed, 0.12) },
           data: [],
         },
         {
@@ -155,8 +126,8 @@
           yAxisIndex: 0,
           smooth: false,
           symbol: 'none',
-          lineStyle: { color: '#ff9800', width: 2, type: 'dashed' },
-          itemStyle: { color: '#ff9800' },
+          lineStyle: { color: COLORS.cmdPower, width: 2, type: 'dashed' },
+          itemStyle: { color: COLORS.cmdPower },
           data: [],
         },
       ],
@@ -222,6 +193,24 @@
     const cmdData = commandedPowerSeries && commandedPowerSeries.length > 0
       ? commandedPowerSeries
       : history.map(() => null);
+
+    // Legend lists only series with data; touch it only when that set changes.
+    const has = (vals: (number | null)[]) => vals.some((v) => v != null);
+    const legend = visibleSeries(
+      {
+        power: has(history.map((e) => e.power)),
+        hr: has(history.map((e) => e.hr)),
+        cadence: has(history.map((e) => e.cadence)),
+        speed: has(speedData),
+        cmdPower: has(cmdData),
+      },
+      zoneBand != null,
+    );
+    const key = legend.join('|');
+    if (key !== legendKey) {
+      legendKey = key;
+      chart.setOption({ legend: { data: legend } });
+    }
 
     chart.setOption({
       xAxis: {
