@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import * as echarts from 'echarts';
   import type { TimeseriesPoint } from '$lib/tauri';
+  import { hrZoneForBpm } from '$lib/utils/zones';
 
   interface Props {
     timeseries: TimeseriesPoint[];
@@ -18,11 +19,7 @@
 
   function zoneColor(bpm: number): string {
     if (!hrZones) return ZONE_COLORS[0];
-    if (bpm < hrZones[0]) return ZONE_COLORS[0]; // Z1
-    if (bpm < hrZones[1]) return ZONE_COLORS[1]; // Z2
-    if (bpm < hrZones[2]) return ZONE_COLORS[2]; // Z3
-    if (bpm < hrZones[3]) return ZONE_COLORS[3]; // Z4
-    return ZONE_COLORS[4]; // Z5
+    return ZONE_COLORS[hrZoneForBpm(bpm, hrZones) - 1];
   }
 
   let histogram = $derived.by(() => {
