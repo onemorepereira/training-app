@@ -1,5 +1,5 @@
 # Zone control & trainer safety — Design
-**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 2, after design review 1)   **Status:** Approved (building)
+**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 3, built)   **Status:** Current
 
 ## Overview
 
@@ -528,6 +528,21 @@ These fold in the spec owner's rulings on the reviewer's non-blocking questions 
 
 **Serde names are fixed:** `SessionStopped`, `AppClosing`, `ControllerFault`, `TrainerUnresponsive` (Area D depends on them).
 
+### Build notes (ADR-23): how the implementation differs from the plan
+Recorded during Phase 2. Nothing here changes a ruling.
+
+1. **Slices 4–7 landed as one commit** (`a22c390`). The sink, the generation-scoped lifecycle, the reconcile/freeze logic, pause and the lifecycle hooks share one control loop and one `ZoneController` API, so they could not be committed separately with each step compiling and tested on its own. Each behaviour still has its own tests.
+2. **Sink shape.** The design's `TrainerSink` trait became a raw `TrainerBackend` trait (`is_connected`, `send`) plus a concrete `SerializedSink<B>`, which owns the command mutex, timeout, generation fence and `release()`.
+   - `FakeTrainer` implements `TrainerBackend`, so every controller test runs through the real serialization and fence code.
+   - `ZoneController<B = DeviceManagerBackend>` is generic over the backend.
+3. **Constant type.** `config::MAX_TRAINER_WATTS` is `u16` (2000), and `clamp_trainer_watts(i32) -> i16` does the clamp. The `manager.rs` line is exactly as in ADR-5.
+4. **A panic in a command task is re-raised in the control task** (`resume_unwind`). A backend panic therefore ends the run as `ControllerFault`, which is what AC4 requires.
+5. **The initial target is sent by the control task as its first step,** not by `start()`. It is supervised, fenced and cancellable like every other command. `start()` returns before the initial command is delivered.
+6. **Resume does not send immediately.** The next tick re-sends the target: ≤ 1 s in power mode, ≤ 5 s in HR mode, where it ramps from 0 W per ADR-14. Resume also restarts the HR and power sensor-lost timers, so a quiet pause doesn't trip "sensor lost" right after resuming.
+7. **The main `select!` is `biased`:** control messages first, then readings, then ticks. Stop and pause are therefore applied before a tick that is due at the same instant.
+8. **An HR sensor silent for 15–30 s ("holding power") also freezes the PID,** like the other no-delivery conditions.
+9. **`stop_zone_control` returns `None`** when no run ever existed, as specified in Data and contracts.
+
 ## Failure modes
 
 | Failure | Detection | Behavior | Recovery |
@@ -621,3 +636,35 @@ Each slice is one commit with its tests (failing test first). The riskiest work 
 6. **Pause.** "Released" as the paused target with retry, immediate reconcile on Pause and Resume, `last_tick_at` on every tick, dt cap. Covers AC8 and AC6 pause.
 7. **Lifecycle hooks.** `lifecycle.rs` functions plus tests, then the one-line calls in `stop_session`/`pause_session`/`resume_session`, `CloseRequested` and `RunEvent::ExitRequested`. Finish with the manual check in `tauri dev` with the simulator. Covers the AC6 wiring.
 8. **Final.** Full `cargo test` and `npm run check`; `design.md` Status: Current with a Verification section; `spec.md` Status: Built.
+
+## Verification
+- **Rust:** `cd src-tauri && cargo test`: 347 passed (289 at baseline; 85 in `session::zone_control`, plus config and commands tests). The zone-control suite was run 6 times in a row with the same result. `cargo check --features production` is clean.
+- **Frontend:** `npm test` (71 passed) and `npm run check` (0 errors, 0 warnings); no frontend files changed.
+
+**"Fails before" evidence:**
+- AC1: the plant harness was first run against the old controller and failed (peak smoothed HR 158 > 140 on the reference plant; 147 on the grid).
+- Mutation checks on the final code:
+  - Disabling the safety-cut counter fails both `undelivered_*` tests.
+  - Removing the PID re-seed fails both ramp tests.
+  - Making `stop()` return without waiting for finalize fails 8 lifecycle and race tests.
+- The other new tests target APIs or behaviour that did not exist before: validation, band function, generations, release, pause release. They are written against the specified contract.
+
+| AC | Test(s) | Location |
+|---|---|---|
+| AC1 | `hr_plant_20bpm_below_settles_without_overshoot_or_oscillation`, `hr_plant_grid_settles_across_lag_and_delay`, `hr_pid_zero_error_stable_hr_holds_power`, `hr_pid_integral_frozen_while_at_band_ceiling`, `hr_pid_integral_frozen_while_rate_limited`, `hr_pid_integral_unwinds_when_error_reverses_at_ceiling`, `hr_pid_first_tick_reference_value`, `pid_state_unchanged_during_override`, `hr_ceiling_override_30s_first_post_override_command_at_most_delivered_plus_max_up`, `hr_mode_after_cadence_zero_ramps_up_from_zero`, `output_below_band_ramps_into_band_under_rate_limit` | `pid.rs`, `controller.rs` |
+| AC2 | `custom_hr_zone_band_is_min_to_150pct_ftp`, `custom_hr_zone_without_ftp_caps_at_400`, `custom_hr_150_160_commands_above_55pct_ftp` | `controller.rs` |
+| AC3 | `power_zone_8_rejected`, `power_zone_7_accepted`, `hr_zone_6_rejected`, `zone_0_custom_accepted`, `lower_equal_upper_rejected`, `power_bound_above_2000_rejected`, `hr_bound_above_250_rejected`, `midpoint_of_max_bounds_does_not_overflow`, `hr_band_floor_never_exceeds_ceiling_for_any_ftp`, `initial_power_with_tiny_ftp_does_not_panic`, `initial_power_estimate_clamped_into_hr_band`, `ftp_below_50_rejected`, `ftp_above_1000_rejected`, `non_increasing_hr_zones_rejected` (regression; already rejected before), `hr_zone_above_250_rejected`, `zero_power_zone_percentage_rejected` | `types.rs`, `controller.rs`, `commands.rs` |
+| AC4 | `control_task_panic_reports_controller_fault_and_releases_trainer`, `finalize_panic_reports_controller_fault_to_stop`, `self_stop_on_duration_complete_releases_trainer` | `controller.rs` |
+| AC5 | `power_mode_restores_target_within_2_ticks_after_cadence_returns`, `target_resent_within_2_ticks_after_trainer_reconnect`, `trainer_lost_without_override_waits_30s` | `controller.rs` |
+| AC6 | `release_sends_zero_watts_before_resistance_zero`, `release_delivered_iff_zero_watts_ok`, `release_not_confirmed_when_zero_watts_fails_even_if_resistance_ok`, `release_respects_budget_when_trainer_hangs` (`trainer.rs`); `stop_releases_trainer_with_zero_watts_then_resistance`, `stop_when_inactive_is_noop`, `second_stop_after_finish_returns_first_reason_without_commands`, `sensor_lost_stop_releases_trainer`, `pause_releases_trainer_and_resume_resends_target`, `failed_pause_release_is_retried_next_tick`, `paused_trainer_lost_30s_stops_trainer_disconnected`, `paused_with_cadence_zero_sends_release_and_never_trainer_unresponsive`, `undelivered_cadence_cut_for_3_ticks_stops_trainer_unresponsive`, `undelivered_hr_ceiling_cut_for_3_ticks_stops_trainer_unresponsive`, `hr_ceiling_clears_only_after_two_samples_below_ceiling_minus_3`, `single_sample_below_clear_threshold_keeps_override`, `two_concurrent_stops_both_return_after_release`, `start_during_in_flight_stop_waits_for_release`, `stop_then_start_old_generation_never_commands_after_new_initial`, `self_finalize_racing_start_does_not_touch_new_run_status`, `stop_with_budget_returns_at_budget_when_release_hangs`, `stale_generation_command_dropped_by_sink` (`controller.rs`, `trainer.rs`); `on_session_stop_releases_trainer_before_returning`, `on_session_stop_without_zone_ride_is_noop`, `on_session_pause_releases_and_resume_resends`, `on_app_close_respects_4s_budget_with_hung_trainer`, `on_app_close_reports_unconfirmed_release_when_zero_watt_fails` (`lifecycle.rs`) | see column |
+| AC7 | `clamp_trainer_watts_caps_at_2000`, `clamp_trainer_watts_negative_is_zero`, `clamp_trainer_watts_u16_max_does_not_wrap`; one-line clamp in `DeviceManager::set_target_power` | `config.rs`, `device/manager.rs` |
+| AC8 | `pause_10_minutes_adds_zero_time_in_zone`, `first_tick_after_resume_uses_normal_dt` | `controller.rs` |
+| AC9 | `integral_decays_when_smoothed_hr_falls_between_ticks`, `no_integral_decay_when_smoothed_hr_rises_above_zone`, `no_integral_decay_when_hr_below_target_and_falling` | `pid.rs` |
+| AC10 | `hung_trainer_command_times_out_within_3s_and_counts_as_failure`, `next_command_waits_for_timed_out_previous_command` (`trainer.rs`); `status_responsive_while_stop_awaits_task` (`controller.rs`) | see column |
+| AC11 | `hr_pid_zero_dt_returns_unchanged_power`, `hr_pid_negative_dt_returns_unchanged_power` (`pid.rs`); `single_hr_spike_above_max_does_not_cut_power`, `sustained_hr_above_max_cuts_to_safety_power` (`controller.rs`) | see column |
+| AC12 | All of the above. Every test uses `#[tokio::test(start_paused = true)]` or is synchronous; there are no real sleeps | — |
+
+**Unproven, needs a person:**
+- The one-line Tauri wiring in `stop_session`, `pause_session`, `resume_session`, `CloseRequested` and `RunEvent::ExitRequested` has not been exercised in a running app. Manual check: `npm run tauri dev` with the dev simulator, start a zone ride, then (a) Stop session, (b) Pause/Resume, (c) close the window, (d) Cmd+Q on macOS. Each should log `Zone control ended (...): trainer released`.
+- FE-C page 0x30 behaviour on real hardware (accepted risk).
+
