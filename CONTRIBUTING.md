@@ -14,6 +14,7 @@ npm install
 
 ```bash
 cd src-tauri && cargo test
+npm test
 npm run check
 ```
 
@@ -49,6 +50,7 @@ Branch name conventions:
 
 ```bash
 cd src-tauri && cargo test          # All Rust tests must pass
+npm test                            # Frontend unit tests must pass
 npm run check                       # Frontend type checking must pass
 ```
 
@@ -137,6 +139,7 @@ Rules:
 ```bash
 cd src-tauri && cargo test                         # All Rust tests
 cd src-tauri && cargo test --lib session::metrics   # Specific module
+npm test                                            # Frontend unit tests
 npm run check                                       # Frontend types
 npm run dev                                         # Dev server
 npm run build:release                               # Production build

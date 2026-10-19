@@ -60,6 +60,7 @@ npm run build:release  # production build
 
 ```bash
 cd src-tauri && cargo test   # Rust tests
+npm test                     # Frontend unit tests (vitest)
 npm run check                # Frontend type checking
 ```
 

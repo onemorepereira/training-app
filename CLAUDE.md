@@ -23,6 +23,7 @@ Every test must answer: **"What breaks if this test is deleted?"** Tests verify 
 ```bash
 cd src-tauri && cargo test          # Run all Rust tests
 cd src-tauri && cargo test --lib session::metrics  # Run metrics tests only
+npm test                            # Frontend unit tests (vitest)
 npm run check                       # Frontend type checking
 ```
 
