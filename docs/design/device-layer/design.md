@@ -1,6 +1,20 @@
 # Device layer (BLE / ANT+ / trainers) — Design
 
-**Spec:** ./spec.md   **Last updated:** 2026-10-18   **Status:** Draft
+**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 2, after design review 1)   **Status:** Draft
+
+> **Rev 2 changes (review 1).**
+> - Lost-teardown and manual-connect-to-Reconnecting rules (ADR-2a/2b).
+> - Single-lock `PrimaryState` with an atomic claim (ADR-3a).
+> - Ranked, fresh fallback sources (ADR-3b).
+> - Exclusion-list reset on scan-channel release (ADR-4).
+> - Lock rules for the watchdog / `AntSlot` (ADR-1a).
+> - Scan-merge precedence (ADR-1).
+> - Cancellable connects and spawned, bounded reconnects (ADR-1b).
+> - 10-minute give-up for ANT (ADR-2c).
+> - FE-C retry skipped when the trainer is stale (ADR-5).
+> - High-priority search 0 from the start (ADR-2).
+> - Zero cadence/speed after 3 s without a new event (ADR-6).
+> - No real-clock waits over 50 ms in tests (Testing rules).
 
 ## Overview
 
@@ -10,7 +24,7 @@ Two kinds of work:
 2. **Lifecycle and concurrency fixes.** These cover C2, C3, C4, C6, C7, C8 and C17, and they hinge on three structural changes:
    - **I/O seam plus two-phase locking.** `DeviceManager` gets an `Io` type parameter (default `RealIo` = BLE + ANT). Scan, connect, disconnect and reconnect run as *prepare (lock) → I/O (no lock) → commit (lock)*, driven by associated functions on the shared `Arc<Mutex<DeviceManager>>`. A per-device "gate" mutex serialises operations on one device. Trainer commands are never queued behind a 4 s scan. A fake `Io` makes connect-twice, stale, reconnect and lock-scope behaviour testable without hardware.
    - **Persistent ANT+ channels.** Connected ANT+ slave channels open with *high-priority search disabled and low-priority search infinite*. A device that drops out is re-acquired by the radio on the same channel, so there is no close/reopen, no duplicate channel and no duplicated readings. The watchdog only flips the status Connected ⇄ Reconnecting from the last-data timestamp. Connect reports Connected only after the first data page arrives.
-   - **Primaries keyed by metric** (Power, HeartRate, Cadence, Speed, Trainer) instead of `DeviceType`. A device claims a metric on its first reading of that metric (lazy claim) if no primary exists. The `set_primary_device` / `get_primary_devices` command contract stays backward compatible.
+   - **Primaries keyed by metric** (Power, HeartRate, Cadence, Speed, Trainer) instead of `DeviceType`. A device claims a metric on its first reading of that metric (lazy claim) if no primary exists. Non-claimable sources fall back by rank (pod > power meter > trainer) among fresh sources. The `set_primary_device` / `get_primary_devices` command contract stays backward compatible.
 
 Note on the spec: primaries are **not persisted today**. They live only in memory (`Arc<RwLock<HashMap<DeviceType,String>>>`) and are re-derived on every connect. No stored primaries need migrating. Backward compatibility means the Tauri command contract plus the `known_devices.device_type` strings, which are unchanged. See ADR-3.
 
@@ -30,7 +44,7 @@ Components touched. All are under `src-tauri/src/device/` unless noted.
 | `ftms.rs` | Grade rounding. Supported Resistance Level Range parse and scale. |
 | `protocol.rs`, `listener.rs` (BLE) | `CscState` with initialised flags. CPS decoder becomes stateful (`CpsState`) with field walking and crank cadence. Unknown balance reference → `None`. Lazy primary claim. |
 | `ble.rs` | Disconnect-on-error after `connect()`. `BleManager: Clone`, which is cheap because its fields are an `Adapter` plus `Arc`s. Read 0x2AD6 for trainers. |
-| `types.rs` | `Metric` enum, `Primaries` type, `admit_reading()` replacing `is_dominated()`, `Capabilities`. |
+| `types.rs` | `Metric`, `SourceClass`, `PrimaryState` (one lock: primaries + caps + freshness), `admit_reading()` replacing `is_dominated()`. |
 | `dedup.rs` | Whole-token match. |
 | **Outside `device/`** (minimal, unavoidable) | `lib.rs` watchdog becomes a single `DeviceManager::watchdog_tick(&dm, &tx)` call plus the existing emits. `commands.rs`: `scan_devices`, `connect_device` and `disconnect_device` call the `*_shared` fns; `set_primary_device` / `get_primary_devices` map through `PrimaryKey`. The `AppState.primary_devices` type changes. |
 
@@ -53,18 +67,37 @@ sequenceDiagram
 
 ## Data and contracts
 
-**Rust types (`types.rs`)**
+**Rust types (`types.rs`)**, rev 2 (ADR-3a/3b)
 
 ```rust
 pub enum Metric { Power, HeartRate, Cadence, Speed, Trainer }
-pub type Primaries = Arc<std::sync::RwLock<HashMap<Metric, String>>>;
-/// Metrics a device may auto-claim as primary (claimed lazily on first reading).
-pub type Capabilities = Arc<std::sync::RwLock<HashMap<String /*device_id*/, MetricSet>>>;
-impl SensorReading { pub fn metric(&self) -> Option<Metric> }   // Cadence→Cadence, Speed→Speed, TrainerCommand→None
-/// Replaces is_dominated. Returns true if the reading should be forwarded.
-/// primary==device → true; primary==other → false; no primary → claim if metric ∈ caps(device), forward either way.
-pub fn admit_reading(primaries: &Primaries, caps: &Capabilities, r: &SensorReading) -> bool
+/// Source rank for a metric. Higher wins among *fresh* sources.
+pub enum SourceClass { Dedicated /* claimable for this metric */, PowerMeter, Trainer }
+pub struct DeviceCaps { claimable: MetricSet, class_for: fn(Metric) -> SourceClass /* table below */ }
+/// ONE lock for primaries + capabilities + freshness, so claim/release are atomic.
+pub struct PrimaryState {
+    primaries: HashMap<Metric, String>,
+    caps: HashMap<String /*device_id*/, DeviceCaps>,          // registered at connect-prepare
+    last_reading: HashMap<(Metric, String), Instant>,          // freshness per source
+}
+pub type SharedPrimaryState = Arc<std::sync::RwLock<PrimaryState>>;
+impl SensorReading { pub fn metric(&self) -> Option<Metric> }   // TrainerCommand → None
+/// Replaces is_dominated. Takes the write lock once (O(devices), µs) and returns
+/// whether to forward. `now` is injected for tests.
+pub fn admit_reading(state: &SharedPrimaryState, r: &SensorReading, now: Instant) -> bool
 ```
+
+`admit_reading` rules, all evaluated under one write lock:
+
+1. An empty `device_id` (`TrainerCommand`) → forward.
+2. A device with no `caps` entry (never registered, or already disconnected) → **drop**. Its listener is being torn down.
+3. Record `last_reading[(m, d)] = now`.
+4. If `m ∈ caps[d].claimable` and there is no primary for `m` → insert `primaries[m] = d`. This is a check-and-insert under the same lock and is conditioned on step 2.
+5. Forward iff `d` is the *best fresh source* for `m`. Fresh means `now − last_reading ≤ SOURCE_FRESH = 5 s`.
+   - Rank: the primary for `m` (rank 3) > a `PowerMeter` source (2) > a `Trainer` source (1).
+   - A non-primary `Dedicated` device (for example a second cadence pod) has rank 0 while a primary exists, so it is never forwarded.
+   - Ties at the same rank (two power meters' cadence, with no primary) go to the lexicographically smallest `device_id`, so streams never interleave.
+   - If the primary is stale (> 5 s), the next-ranked fresh source flows. When the primary resumes it outranks the fallback again.
 
 - `DeviceType` stays as it is. `CadenceSpeed` is still the stored and displayed type, so `known_devices` rows and the TS `DeviceInfo.device_type` union are untouched.
 - Capability table:
@@ -75,6 +108,12 @@ pub fn admit_reading(primaries: &Primaries, caps: &Capabilities, r: &SensorReadi
   | Power (BLE CPS / ANT 11) | {Power}. Power-meter cadence is *not* claimable, so a dedicated cadence sensor wins. It still flows when no cadence primary exists. |
   | CadenceSpeed | {Cadence, Speed}. Lazy claim means a speed-only pod never claims Cadence. ANT 122 → {Cadence}, 123 → {Speed}, 121 → {Cadence, Speed}. |
   | FitnessTrainer | {Trainer}. Trainer power, cadence, HR and speed are not claimable, which matches today: trainer data flows only when no dedicated sensor is primary for that metric. |
+
+`SourceClass` for the non-claimable metrics:
+- Power-meter cadence → `PowerMeter`.
+- Trainer power, cadence, speed and HR → `Trainer`.
+
+Resulting cadence precedence (spec-owner ruling): dedicated or combo pod > power meter > trainer. Only the best *fresh* source is forwarded.
 
 **Tauri commands (backward compatible)**
 
@@ -100,9 +139,17 @@ pub trait DeviceIo: Send + Sync + 'static {
     fn connect(&self, id: &str, ctx: ListenerCtx) -> impl Future<Output = Result<Connected, AppError>> + Send;
     fn disconnect(&self, id: &str) -> impl Future<Output = Result<(), AppError>> + Send;
     fn probe(&self, ids: Vec<String>) -> impl Future<Output = Vec<(String, LinkState)>> + Send; // BLE is_connected, ANT last_seen/closed
+    /// ANT only: wait (async, polling the last_seen Arc, no AntSlot lock) for a page newer than `since`.
+    fn await_data(&self, id: &str, since: Instant, timeout: Duration) -> impl Future<Output = bool> + Send;
     fn ant_metadata(&self) -> Option<Arc<StdMutex<HashMap<String, AntDeviceMetadata>>>>;
 }
-pub struct ListenerCtx { tx: broadcast::Sender<SensorReading>, primaries: Primaries, caps: Capabilities }
+// connect() also receives a `CancelToken` (Arc<AtomicBool> + tokio::sync::Notify; no new crate).
+// Async waits select! on it; blocking ANT loops check the flag every ≤ 50 ms. A cancelled connect
+// undoes its own partial work (BLE peripheral.disconnect / ANT close_channel) before returning Err(Cancelled).
+pub struct ListenerCtx { tx: broadcast::Sender<SensorReading>, primary_state: SharedPrimaryState }
+/// RealIo keeps per-ANT-device link handles OUTSIDE the AntSlot lock (ADR-1a).
+struct AntLinks(Arc<StdMutex<HashMap<String, AntLink>>>); // held only for map get/insert, never across I/O
+struct AntLink { last_seen: Arc<AtomicI64>, closed: Arc<AtomicBool>, stale_since: Option<Instant> }
 pub struct Connected { info: DeviceInfo, listener: Option<JoinHandle<()>>, trainer: Option<TrainerBackend>, caps: MetricSet }
 pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SECS, channel still searching */,
                      Lost /* BLE disconnected, or ANT channel closed */ }
@@ -131,11 +178,36 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
      - Under the lock: removes bookkeeping, aborts the listener, clears primaries for `id`, removes the reconnect target.
      - Then `io.disconnect` without the DM lock.
   3. `scan_shared`: no gate (it touches no device). `io.scan()` runs unlocked. The merge with `connected_devices` and the storage persist happen under the lock, which is DB-fast. ANT scan and ANT connect serialise on the ANT slot lock, not on the DM lock.
+     - **Merge precedence (rev 2, ruling 7).** For any id that has a live record (`Connecting` from `in_flight`, `Connected` or `Reconnecting` in `connected_devices`), the live record wins over the scan result. Only `in_range` and `rssi` come from the scan.
+     - The scan result can never downgrade a live status to `Disconnected`.
+     - The scan also never inserts into `connected_devices`.
   4. `watchdog_tick`:
      - Lock → snapshot ids → unlock.
      - `io.probe` (BLE `is_connected` is async D-Bus).
      - Lock → apply transitions → unlock.
-     - For each due reconnect → `connect_shared(.., AutoReconnect)`. Each attempt takes and releases the lock itself.
+     - Rev 2: Lost teardowns and due reconnects are **spawned** (ADR-1b), never awaited inline. The tick itself only does the snapshot, the probe and the transitions, and returns its report.
+- **ADR-1a (rev 2, ruling 6): lock discipline.**
+  - The ANT probe reads `AntLinks`: `Arc<AtomicI64>` last-seen and `Arc<AtomicBool>` closed. These are cloned at connect and stored outside `AntSlot`. The probe never touches the `AntSlot` mutex.
+  - **Rule:** a `std::sync` lock is acquired on an async worker thread only for O(1)/O(n) in-memory map work: `AntLinks`, `PrimaryState`, the BLE metadata map. Any work that can block (USB I/O, `AntSlot`, sleeps, response polling) runs inside `spawn_blocking`.
+  - `RealIo::disconnect` / `connect` / `scan` for ANT are `spawn_blocking(move || slot.lock()…)`.
+  - Lock order:
+    - DM (tokio) is never held while awaiting a gate, `spawn_blocking`, or I/O.
+    - `PrimaryState` is a leaf: no other lock is taken while it is held.
+    - `AntLinks` is a leaf.
+    - `AntSlot` is taken only on blocking threads.
+- **ADR-1b (rev 2): cancellation and spawned reconnects.**
+  - `in_flight: HashMap<id, CancelToken>` in DM. `connect_shared` registers its token in the prepare phase and removes it at commit or failure.
+  - `disconnect_shared`, under the DM lock, then:
+    1. Cancels the in-flight token, if any.
+    2. Removes the reconnect target.
+    3. Removes caps and then primaries (ADR-3a).
+    4. Releases the lock and takes the gate. The cancelled connect releases the gate within ≤ 50 ms of cancel plus its own undo, with no waiting for a 5 s first-page or 4 s BLE find.
+    5. Tears down whatever was committed.
+  - The cancelled connect's commit is skipped because the token is cancelled, and it undoes its partial I/O itself.
+  - Reconnects: `watchdog_tick` spawns each due attempt as a task, bounded by a `Semaphore(RECONNECT_CONCURRENCY = 2)`.
+    - The attempt uses `gate.try_lock_owned()`. If the device is busy (manual op or previous attempt still running), it is skipped this round and the backoff is not bumped.
+    - A slow attempt therefore never delays the next tick's stale detection.
+    - `report.reconnected` events are emitted by the spawned task via a callback/`mpsc` the watchdog loop in `lib.rs` drains each tick. The event payloads are unchanged.
 - **Not addressed (record for B).** Trainer commands themselves still hold the DM lock across their own I/O: FTMS indication wait ≤ 2 s; FE-C ack ≤ 2 × 600 ms after ADR-5. A slow trainer command blocks another trainer command. That is acceptable for now. A future `trainer_handle()` returning a cloneable backend would remove it, but that needs Area B call-site changes.
 - **Reversibility: easy.** Internal API. Call sites outside `device/` change by one line each.
 
@@ -161,12 +233,34 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
   - **Connected only after first page.** `AntManager::connect` opens the channel, then blocks (inside `spawn_blocking`, under the ANT slot lock, not the DM lock) for up to `ANT_FIRST_PAGE_TIMEOUT = 5 s` for the first page on the channel's mpsc receiver. The page is forwarded to the listener, so it is not lost.
     - Implementation: the listener is spawned with a `first_page: oneshot`-like signal; simplest is `wait_first_page(&rx, timeout) -> Option<Vec<u8>>` *before* spawning the listener, then the page is handed to `listen_ant_channel` as `initial: Option<[u8;8]>`.
     - On timeout the channel is closed and `Err(AntError::Channel("no data from device"))` is returned. `last_seen` is set from the first page, so the watchdog can flag it later.
-  - A device that never returns stays `Reconnecting`. It is never shown as Connected and never silently becomes "Connected with no data".
+  - A device that never returns stays `Reconnecting` until the 10-minute give-up (ADR-2c), then becomes `Disconnected`. It is never shown as Connected and never silently becomes "Connected with no data".
+  - The first-page wait loop checks the cancel token every ≤ 50 ms (ADR-1b).
   - `device_reconnecting.attempt` counts watchdog ticks while stale.
   - Primary claims for a stale device are released. A backup device can then take over via lazy claim, and the returning device re-claims only if the slot is free. This is the same semantics as today's `remove_primary`/`auto_set_primary`.
   - The **scan** wildcard channels keep a finite search: LP default, HP 0x44 = 2 (5 s). Their window is 4 s anyway.
 - **Why.** No duplicate channels by construction. No reconnect churn on a USB stick with 8 channels. Re-acquisition latency is that of LP search. It fixes "dead after 30 s".
-- **Risk.** Acquisition speed with HP disabled is unproven on hardware. Mitigation, kept as a constant to tune: initial connect uses `LP = 0xFF, HP = 2` (5 s HP to acquire fast). After the first page the channel is reconfigured with `0x44 = 0`. Rev 5.1 §9.5.2.5 allows setting search timeout on an open channel; it takes effect on the next search. If a spike shows that is not honoured on an open channel, keep HP = 0 from the start.
+- **Risk.** Acquisition speed with HP disabled is unproven on hardware.
+  - **Rev 2 (ruling):** connection channels use `HP = 0, LP = 0xFF` *from the start*.
+  - A fast-acquire variant (`HP = 2` during the initial connect, then `0x44 = 0` after the first page) exists only behind `const ANT_FAST_ACQUIRE: bool = false`.
+- **ADR-2a (rev 2, ruling 1): Lost teardown.**
+  - On `LinkState::Lost`, the tick registers the reconnect target and marks the status `Reconnecting`, both under the DM lock. It then spawns the teardown task:
+    1. Take the per-device gate.
+    2. Re-check under the DM lock that the device is still in the same Lost episode. The record has an `episode: u64` counter, bumped on every connect commit and disconnect. If a manual disconnect or connect happened in between, the teardown is a no-op.
+    3. Remove the listener handle and backend.
+    4. Release the lock.
+    5. `io.disconnect(id)`. ANT runs in `spawn_blocking`: stop flag, remove sender, `close_channel` tolerant of "already closed", remove the `AntLinks` entry.
+  - The reconnect target is **kept**. Reconnect attempts need the same gate, so teardown always completes before any reopen.
+  - Concurrent manual disconnect: whoever takes the gate first acts. The other sees the episode change and does nothing. Manual disconnect also removes the target, so no reconnect follows.
+- **ADR-2b (rev 2, ruling 2): manual connect to a `Reconnecting` ANT device whose channel is still alive** (Stale, not Lost).
+  - Never open a second channel. `connect_shared` sees the record, takes the gate and calls `io.await_data(id, since = now, 5 s)`.
+  - This polls the `last_seen` Arc asynchronously every 50 ms and selects on the cancel token. It holds no `AntSlot`.
+  - Data received → status `Connected`, `device_reconnected` emitted, return `Ok(info{Connected})`.
+  - Timeout → return `Ok(info{Reconnecting})`. It is not an error and never reports Connected.
+  - `AntManager::connect` also has a defensive guard: if the id is already in `connected`, it returns the existing info without allocating a channel.
+- **ADR-2c (rev 2): give-up.**
+  - `AntLink.stale_since` is set on the Stale transition. If it exceeds `ANT_GIVE_UP = 10 min` (an injected clock in tests), the device goes through the ADR-2a teardown **without** registering a reconnect target.
+  - Status → `Disconnected` (removed from `connected_devices`), and `device_disconnected` is emitted again so the frontend clears its "reconnecting" badge. The channel is freed.
+  - The device stays in `known_devices`, so a manual connect opens a fresh channel.
 - **Reversibility: easy.** These are constants and an internal state machine.
 
 ### ADR-3: Primaries keyed by metric, lazy claim, legacy command shape preserved
@@ -178,6 +272,16 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
 - **Decision: A.**
 - **Why.** The de-duplication question is inherently per metric: trainer power vs power meter, trainer HR vs strap, power-meter cadence vs pod. Lazy claim needs no extra GATT reads, because a device claims only what it actually emits. CSC Feature (CSCS v1.0 §3.2, mandatory) is not needed.
 - **Persistence.** Nothing is persisted today (verified: no `primary` in migrations or storage; `commands.rs` writes only the in-memory map). Keep in-memory. Persisting primaries is out of scope; it is noted for Area E if wanted.
+- **ADR-3a (rev 2, ruling 3): atomic claim and ordered release.**
+  - Primaries, capabilities and freshness live in **one** `RwLock<PrimaryState>`.
+  - Caps are registered in the connect *prepare* phase, before any listener can run, and removed if the connect fails or is cancelled.
+  - Disconnect and teardown, in one write-lock section: remove `caps[d]` **first**, then every `primaries[m] == d`, then `last_reading[(·, d)]`.
+  - A claim is the check-and-insert in `admit_reading` step 4, conditioned on `caps[d]` existing (step 2), all under the same write lock.
+  - An in-flight reading after disconnect therefore finds no caps → dropped, no claim.
+  - Stale-release (ADR-2) removes only the primaries (caps stay), so the returning device can re-claim a free slot.
+- **ADR-3b (rev 2, ruling 5): ranked fallback.** The ranking and freshness rules are in Data and contracts (`admit_reading` step 5). `SOURCE_FRESH = 5 s`.
+  - Because a single best source is chosen per reading under the lock, two sources of one metric never interleave.
+  - Cost: one write lock per reading, roughly 4–8 Hz per device. That is negligible.
 - **Behaviour change (intended).** Primary is set on the device's first reading rather than at connect. Between connect and the first reading, `get_primary_devices` may not list it. The Devices page reloads primaries on mount, which is acceptable.
 - **Reversibility: easy.** In-memory only; the command shape is a superset of today's.
 
@@ -196,6 +300,13 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
 - **Decision: A.** Scan channels are allocated dynamically from channels not used by connections. Scan and connect are serialised by the ANT slot lock, so connections can use all 8 channels.
   - If free channels < profiles, profiles are scanned in batches of `free` channels, 4 s each. That is rare: it needs ≥ 3 ANT connections.
   - Up to 5 devices per profile per scan: 1 locked plus 4 excluded, after which the channel stays closed.
+  - **Rev 2 (ruling 4): channel release sequence.** Every scan channel is released with:
+    1. `0x4C Close` → wait for `EVENT_CHANNEL_CLOSED`.
+    2. **`0x5A Config ID List [ch, 0, 0]`** (size 0 = list disabled; D00000652 §9.5.2.12) → wait for the response. The channel must still be assigned at this point.
+    3. `0x41 Unassign` → wait for the response.
+  - Only then is the channel number returned to the free pool. A later connection on that number can never inherit an exclusion list.
+  - `open_channel` also sends `0x5A [ch, 0, 0]` defensively on any channel it assigns, so a crash mid-scan cannot leak a list.
+  - **Testability:** the channel functions take `&dyn AntTx` (`fn send(&self, &AntMessage) -> Result<()>`), implemented by `AntUsb` and by a test `RecordingStick`. The stick records sends and pushes `RESPONSE_NO_ERROR` / `EVENT_CHANNEL_CLOSED` into the response queue, so command sequences are asserted byte by byte.
   - The startup "cleanup" closes only non-connection channels. The `response_queue.clear()` becomes a per-channel drain, so it can no longer eat a concurrent FE-C TX event.
 - **Reversibility: easy.**
 
@@ -213,6 +324,7 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
   - Before sending, it purges stale TX events for `ch`.
   - It succeeds on 0x05. It fails the attempt on 0x06, 0x08, response 0x1F, or the timeout. It retries once, then returns `AntError::Channel("FE-C ack failed: …")`.
   - It runs inside the existing `spawn_blocking`.
+  - **Rev 2: starvation guard.** The FE-C backend holds the trainer's `last_seen` Arc. If the first attempt fails and the trainer's last page is older than `FEC_RETRY_FRESH = 3 s`, the retry is **skipped** and the error is returned immediately (the trainer is gone; a retry would only burn 600 ms). Area B serialises controller commands with 3 s timeouts.
   - A per-backend `send_lock` serialises sends so `TRANSFER_IN_PROGRESS` cannot arise from our own concurrency.
   - The worst case is 1.2 s, which satisfies "≤ 1 s wait" per attempt.
 - **Why not C.** It changes router fan-out for a small gain. B's queue is already channel-filtered everywhere after ADR-4.
@@ -234,6 +346,11 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
   - `CscState { wheel: Option<(u32,u16)>, crank: CrankState }` (C9). `CpsState { crank: CrankState }`.
   - `decode_cycling_power(&mut CpsState, data, id) -> Vec<SensorReading>` returns Power plus an optional Cadence.
   - Truncated payloads (flag set, bytes missing) skip only that field.
+  - **Rev 2: zero on coasting.** `CrankState` and `WheelState` store `last_event_at: Instant` (the notification time at which the revs/time last changed).
+    - On a notification with no new event, if `now − last_event_at ≥ ZERO_AFTER = 3 s`, emit `0 rpm` / `0 km/h`. This repeats on every such notification while the sensor keeps notifying.
+    - The first new event resumes normal values.
+    - `now` is an injected parameter: the decoders take `now: Instant`, and listeners pass `Instant::now()`.
+    - The same rule is applied to the ANT+ speed, cadence and combined decoders for consistency. That is a small extension beyond the ruling, flagged for review.
   - ANT page 0x10 cadence ≠ 0xFF → Cadence reading on new event-count samples. It follows the same event-count gating as power. On the first sample both are emitted.
 - **Reversibility: easy.**
 
@@ -299,15 +416,22 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
 
 | Failure | Detection | Behavior | Recovery |
 |---|---|---|---|
-| ANT device out of range | `last_seen` > 10 s | status Reconnecting, `device_disconnected` once, then `device_reconnecting` each tick; primary claims released | Pages resume → Connected, `device_reconnected`; LP search continues indefinitely |
-| ANT channel closed unexpectedly | Channel event 0x01/0x07 for a connection channel not being closed by us; or listener rx disconnected | `LinkState::Lost` → full teardown via `io.disconnect` → `ReconnectManager` | Reconnect opens a fresh channel; Connected only after first page |
+| ANT device out of range | `last_seen` > 10 s | status Reconnecting, `device_disconnected` once, then `device_reconnecting` each tick; primary claims released (caps kept) | Pages resume → Connected, `device_reconnected`; LP search continues up to 10 min |
+| ANT device never returns | `stale_since` > 10 min | Teardown (ADR-2a) without reconnect target; status Disconnected; `device_disconnected` re-emitted; channel freed | Manual connect from known devices |
+| Manual connect to a Reconnecting ANT device | Live record + link not Lost | Reuse channel; wait 5 s for data → `Connected`, or `Ok(Reconnecting)` | — |
+| ANT channel closed unexpectedly | Channel event 0x01/0x07 for a connection channel not being closed by us; or listener rx disconnected | `LinkState::Lost` → spawned teardown under gate (target kept) → `ReconnectManager` | Reconnect opens a fresh channel; Connected only after first page |
+| Disconnect during in-flight connect | `in_flight` token present | Token cancelled; connect undoes partial I/O, skips commit; disconnect proceeds under gate within ~50 ms + undo | — |
+| Slow reconnect attempt | — | Runs as a spawned task (≤ 2 concurrent; busy gate → skipped this round) | Next tick unaffected |
+| Primary device goes quiet (< 10 s, not yet stale) | `last_reading` > 5 s | Next-ranked fresh source (PM → trainer) forwarded | Primary resumes → outranks again |
+| Reading arrives after disconnect | No `caps` entry | Dropped, no claim | — |
+| FE-C ack fails while trainer stale (> 3 s) | `last_seen` Arc | No retry; immediate `Err` | — |
 | ANT stick unplugged / router exits | Router loop exit sets all connection `closed` flags | All ANT devices Lost → reconnect attempts fail (`NoUsbStick`) | Re-plug → `ensure_ant` re-init on next attempt |
 | ANT first page never arrives on connect | 5 s timeout | Channel closed, connect returns error | User retries / reconnect backoff |
 | FE-C ack fails | TX_FAILED / GO_TO_SEARCH / 600 ms timeout | Retry once; then `Err` to caller (zone control logs/handles) | Next command |
 | Blocking ANT task panics | `spawn_blocking` JoinError / poisoned slot | Slot reset to `None`, AntManager dropped (router stopped) | `ensure_ant` re-inits on next use (as today) |
 | BLE discovery/classify fails after connect | `Err` from `finish_connect` | Peripheral disconnected, error returned | User retry |
 | Concurrent connect of same device | Per-device gate | Second caller waits, then sees Connected → no-op Ok | — |
-| Connect commit finds device was disconnected meanwhile | Not possible: disconnect also takes the gate | — | — |
+| Scan finishes while a device is connecting/connected | Live record exists | Live status wins; scan contributes only `in_range`/`rssi` | — |
 | 0x2AD6 missing / malformed | Read error or length ∉ {3, 6} | Range `None` → legacy 0–100 % mapping | — |
 | Scan while ≥ 3 ANT devices connected | free channels < profiles | Profiles scanned in batches (scan takes longer) | — |
 
@@ -340,6 +464,28 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
 | AC16 (C16) | `dedup.rs` | `name_number_requires_whole_token`, `name_number_matches_token_after_separator`, `name_number_leading_zero_token_matches` |
 | AC17 (C17) | `ant/channel.rs`, `ant/manager.rs` | `exclusion_list_messages_bytes` (0x59 / 0x5A layout), `scan_channel_allocation_skips_connection_channels`, `scan_profiles_batched_when_channels_scarce` |
 | AC18 | all | `cargo test` full suite green; every test above fails on the pre-change code (verified per slice) |
+| Rev 2 / ruling 1 (AC5) | `manager.rs` | `lost_teardown_runs_under_gate_and_keeps_reconnect_target`, `lost_teardown_noop_after_concurrent_manual_disconnect`, `lost_teardown_then_manual_connect_opens_single_channel` |
+| Rev 2 / ruling 2 (AC5) | `manager.rs`, `io.rs` | `manual_connect_reconnecting_ant_reuses_channel_and_connects_on_data`, `manual_connect_reconnecting_ant_without_data_returns_ok_reconnecting` |
+| Rev 2 / ruling 3 (AC4) | `types.rs` | `reading_after_disconnect_cannot_reclaim_primary`, `disconnect_removes_caps_before_primaries` |
+| Rev 2 / ruling 4 (AC17) | `ant/channel.rs` | `scan_channel_release_sends_close_reset_list_unassign_in_order`, `open_channel_resets_id_list_after_assign` |
+| Rev 2 / ruling 5 (AC4) | `types.rs` | `cadence_pod_outranks_power_meter_outranks_trainer`, `stale_primary_falls_back_to_power_meter_cadence`, `primary_resume_reclaims_forwarding`, `two_power_meters_cadence_never_interleave` |
+| Rev 2 / ruling 6 (AC8) | `io.rs`, `manager.rs` | `ant_probe_returns_while_ant_slot_locked`, `watchdog_tick_completes_within_50ms_during_scan` |
+| Rev 2 / ruling 7 | `manager.rs` | `scan_merge_keeps_connecting_status`, `scan_merge_keeps_reconnecting_status`, `scan_merge_updates_in_range_only` |
+| Rev 2 / cancellation | `manager.rs` | `disconnect_cancels_in_flight_connect_promptly`, `cancelled_connect_does_not_commit_listener` |
+| Rev 2 / spawned reconnects | `manager.rs` | `slow_reconnect_does_not_delay_next_tick`, `reconnects_bounded_to_two_concurrent`, `busy_gate_skips_reconnect_round` |
+| Rev 2 / give-up | `manager.rs` | `ant_stale_ten_minutes_gives_up_to_disconnected`, `ant_give_up_frees_channel_and_registers_no_reconnect` |
+| Rev 2 / FE-C starvation (AC7) | `ant/channel.rs` | `ack_retry_skipped_when_trainer_stale` |
+| Rev 2 / HP search (AC5) | `ant/channel.rs` | `ant_connection_channel_search_config_bytes` (HP 0 from the start) |
+| Rev 2 / zero cadence (AC10, AC11) | `protocol.rs`, `ant/protocol.rs` | `csc_zero_cadence_after_3s_without_crank_event`, `csc_zero_speed_after_3s_without_wheel_event`, `cps_zero_cadence_after_3s_without_crank_event`, `cadence_resumes_after_zero_on_new_event` |
+
+## Testing rules (rev 2)
+
+- **No real-clock wait longer than 50 ms in any test.**
+- Async code (manager, `io.await_data`, reconnect backoff) uses `#[tokio::test(start_paused = true)]` and `tokio::time::advance`.
+- Blocking ANT code (`wait_first_page`, `send_acknowledged_and_wait`, `close_channel`) takes its timeouts as `Duration` parameters. Production uses consts; tests pass ≤ 20 ms.
+- Decoders and `admit_reading` take `now: Instant` explicitly.
+- Upper-bound latency assertions (for example "probe returns within 50 ms while `AntSlot` is held") are the only real-clock checks. They wrap the call in `timeout(50 ms)`, so a passing run is fast.
+- Watchdog give-up uses an injected `now` passed to `watchdog_tick_at(dm, tx, now)`. The production wrapper passes `Instant::now()`.
 
 ## Risks and spikes
 
@@ -361,19 +507,29 @@ Each slice is one commit with its tests (failing first).
 3. **Spike + seam: `DeviceIo`, `RealIo`, `FakeIo`, two-phase `scan_shared`/`connect_shared`/`disconnect_shared`/`watchdog_tick`, per-device gates, idempotent connect (C7, C4).**
    - Move the BLE/ANT ownership from `DeviceManager` into `RealIo`. The ANT slot becomes `Arc<StdMutex<Option<AntManager>>>` with poison → reset.
    - Update `lib.rs` and `commands.rs` call sites (one line each).
-   - Tests: AC6 and AC8.
+   - Rev 2 additions in this slice:
+     - `AntLinks` outside `AntSlot`.
+     - `in_flight` cancel tokens.
+     - Spawned, bounded reconnects with `try_lock` gates; the `lib.rs` loop drains a report `mpsc`.
+     - Scan-merge precedence.
+     - The `episode` counter.
+   - Tests: AC6, AC8, rulings 6 and 7, cancellation, spawned reconnects.
    - Behaviour is otherwise unchanged; the old ANT reconnect logic is retained for now.
 4. **ANT persistent channel lifecycle (C2).**
-   - Search timeout messages: add `MSG_SET_LP_SEARCH_TIMEOUT = 0x63` and the event constants.
+   - Search timeout messages (HP 0, LP 0xFF from the start; `ANT_FAST_ACQUIRE` const): add `MSG_SET_LP_SEARCH_TIMEOUT = 0x63` and the event constants.
+   - `AntTx` trait + `RecordingStick`.
    - `wait_first_page`; listener `initial` page.
    - `closed` flag via router channel events / listener exit; `LinkState` probe.
-   - Watchdog Stale/Recovered/Lost transitions; teardown-before-reconnect.
+   - Watchdog Stale/Recovered/Lost transitions.
+   - Spawned Lost teardown under the gate (ADR-2a).
+   - Manual connect to Reconnecting → `await_data` (ADR-2b).
+   - 10-minute give-up (ADR-2c).
    - `AntManager::connect` idempotence guard.
-5. **Metric primaries (C3).** `Metric`, `admit_reading`, `Capabilities`, lazy claim in the BLE and ANT listeners, `PrimaryKey` commands, release on stale/disconnect. Remove `is_dominated` and migrate its tests to `admit_reading`.
-6. **FE-C ack wait (C6).** `send_acknowledged_and_wait`, `send_lock`, queue in the backend, per-channel drains.
+5. **Metric primaries (C3).** `Metric`, `PrimaryState` (single lock), `admit_reading` with ranked/fresh fallback and an injected `now`, caps registered at prepare / removed first at disconnect, lazy claim in the BLE and ANT listeners, `PrimaryKey` commands, release on stale/disconnect. Remove `is_dominated` and migrate its tests to `admit_reading`.
+6. **FE-C ack wait (C6).** `send_acknowledged_and_wait` with timeouts passed as parameters, the stale-trainer retry skip, `send_lock`, queue + `last_seen` in the backend, per-channel drains.
 7. **BLE connect cleanup (C8).** `disconnect_on_err` + `finish_connect`.
-8. **Crank/CSC state (C9, C11).** `CrankState`, `CscState`, `CpsState`, CPS field walking, ANT page 0x10 cadence.
-9. **ANT scan rework (C12, C17).** Dynamic scan channels, batching, exclusion lists, combo S&C profile and decoder.
+8. **Crank/CSC state (C9, C11).** `CrankState`, `WheelState`, `CscState`, `CpsState`, zero-after-3 s (injected `now`), CPS field walking, ANT page 0x10 cadence.
+9. **ANT scan rework (C12, C17).** Dynamic scan channels, batching, exclusion lists with the close → `0x5A` size 0 → unassign release sequence, combo S&C profile and decoder.
 10. **Background pages (C14).** `PageToggleGate`, pages 2/3 for HR and legacy S&C; device number passed to the listener.
 11. **FTMS resistance range (C13).** Async `TrainerController::new` reads 0x2AD6; range-aware `encode_resistance`.
 12. **Small fixes (C15, C16).** Balance unknown → None plus rounding; whole-token dedup.
