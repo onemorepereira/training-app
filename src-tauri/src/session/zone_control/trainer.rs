@@ -34,10 +34,20 @@ pub enum TrainerCmd {
     Resistance(u8),
 }
 
+/// Outcome of a command as seen by the controller (after timeout handling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Ok,
+    Err,
+    Timeout,
+}
+
 /// Raw trainer calls, without timeout or serialization.
 pub trait TrainerBackend: Send + Sync + 'static {
     fn is_connected(&self) -> impl Future<Output = bool> + Send;
     fn send(&self, cmd: TrainerCmd) -> impl Future<Output = Result<(), AppError>> + Send;
+    /// Observer for the caller-visible outcome of each command (tests record it).
+    fn on_outcome(&self, _cmd: TrainerCmd, _outcome: CommandOutcome) {}
 }
 
 /// Production backend: the shared DeviceManager.
@@ -120,16 +130,24 @@ impl<B: TrainerBackend> SerializedSink<B> {
             }
             backend.send(cmd).await
         });
-        match tokio::time::timeout(limit, task).await {
+        let result = match tokio::time::timeout(limit, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(join_err)) => match join_err.try_into_panic() {
                 Ok(payload) => std::panic::resume_unwind(payload),
                 Err(e) => Err(AppError::Session(format!("Trainer command task failed: {e}"))),
             },
-            Err(_) => Err(AppError::Session(format!(
-                "Trainer command {cmd:?} timed out after {limit:?}"
-            ))),
-        }
+            Err(_) => {
+                self.backend.on_outcome(cmd, CommandOutcome::Timeout);
+                return Err(AppError::Session(format!(
+                    "Trainer command {cmd:?} timed out after {limit:?}"
+                )));
+            }
+        };
+        self.backend.on_outcome(
+            cmd,
+            if result.is_ok() { CommandOutcome::Ok } else { CommandOutcome::Err },
+        );
+        result
     }
 
     /// Put the trainer in the safe state (ADR-11): 0 W first, then resistance 0 %
@@ -197,6 +215,10 @@ pub(crate) mod fake {
         /// One-shot behaviors consumed by the next command (any kind)
         queued: VecDeque<Behavior>,
         log: Vec<(TrainerCmd, tokio::time::Instant)>,
+        /// Every command that reached the fake, with its start time
+        attempts: Vec<(TrainerCmd, tokio::time::Instant)>,
+        /// Caller-visible outcome of every command, in completion order
+        outcomes: Vec<(TrainerCmd, CommandOutcome)>,
     }
 
     /// Scriptable in-memory trainer; records every command it *executes*.
@@ -214,6 +236,8 @@ pub(crate) mod fake {
                     default_resistance: Behavior::Ok,
                     queued: VecDeque::new(),
                     log: Vec::new(),
+                    attempts: Vec::new(),
+                    outcomes: Vec::new(),
                 })),
             }
         }
@@ -242,8 +266,19 @@ pub(crate) mod fake {
             self.inner.lock().unwrap().log.clone()
         }
 
+        pub fn attempts(&self) -> Vec<(TrainerCmd, tokio::time::Instant)> {
+            self.inner.lock().unwrap().attempts.clone()
+        }
+
+        pub fn outcomes(&self) -> Vec<(TrainerCmd, CommandOutcome)> {
+            self.inner.lock().unwrap().outcomes.clone()
+        }
+
         pub fn clear(&self) {
-            self.inner.lock().unwrap().log.clear();
+            let mut inner = self.inner.lock().unwrap();
+            inner.log.clear();
+            inner.attempts.clear();
+            inner.outcomes.clear();
         }
     }
 
@@ -255,6 +290,7 @@ pub(crate) mod fake {
         async fn send(&self, cmd: TrainerCmd) -> Result<(), AppError> {
             let behavior = {
                 let mut inner = self.inner.lock().unwrap();
+                inner.attempts.push((cmd, tokio::time::Instant::now()));
                 if !inner.connected {
                     return Err(AppError::Session("Trainer disconnected".into()));
                 }
@@ -276,6 +312,10 @@ pub(crate) mod fake {
                 .log
                 .push((cmd, tokio::time::Instant::now()));
             Ok(())
+        }
+
+        fn on_outcome(&self, cmd: TrainerCmd, outcome: CommandOutcome) {
+            self.inner.lock().unwrap().outcomes.push((cmd, outcome));
         }
     }
 }
@@ -314,6 +354,13 @@ mod tests {
         assert!(!out.delivered);
         assert!(matches!(out.resistance, Some(Ok(()))));
         assert_eq!(fake.commands(), vec![TrainerCmd::Resistance(0)]);
+        assert_eq!(
+            fake.outcomes(),
+            vec![
+                (TrainerCmd::Power(0), CommandOutcome::Err),
+                (TrainerCmd::Resistance(0), CommandOutcome::Ok)
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -325,6 +372,7 @@ mod tests {
         let r = sink.send(1, TrainerCmd::Power(200), TRAINER_COMMAND_TIMEOUT).await;
         assert!(r.is_err());
         assert_eq!(start.elapsed(), Duration::from_secs(3));
+        assert_eq!(fake.outcomes(), vec![(TrainerCmd::Power(200), CommandOutcome::Timeout)]);
     }
 
     #[tokio::test(start_paused = true)]

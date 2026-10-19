@@ -36,6 +36,12 @@ const CADENCE_ZERO_SECS: u64 = 3;
 pub const TRAINER_LOST_STOP_SECS: u64 = 30;
 /// Safety override undelivered for this many consecutive ticks → stop (ADR-15)
 pub const SAFETY_UNDELIVERED_STOP_TICKS: u32 = 3;
+/// … or for this much wall-clock time, whichever comes first (ADR-24)
+pub const SAFETY_UNDELIVERED_STOP: Duration = Duration::from_secs(6);
+/// Power mode: after a cadence-zero cut, restore the target only once cadence
+/// ≥ this has been sustained for POWER_RESTORE_CADENCE_SECS (ADR-25)
+pub const POWER_RESTORE_CADENCE_RPM: f32 = 40.0;
+pub const POWER_RESTORE_CADENCE_SECS: u64 = 2;
 /// HR-ceiling override clears below max_hr − margin for N consecutive samples (ADR-15)
 pub const HR_CEILING_CLEAR_MARGIN_BPM: u8 = 3;
 pub const HR_CEILING_CLEAR_SAMPLES: u32 = 2;
@@ -58,6 +64,8 @@ struct ControlLoopState {
     stop_reason: Option<StopReason>,
     last_power: Option<u16>,
     last_cadence_zero_since: Option<Instant>,
+    /// Since when cadence has been ≥ POWER_RESTORE_CADENCE_RPM (None if below)
+    cadence_ok_since: Option<Instant>,
     last_hr_seen: Option<Instant>,
     last_power_seen: Option<Instant>,
     /// FTP from user config, used for HR mode power banding
@@ -87,6 +95,7 @@ impl ControlLoopState {
             stop_reason: None,
             last_power: None,
             last_cadence_zero_since: None,
+            cadence_ok_since: None,
             last_hr_seen: None,
             last_power_seen: None,
             ftp: None,
@@ -407,6 +416,10 @@ struct ControlLoop<B: TrainerBackend> {
     last_sent_at: Option<Instant>,
     trainer_lost_since: Option<Instant>,
     undelivered_safety_ticks: u32,
+    /// Start of the current undelivered-safety-override episode (ADR-24)
+    safety_pending_since: Option<Instant>,
+    /// Power mode cadence cut is latched until cadence recovers (ADR-25)
+    power_cadence_cut: bool,
     hr_ceiling_override: bool,
     hr_clear_samples: u32,
     /// PID was frozen on the previous tick (re-seed on exit, ADR-14)
@@ -435,6 +448,8 @@ impl<B: TrainerBackend> ControlLoop<B> {
             last_sent_at: None,
             trainer_lost_since: None,
             undelivered_safety_ticks: 0,
+            safety_pending_since: None,
+            power_cadence_cut: false,
             hr_ceiling_override: false,
             hr_clear_samples: 0,
             was_frozen: false,
@@ -512,13 +527,13 @@ impl<B: TrainerBackend> ControlLoop<B> {
         match step {
             Step::Initial => {
                 let w = self.state.lock().await.commanded_power;
-                self.reconcile(Delivered::Watts(w)).await;
+                self.reconcile(Delivered::Watts(w), TRAINER_COMMAND_TIMEOUT).await;
                 None
             }
             Step::Reconcile => {
                 let paused = self.state.lock().await.paused;
                 if paused {
-                    self.reconcile(Delivered::Released).await;
+                    self.reconcile(Delivered::Released, TRAINER_COMMAND_TIMEOUT).await;
                 }
                 None
             }
@@ -581,6 +596,11 @@ impl<B: TrainerBackend> ControlLoop<B> {
                 } else {
                     s.last_cadence_zero_since = None;
                 }
+                if rpm >= POWER_RESTORE_CADENCE_RPM {
+                    s.cadence_ok_since.get_or_insert(now);
+                } else {
+                    s.cadence_ok_since = None;
+                }
             }
             _ => {}
         }
@@ -620,7 +640,7 @@ impl<B: TrainerBackend> ControlLoop<B> {
     }
 
     /// Send `effective` if the trainer isn't confirmed to be doing it (ADR-4).
-    async fn reconcile(&mut self, effective: Delivered) {
+    async fn reconcile(&mut self, effective: Delivered, limit: Duration) {
         let now = Instant::now();
         let refresh_due = matches!(effective, Delivered::Watts(_))
             && self
@@ -632,7 +652,7 @@ impl<B: TrainerBackend> ControlLoop<B> {
         }
         let ok = match effective {
             Delivered::Watts(w) => {
-                match self.sink.send(self.gen, TrainerCmd::Power(w), TRAINER_COMMAND_TIMEOUT).await {
+                match self.sink.send(self.gen, TrainerCmd::Power(w), limit).await {
                     Ok(()) => {
                         log_trainer_command(&self.sensor_tx, w);
                         true
@@ -719,10 +739,26 @@ impl<B: TrainerBackend> ControlLoop<B> {
             let max_hr = s.max_hr;
             self.update_hr_ceiling_on_tick(max_hr);
         }
-        let cadence_override = s
+        let cadence_zero_long = s
             .last_cadence_zero_since
             .map(|z| now.duration_since(z).as_secs() >= CADENCE_ZERO_SECS)
             .unwrap_or(false);
+        let cadence_override = if hr_mode {
+            cadence_zero_long
+        } else {
+            if cadence_zero_long {
+                self.power_cadence_cut = true;
+            } else if self.power_cadence_cut
+                && s
+                    .cadence_ok_since
+                    .map(|t| now.duration_since(t).as_secs() >= POWER_RESTORE_CADENCE_SECS)
+                    .unwrap_or(false)
+            {
+                info!("Cadence sustained ≥ {} rpm — restoring target", POWER_RESTORE_CADENCE_RPM);
+                self.power_cadence_cut = false;
+            }
+            self.power_cadence_cut
+        };
         let safety = if cadence_override {
             Some(0)
         } else if hr_mode && self.hr_ceiling_override {
@@ -790,7 +826,14 @@ impl<B: TrainerBackend> ControlLoop<B> {
         };
         drop(s);
 
-        self.reconcile(effective).await;
+        // Undelivered safety override: bound the episode by wall clock too (ADR-24)
+        let safety_pending = !paused && safety.is_some();
+        let mut limit = TRAINER_COMMAND_TIMEOUT;
+        if safety_pending && self.delivered != effective {
+            let since = *self.safety_pending_since.get_or_insert(now);
+            limit = limit.min((since + SAFETY_UNDELIVERED_STOP).saturating_duration_since(now));
+        }
+        self.reconcile(effective, limit).await;
 
         let mut s = self.state.lock().await;
         if paused {
@@ -800,18 +843,24 @@ impl<B: TrainerBackend> ControlLoop<B> {
         }
         drop(s);
 
-        let safety_pending = !paused && safety.is_some();
         if safety_pending && self.delivered != effective {
             self.undelivered_safety_ticks += 1;
-            if self.undelivered_safety_ticks >= SAFETY_UNDELIVERED_STOP_TICKS {
+            let pending_for = self
+                .safety_pending_since
+                .map(|t| Instant::now().duration_since(t))
+                .unwrap_or_default();
+            if self.undelivered_safety_ticks >= SAFETY_UNDELIVERED_STOP_TICKS
+                || pending_for >= SAFETY_UNDELIVERED_STOP
+            {
                 error!(
-                    "Safety power cut undelivered for {} ticks — stopping zone control",
-                    self.undelivered_safety_ticks
+                    "Safety power cut undelivered for {} ticks / {:?} — stopping zone control",
+                    self.undelivered_safety_ticks, pending_for
                 );
                 return Some(StopReason::TrainerUnresponsive);
             }
         } else {
             self.undelivered_safety_ticks = 0;
+            self.safety_pending_since = None;
         }
         if !safety_pending {
             if let Some(since) = self.trainer_lost_since {
@@ -1376,16 +1425,60 @@ pub(crate) mod task_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn power_mode_restores_target_within_2_ticks_after_cadence_returns() {
+    async fn power_mode_restores_target_within_2_ticks_after_cadence_sustained_2s() {
+        // Amended AC5: restore within 2 ticks once cadence ≥ 40 rpm has been sustained 2 s.
         let (zc, fake, tx) = setup();
         start(&zc, &tx, power_target(190, 210, None), None).await;
         ride(&tx, 3, steady).await;
         ride(&tx, 6, |_| vec![cadence(0.0), power(0)]).await;
         assert!(fake.commands().contains(&TrainerCmd::Power(0)), "cadence cut not sent");
         let back = Instant::now();
-        ride(&tx, 4, steady).await;
+        ride(&tx, 6, steady).await;
         let at = first_power_at_or_after(&fake, 200, back).expect("target never restored");
-        assert!(at - back <= Duration::from_secs(2), "restored after {:?}", at - back);
+        assert!(at - back >= Duration::from_secs(2), "restored after only {:?}", at - back);
+        assert!(at - back <= Duration::from_secs(4), "restored after {:?}", at - back);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn power_mode_keeps_cut_while_cadence_below_40rpm() {
+        // Low cadence under ERG is the "spiral of death": stay at 0 W.
+        let (zc, fake, tx) = setup();
+        start(&zc, &tx, power_target(190, 210, None), None).await;
+        ride(&tx, 3, steady).await;
+        ride(&tx, 6, |_| vec![cadence(0.0)]).await;
+        let cut = Instant::now();
+        ride(&tx, 10, |_| vec![cadence(30.0)]).await;
+        assert_eq!(first_power_at_or_after(&fake, 200, cut), None, "restored at 30 rpm");
+        // A 1 s burst at 90 rpm is not sustained
+        ride(&tx, 1, |_| vec![cadence(90.0)]).await;
+        ride(&tx, 3, |_| vec![cadence(30.0)]).await;
+        assert_eq!(first_power_at_or_after(&fake, 200, cut), None, "restored after 1 s burst");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_safety_cut_stops_within_6s_wall_clock() {
+        // Each send blocks to its 3 s timeout, so 3 ticks would take ~9-10 s;
+        // the 6 s wall-clock bound must stop the ride first.
+        let (zc, fake, tx) = setup();
+        start(&zc, &tx, power_target(190, 210, None), None).await;
+        ride(&tx, 3, steady).await;
+        // Every 0 W send blocks exactly to the 3 s command timeout
+        fake.set_power_behavior(Behavior::Hang(TRAINER_COMMAND_TIMEOUT));
+        ride(&tx, 20, |_| vec![cadence(0.0)]).await;
+        assert_eq!(zc.status().await.stop_reason, Some(StopReason::TrainerUnresponsive));
+        let zero_attempts: Vec<Instant> = fake
+            .attempts()
+            .into_iter()
+            .filter(|(c, _)| *c == TrainerCmd::Power(0))
+            .map(|(_, at)| at)
+            .collect();
+        let first_cut = zero_attempts[0];
+        let release = *zero_attempts.last().unwrap(); // finalize's 0 W
+        assert!(
+            release - first_cut <= Duration::from_secs(6),
+            "stopped {:?} after the first undelivered cut",
+            release - first_cut
+        );
     }
 
     #[tokio::test(start_paused = true)]
