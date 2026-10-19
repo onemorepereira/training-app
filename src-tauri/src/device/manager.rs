@@ -20,7 +20,12 @@ use crate::session::storage::Storage;
 
 enum TrainerBackend {
     Ftms(TrainerController),
-    Fec { usb: Arc<AntUsb>, channel: u8 },
+    Fec {
+        usb: Arc<AntUsb>,
+        channel: u8,
+        /// Wind coefficient last acknowledged by the trainer (page 0x32 is resent only on change).
+        last_cw_raw: Option<u8>,
+    },
 }
 
 use crate::config;
@@ -424,7 +429,7 @@ impl DeviceManager {
                 if let Some((usb, channel)) = ant.get_fec_channel(device_id) {
                     self.trainer_backends.insert(
                         device_id.to_string(),
-                        TrainerBackend::Fec { usb, channel },
+                        TrainerBackend::Fec { usb, channel, last_cw_raw: None },
                     );
                     info!("[{}] FE-C trainer controller created", device_id);
                 }
@@ -593,7 +598,7 @@ impl DeviceManager {
             Some(TrainerBackend::Ftms(controller)) => {
                 controller.set_target_power(watts).await
             }
-            Some(TrainerBackend::Fec { usb, channel }) => {
+            Some(TrainerBackend::Fec { usb, channel, .. }) => {
                 let usb = usb.clone();
                 let ch = *channel;
                 let w = watts.max(0) as u16;
@@ -617,7 +622,7 @@ impl DeviceManager {
             Some(TrainerBackend::Ftms(controller)) => {
                 controller.set_resistance(level).await
             }
-            Some(TrainerBackend::Fec { usb, channel }) => {
+            Some(TrainerBackend::Fec { usb, channel, .. }) => {
                 let usb = usb.clone();
                 let ch = *channel;
                 let lvl = level;
@@ -647,15 +652,17 @@ impl DeviceManager {
             Some(TrainerBackend::Ftms(controller)) => {
                 controller.set_simulation(grade, crr, cw).await
             }
-            Some(TrainerBackend::Fec { usb, channel }) => {
+            Some(TrainerBackend::Fec { usb, channel, last_cw_raw }) => {
                 let usb = usb.clone();
                 let ch = *channel;
-                tokio::task::spawn_blocking(move || {
+                let last = *last_cw_raw;
+                let sent = tokio::task::spawn_blocking(move || {
                     let fec = FecController::new(&usb, ch);
-                    fec.set_simulation(grade, crr, cw)
+                    fec.set_simulation(grade, crr, cw, last)
                 })
                 .await
-                .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?
+                .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?;
+                sent.map(|raw| *last_cw_raw = Some(raw))
             }
             None => Err(AppError::Session("No trainer connected".into())),
         };

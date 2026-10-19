@@ -28,11 +28,15 @@ pub(crate) fn encode_resistance(level: u8) -> Vec<u8> {
 }
 
 /// Encode FTMS Set Indoor Bike Simulation Parameters (0x11).
+/// FTMS v1.0 §4.16.2.18 Table 4.20: wind speed sint16 (0.001 m/s), grade sint16 (0.01 %),
+/// Crr uint8 (0.0001), Cw uint8 (0.01 kg/m). Values round to nearest; NaN is treated as 0.
 pub(crate) fn encode_simulation(grade: f32, crr: f32, cw: f32) -> Vec<u8> {
+    let finite = |v: f32| if v.is_nan() { 0.0 } else { v };
     let wind_speed: i16 = 0;
-    let grade_raw = (grade.clamp(-100.0, 100.0) * 100.0) as i16;
-    let crr_raw = (crr.clamp(0.0, 0.0255) / 0.0001) as u8;
-    let cw_raw = (cw.clamp(0.0, 2.55) / 0.01) as u8;
+    // Clamped to ±100 % → raw ±10000, well inside sint16.
+    let grade_raw = (finite(grade).clamp(-100.0, 100.0) * 100.0).round() as i16;
+    let crr_raw = (finite(crr).clamp(0.0, 0.0255) / 0.0001).round() as u8;
+    let cw_raw = (finite(cw).clamp(0.0, 2.55) / 0.01).round() as u8;
     let wind_bytes = wind_speed.to_le_bytes();
     let grade_bytes = grade_raw.to_le_bytes();
     vec![
@@ -285,5 +289,37 @@ mod tests {
         assert_eq!(data[5], 255);
         // cw clamped to 2.55: 2.55 / 0.01 = 255
         assert_eq!(data[6], 255);
+    }
+
+    // FTMS v1.0 §4.16.2.18 Table 4.20: grade sint16, 0.01 % resolution.
+
+    #[test]
+    fn ftms_grade_2_3_rounds_to_230() {
+        let data = encode_simulation(2.3, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 230);
+        // 2.296 % → 229.6 raw → nearest 0.01 % is 230 (truncation gave 229)
+        let data = encode_simulation(2.296, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 230);
+        // -2.296 % → -230 (truncation toward zero gave -229)
+        let data = encode_simulation(-2.296, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), -230);
+    }
+
+    #[test]
+    fn ftms_grade_clamped_to_plus_minus_100() {
+        let data = encode_simulation(150.0, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 10000);
+    }
+
+    #[test]
+    fn ftms_grade_nan_encodes_zero() {
+        let data = encode_simulation(f32::NAN, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 0);
+    }
+
+    #[test]
+    fn ftms_crr_rounds_to_nearest() {
+        // 0.00406 / 0.0001 = 40.6 → 41 (truncation gave 40)
+        assert_eq!(encode_simulation(0.0, 0.00406, 0.0)[5], 41);
     }
 }
