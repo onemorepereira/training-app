@@ -25,6 +25,38 @@ let latestHR: number | null = null;
 let latestCadence: number | null = null;
 let latestSpeed: number | null = null;
 
+/** Wall-clock ms of the last reading per channel (0 = never seen). */
+const lastSeenAt = { power: 0, hr: 0, cadence: 0, speed: 0 };
+
+/** A channel is fresh if it had a reading within this window (matches backend READING_FRESHNESS_SECS). */
+export const SENSOR_FRESHNESS_MS = 5000;
+
+export interface SensorSnapshot {
+  power: number | null;
+  hr: number | null;
+  cadence: number | null;
+  speed: number | null;
+  powerFresh: boolean;
+  hrFresh: boolean;
+  cadenceFresh: boolean;
+  speedFresh: boolean;
+}
+
+/** Latest value and freshness of every channel, based on frontend receive times. */
+export function getSensorSnapshot(now: number = Date.now()): SensorSnapshot {
+  const fresh = (t: number) => t > 0 && now - t <= SENSOR_FRESHNESS_MS;
+  return {
+    power: latestPower,
+    hr: latestHR,
+    cadence: latestCadence,
+    speed: latestSpeed,
+    powerFresh: fresh(lastSeenAt.power),
+    hrFresh: fresh(lastSeenAt.hr),
+    cadenceFresh: fresh(lastSeenAt.cadence),
+    speedFresh: fresh(lastSeenAt.speed),
+  };
+}
+
 let unlistenSensor: (() => void) | null = null;
 let unlistenMetrics: (() => void) | null = null;
 let generation = 0;
@@ -37,10 +69,11 @@ export async function startSensorListening() {
   const [sensorUn, metricsUn] = await Promise.all([
     listen<SensorReading>('sensor_reading', (event) => {
       const reading = event.payload;
-      if (reading.Power) { latestPower = reading.Power.watts; currentPower.set(latestPower); }
-      if (reading.HeartRate) { latestHR = reading.HeartRate.bpm; currentHR.set(latestHR); }
-      if (reading.Cadence) { latestCadence = reading.Cadence.rpm; currentCadence.set(latestCadence); }
-      if (reading.Speed) { latestSpeed = reading.Speed.kmh; currentSpeed.set(latestSpeed); }
+      const now = Date.now();
+      if (reading.Power) { latestPower = reading.Power.watts; lastSeenAt.power = now; currentPower.set(latestPower); }
+      if (reading.HeartRate) { latestHR = reading.HeartRate.bpm; lastSeenAt.hr = now; currentHR.set(latestHR); }
+      if (reading.Cadence) { latestCadence = reading.Cadence.rpm; lastSeenAt.cadence = now; currentCadence.set(latestCadence); }
+      if (reading.Speed) { latestSpeed = reading.Speed.kmh; lastSeenAt.speed = now; currentSpeed.set(latestSpeed); }
 
       if (get(sessionActive) && !get(sessionPaused)) {
         metricHistory.update((h) => {
@@ -82,4 +115,5 @@ export function stopSensorListening() {
   latestHR = null;
   latestCadence = null;
   latestSpeed = null;
+  lastSeenAt.power = lastSeenAt.hr = lastSeenAt.cadence = lastSeenAt.speed = 0;
 }

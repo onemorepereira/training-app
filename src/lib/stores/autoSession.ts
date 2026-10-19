@@ -1,6 +1,6 @@
 import { writable, get } from 'svelte/store';
-import { currentCadence, currentSpeed, liveMetrics } from '$lib/stores/sensor';
-import { sessionActive } from '$lib/stores/session';
+import { currentCadence, getSensorSnapshot } from '$lib/stores/sensor';
+import { sessionActive, sessionPaused } from '$lib/stores/session';
 import { startSession, endSession, lifecycleError } from '$lib/stores/sessionLifecycle';
 import { extractError } from '$lib/tauri';
 
@@ -12,7 +12,23 @@ const AUTO_STOP_THRESHOLD_SECS = 3;
 
 let tickInterval: ReturnType<typeof setInterval> | null = null;
 let cadenceAboveZeroTicks = 0;
-let speedZeroTicks = 0;
+let idleTicks = 0;
+
+/**
+ * Whether the rider has stopped, from the freshest available channel.
+ * Speed decides if fresh; otherwise cadence if fresh; otherwise unknown (null),
+ * which must never auto-stop (no sensors, or a sensor dropout).
+ */
+export function isRiderIdle(s: {
+  speed: number | null;
+  speedFresh: boolean;
+  cadence: number | null;
+  cadenceFresh: boolean;
+}): boolean | null {
+  if (s.speedFresh) return s.speed === 0;
+  if (s.cadenceFresh) return s.cadence === 0;
+  return null;
+}
 
 function tick() {
   const enabled = get(autoSessionEnabled);
@@ -23,7 +39,6 @@ function tick() {
 
   const active = get(sessionActive);
   const cadence = get(currentCadence);
-  const speed = get(currentSpeed);
 
   if (!active) {
     // Auto-start logic: cadence > 0 for 5 consecutive seconds
@@ -42,19 +57,18 @@ function tick() {
       autoSessionCountdown.set(null);
     }
     // Reset stop counter when no session
-    speedZeroTicks = 0;
+    idleTicks = 0;
   } else {
-    // Auto-stop logic: speed = 0 (or stale sensor) for 3 consecutive seconds
-    const metrics = get(liveMetrics);
-    const speedStale = metrics?.stale_speed ?? false;
-    if (speed == null || speed === 0 || speedStale) {
-      speedZeroTicks++;
-      if (speedZeroTicks >= AUTO_STOP_THRESHOLD_SECS) {
-        speedZeroTicks = 0;
+    // Auto-stop: rider idle for 3 consecutive ticks; never while paused.
+    const idle = get(sessionPaused) ? null : isRiderIdle(getSensorSnapshot());
+    if (idle === true) {
+      idleTicks++;
+      if (idleTicks >= AUTO_STOP_THRESHOLD_SECS) {
+        idleTicks = 0;
         void endSession(); // surfaces errors via lifecycleError
       }
     } else {
-      speedZeroTicks = 0;
+      idleTicks = 0;
     }
     // Reset start counter when session is active
     cadenceAboveZeroTicks = 0;
@@ -64,7 +78,7 @@ function tick() {
 
 function resetCounters() {
   cadenceAboveZeroTicks = 0;
-  speedZeroTicks = 0;
+  idleTicks = 0;
   autoSessionCountdown.set(null);
 }
 
