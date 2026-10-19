@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn fit_export_with_readings() {
-        let summary = make_summary();
+        let summary = summary_with_duration(2);
         let readings = vec![
             SensorReading::Power {
                 watts: 200,
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn fit_export_distance_from_speed_readings() {
-        let summary = make_summary();
+        let summary = summary_with_duration(10);
         let base_ms: u64 = 1718445600_000;
         // 10 seconds of speed readings at 36 km/h = 10 m/s
         // Expected distance: 10m/s * 10s = 100m => 100 * 100 = 10000 (m*100)
@@ -818,6 +818,46 @@ mod tests {
         SensorReading::Speed { kmh, timestamp: None, epoch_ms: BASE_MS + ms_offset, device_id: "t".into() }
     }
 
+    /// Summary whose active duration matches the readings fed with it.
+    fn summary_with_duration(duration_secs: u64) -> SessionSummary {
+        let mut s = make_summary();
+        s.duration_secs = duration_secs;
+        s
+    }
+
+    #[test]
+    fn fit_end_ts_falls_back_to_active_duration_when_longer_than_span() {
+        // Active duration (3600 s) exceeds the data span (records 0..=59 s):
+        // end_ts = start + duration, still ≥ the last record; timer ≤ elapsed.
+        let readings: Vec<SensorReading> = (0..60).map(|s| pw(200, s)).collect();
+        let data = export_fit(&summary_with_duration(3600), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let last_record_ts = records(&msgs).last().unwrap().field_u32(253).unwrap();
+        assert_eq!(last_record_ts, BASE_FIT + 59);
+        for global in [18u16, 19] {
+            let m = msgs.iter().find(|m| m.global_msg == global).unwrap();
+            let end = m.field_u32(253).unwrap();
+            assert_eq!(end, BASE_FIT + 3600, "msg {global} end = start + active duration");
+            assert!(end >= last_record_ts);
+            let (elapsed, timer) = (m.field_u32(7).unwrap(), m.field_u32(8).unwrap());
+            assert_eq!(elapsed, 3_600_000);
+            assert!(timer <= elapsed, "msg {global}: timer {timer} > elapsed {elapsed}");
+        }
+    }
+
+    #[test]
+    fn fit_end_ts_is_last_record_when_span_exceeds_duration() {
+        // Records span 59 s but only 30 s were active: end = last record,
+        // elapsed = 59 s, timer = 30 s.
+        let readings: Vec<SensorReading> = (0..60).map(|s| pw(200, s)).collect();
+        let data = export_fit(&summary_with_duration(30), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let session = msgs.iter().find(|m| m.global_msg == 18).unwrap();
+        assert_eq!(session.field_u32(253), Some(BASE_FIT + 59));
+        assert_eq!(session.field_u32(7), Some(59_000));
+        assert_eq!(session.field_u32(8), Some(30_000));
+    }
+
     fn records(msgs: &[FitMsg]) -> Vec<&FitMsg> {
         msgs.iter().filter(|m| m.global_msg == 20).collect()
     }
@@ -839,7 +879,7 @@ mod tests {
         let readings: Vec<SensorReading> = (0..60)
             .flat_map(|s| [hr_at(140, s * 1000), spd_at(36.0, s * 1000 + 500)])
             .collect();
-        let data = export_fit(&make_summary(), &readings).unwrap();
+        let data = export_fit(&summary_with_duration(60), &readings).unwrap();
         let msgs = parse_fit_messages(&data);
         let recs = records(&msgs);
         assert_eq!(recs.len(), 60, "one record per second of data");
@@ -862,7 +902,7 @@ mod tests {
                 })
             })
             .collect();
-        let data = export_fit(&make_summary(), &readings).unwrap();
+        let data = export_fit(&summary_with_duration(10), &readings).unwrap();
         let msgs = parse_fit_messages(&data);
         let recs = records(&msgs);
         assert_eq!(recs.len(), 10);
@@ -925,7 +965,7 @@ mod tests {
     fn fit_short_pause_writes_no_timer_events() {
         // 4 s hole (≤ 5 s) is indistinguishable from a sensor hole → no timer events
         let readings: Vec<SensorReading> = (0..10).chain(14..20).map(|s| pw(200, s)).collect();
-        let data = export_fit(&make_summary(), &readings).unwrap();
+        let data = export_fit(&summary_with_duration(20), &readings).unwrap();
         let msgs = parse_fit_messages(&data);
         assert_eq!(msgs.iter().filter(|m| m.global_msg == 21).count(), 2);
     }
@@ -935,7 +975,7 @@ mod tests {
         // 36 km/h (10 m/s) for 0..=10 s, 10-min gap, 36 km/h for 610..=620 s
         let readings: Vec<SensorReading> =
             (0..=10).chain(610..=620).map(|s| spd_at(36.0, s * 1000)).collect();
-        let data = export_fit(&make_summary(), &readings).unwrap();
+        let data = export_fit(&summary_with_duration(25), &readings).unwrap();
         let msgs = parse_fit_messages(&data);
         let last = *records(&msgs).last().unwrap();
         // (10 s + 5 s capped gap + 10 s) × 10 m/s = 250 m → ×100 = 25000
@@ -947,7 +987,7 @@ mod tests {
         // Power every second for 20 s; HR strap drops after its reading at 4 s
         let mut readings: Vec<SensorReading> = (0..20).map(|s| pw(200, s)).collect();
         readings.extend((0..=4).map(|s| hr_at(150, s * 1000)));
-        let data = export_fit(&make_summary(), &readings).unwrap();
+        let data = export_fit(&summary_with_duration(20), &readings).unwrap();
         let msgs = parse_fit_messages(&data);
         let recs = records(&msgs);
         assert_eq!(recs[9].field_u8(3), Some(150), "5 s after last HR: still valid");
@@ -988,8 +1028,8 @@ mod tests {
             (0..60).flat_map(|s| [pw(200, s), hr_at(140, s * 1000 + 300)]).collect();
         for (name, summary, readings) in [
             ("paused.fit", &paused, &paused_readings),
-            ("hr_speed_only.fit", &make_summary(), &hr_speed),
-            ("power_hr.fit", &make_summary(), &power_hr),
+            ("hr_speed_only.fit", &summary_with_duration(60), &hr_speed),
+            ("power_hr.fit", &summary_with_duration(60), &power_hr),
         ] {
             let data = export_fit(summary, readings).unwrap();
             std::fs::write(std::path::Path::new(&dir).join(name), data).unwrap();

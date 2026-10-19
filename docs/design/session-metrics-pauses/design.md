@@ -241,7 +241,8 @@ Each slice is one commit with its tests, test first.
 ## Verification
 
 Commands (2026-10-18, branch `fix/session-metrics-pauses`):
-`cd src-tauri && cargo test` → 355 passed, 1 ignored (`write_fit_fixtures`, manual helper), 0 failed (baseline on `main`: 289). `npm test` → 72 passed (baseline 71). `npm run check` → 0 errors, 0 warnings. `cargo build --features production` → builds.
+`cd src-tauri && cargo test` → 361 passed, 1 ignored (`write_fit_fixtures`, manual helper), 0 failed (baseline on `main`: 289). `npm test` → 72 passed (baseline 71).
+Updated after the verify-review follow-ups (backup verification, trainer commands, blocking pool, FIT durations). `npm run check` → 0 errors, 0 warnings. `cargo build --features production` → builds.
 Every new behaviour test below was run and seen failing against the pre-fix code before the fix landed. The exceptions are regression guards that already passed and tests written together with a new type/API, which were mutation-checked instead (zone snapshot: reverting the analysis/manager wiring fails `zone_distribution_uses_session_zones_snapshot` and `stop_summary_captures_zones_from_session_config`).
 
 | AC | Proven by (all in `src-tauri/src/session/…` unless noted) |
@@ -250,32 +251,40 @@ Every new behaviour test below was run and seen failing against the pre-fix code
 | AC2 | `metrics::tests::work_gap_contributes_at_most_5s` (720.6 kJ), `distance_gap_contributes_at_most_5s` (30.033 km); `gap::tests::*` (boundary 5000 ms not a gap, cap, backward timestamps) |
 | AC3 | `analysis::tests::power_curve_not_carried_across_gap`, `power_curve_holds_value_across_short_hole`, `power_curve_best_found_in_later_segment`; `gap::tests::resample_splits_segments_at_gap`; `storage::tests::save_power_curve_replaces_stale_durations` |
 | AC4 | `analysis::tests::timeseries_includes_readings_after_pause`, `timeseries_bad_epoch_does_not_allocate_wall_clock_span` |
-| AC5 | `fit_export::tests::fit_hr_speed_only_ride_has_one_record_per_second`, `fit_power_at_4hz_yields_one_record_per_second_with_mean_power`, `fit_paused_ride_end_ts_not_before_last_record`, `fit_paused_ride_elapsed_is_wall_clock_timer_is_active`, `fit_writes_timer_stop_start_around_gap`, `fit_short_pause_writes_no_timer_events`, `fit_record_distance_follows_gap_rule`, `fit_hr_invalid_after_5s_without_reading`, `fit_paused_ride_decodes_with_fitparser` |
+| AC5 | `fit_export::tests::fit_hr_speed_only_ride_has_one_record_per_second`, `fit_power_at_4hz_yields_one_record_per_second_with_mean_power`, `fit_paused_ride_end_ts_not_before_last_record`, `fit_paused_ride_elapsed_is_wall_clock_timer_is_active`, `fit_writes_timer_stop_start_around_gap`, `fit_short_pause_writes_no_timer_events`, `fit_record_distance_follows_gap_rule`, `fit_hr_invalid_after_5s_without_reading`, `fit_paused_ride_decodes_with_fitparser`, `fit_end_ts_falls_back_to_active_duration_when_longer_than_span`, `fit_end_ts_is_last_record_when_span_exceeds_duration` (the last two were added after the fix as coverage tests, so they passed from the start). All make_summary-based exports with readings use a `duration_secs` that matches the readings. |
 | AC6 | `fit_export::tests::fit_session_threshold_power_is_field_45`, `fit_device_info_manufacturer_is_field_2`, `fit_export_decodes_with_fitparser` (fitparser =0.11.0), the existing CRC/structure tests, and the recorded fitdecode check below |
 | AC7 | `metrics::tests::avg_power_3s_uses_exactly_last_3_samples_at_1hz`, `avg_power_30s_uses_exactly_last_30_samples_at_1hz`, `avg_power_window_excludes_sample_exactly_window_old` (replaces `avg_power_window_boundary_is_inclusive`) |
 | AC8 | `manager::tests::stop_summary_rounds_avg_power_half_up`, `stop_summary_rounds_avg_power_down`, `stop_summary_rounds_np_to_nearest` |
 | AC9 | `analysis::tests::zone_distribution_uses_session_zones_snapshot`, `analysis_falls_back_to_config_zones_when_snapshot_missing`; `manager::tests::stop_summary_captures_zones_from_session_config`; `storage::tests::save_session_round_trips_zones`, `legacy_row_has_no_zones`, `autosave_summary_json_without_zones_still_deserializes`, `reopening_storage_is_idempotent_with_app_meta_and_zones` |
 | AC10 | `src/lib/utils/zoneAnalysis.test.ts` › computeTimeToZone › `uses elapsed_secs when a second is missing from the series`, `measures from the first point when the series starts after 0` |
-| AC11 | `repair::tests::repair_recomputes_metrics_from_raw_log`, `repair_leaves_duration_ftp_and_metadata_untouched`, `repair_rebuilds_power_curve_dropping_stale_durations`, `repair_runs_once`, `repair_creates_backup_before_writing`, `repair_rerun_after_interruption_is_idempotent`, `repair_skips_missing_raw_log_and_still_sets_marker`, `repair_skips_corrupt_raw_log`, `repair_does_not_set_marker_when_a_write_fails`, `repair_gives_up_after_three_failed_attempts`, `repair_fresh_db_sets_marker_without_backup`, `repair_null_ftp_derives_ftp_from_stored_np_and_if`, `repair_null_ftp_without_if_keeps_stored_if_and_tss`, `replace_metrics_for_deleted_session_writes_nothing`; live/repair parity: `manager::tests::live_summary_equals_replayed_summary`; deleted-session race: `storage::tests::save_power_curve_for_deleted_session_writes_nothing`, `best_power_curve_ignores_orphan_rows`; meta: `get_meta_missing_key_returns_none`, `set_meta_overwrites_value` |
+| AC11 | `repair::tests::repair_recomputes_metrics_from_raw_log`, `repair_leaves_duration_ftp_and_metadata_untouched`, `repair_rebuilds_power_curve_dropping_stale_durations`, `repair_runs_once`, `repair_creates_backup_before_writing`, `repair_rerun_after_interruption_is_idempotent`, `repair_skips_missing_raw_log_and_still_sets_marker`, `repair_skips_corrupt_raw_log`, `repair_does_not_set_marker_when_a_write_fails`, `repair_gives_up_after_three_failed_attempts`, `repair_fresh_db_sets_marker_without_backup`, `repair_null_ftp_derives_ftp_from_stored_np_and_if`, `repair_null_ftp_without_if_keeps_stored_if_and_tss`, `replace_metrics_for_deleted_session_writes_nothing`; live/repair parity: `manager::tests::live_summary_equals_replayed_summary`; deleted-session race: `storage::tests::save_power_curve_for_deleted_session_writes_nothing`, `best_power_curve_ignores_orphan_rows`; meta: `get_meta_missing_key_returns_none`, `set_meta_overwrites_value`; backup integrity: `repair_replaces_corrupt_existing_backup_with_verified_one`, `repair_removes_stale_tmp_backup`; active time from sensor readings only: `manager::tests::trainer_commands_do_not_extend_active_time`, `active_time_counts_continuous_readings` |
 | AC12 | the suite results above |
 
 **Recorded independent decoder check (AC6).** Steps:
 1. `FIT_FIXTURE_DIR=<dir> cargo test --lib write_fit_fixtures -- --ignored` wrote three fixtures.
 2. A script decoded them with `fitdecode==0.11.0` (Python venv, `CrcCheck.RAISE`, so the header and file CRCs were verified).
 
-Output, abridged:
+Output, regenerated after the duration fix to the fixtures (`hr_speed_only` and `power_hr` now use `duration_secs = 60`), record dicts trimmed:
 ```
 == paused.fit
   messages: {'file_id': 1, 'device_info': 1, 'event': 4, 'record': 120, 'lap': 1, 'session': 1, 'activity': 1}
   device_info (manufacturer, serial): ('development', False)
   session: {'total_elapsed_time': 719.0, 'total_timer_time': 120.0, 'threshold_power': 200, 'normalized_power': 190, 'training_stress_score': 75.0, 'intensity_factor': 0.95, 'has_end_position_lat': False}
-  timer events: [('start', '…10:00:00'), ('stop_all', '…10:00:59'), ('start', '…10:11:00'), ('stop_all', '…10:11:59')]
+  timer events: [('start', '2024-06-15T10:00:00+00:00'), ('stop_all', '2024-06-15T10:00:59+00:00'), ('start', '2024-06-15T10:11:00+00:00'), ('stop_all', '2024-06-15T10:11:59+00:00')]
+  first record: {'timestamp': 10:00:00, 'power': 200, 'heart_rate': 140, 'cadence': None, 'speed': None, 'distance': None}
+  last record:  {'timestamp': 10:11:59, 'power': 200, 'heart_rate': 140, 'cadence': None, 'speed': None, 'distance': None}
 == hr_speed_only.fit
-  messages: {… 'event': 2, 'record': 60, …}
-  first record: {'power': None, 'heart_rate': 140, 'speed': 10.0, 'distance': 0.0}
-  last record:  {'power': None, 'heart_rate': 140, 'speed': 10.0, 'distance': 590.0}
+  messages: {'file_id': 1, 'device_info': 1, 'event': 2, 'record': 60, 'lap': 1, 'session': 1, 'activity': 1}
+  device_info (manufacturer, serial): ('development', False)
+  session: {'total_elapsed_time': 60.0, 'total_timer_time': 60.0, 'threshold_power': 200, ..., 'has_end_position_lat': False}
+  timer events: [('start', '2024-06-15T10:00:00+00:00'), ('stop_all', '2024-06-15T10:01:00+00:00')]
+  first record: {'timestamp': 10:00:00, 'power': None, 'heart_rate': 140, 'speed': 10.0, 'distance': 0.0}
+  last record:  {'timestamp': 10:00:59, 'power': None, 'heart_rate': 140, 'speed': 10.0, 'distance': 590.0}
 == power_hr.fit
-  messages: {… 'event': 2, 'record': 60, …}; records carry power 200 and heart_rate 140
+  messages: {'file_id': 1, 'device_info': 1, 'event': 2, 'record': 60, 'lap': 1, 'session': 1, 'activity': 1}
+  session: {'total_elapsed_time': 60.0, 'total_timer_time': 60.0, 'threshold_power': 200, ..., 'has_end_position_lat': False}
+  timer events: [('start', '2024-06-15T10:00:00+00:00'), ('stop_all', '2024-06-15T10:01:00+00:00')]
+  first/last record: power 200, heart_rate 140 at 10:00:00 / 10:00:59
 ```
 
 **Not proven automatically:**
