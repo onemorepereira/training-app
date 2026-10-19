@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { reconnectingDevices } from '$lib/stores/devices';
-  import { api, extractError } from '$lib/tauri';
+  import { reconnectingDevices, reconnectDevice } from '$lib/stores/devices';
+  import { extractError } from '$lib/tauri';
 
   function deviceTypeLabel(type: string): string {
     switch (type) {
@@ -17,7 +17,7 @@
   async function manualReconnect(deviceId: string) {
     reconnectError = '';
     try {
-      await api.connectDevice(deviceId);
+      await reconnectDevice(deviceId);
     } catch (e) {
       reconnectError = extractError(e);
     }
