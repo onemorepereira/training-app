@@ -9,15 +9,9 @@ use crate::device::manager::DeviceManager;
 use crate::device::types::{CommandSource, SensorReading};
 use crate::error::AppError;
 
-use super::pid::{adaptive_gains, HrSmoother, PidController};
+use super::pid::{HrPid, HrSmoother, PowerBand};
 use super::types::{StopReason, ZoneControlStatus, ZoneMode, ZoneTarget};
 
-/// Maximum watts per tick when ramping UP (rate limiter, separate from PID output_limit)
-const HR_MAX_WATTS_UP_PER_TICK: f64 = 10.0;
-/// Maximum watts per tick when ramping DOWN (faster — reducing power is always safe)
-const HR_MAX_WATTS_DOWN_PER_TICK: f64 = 30.0;
-/// Integral decay factor when HR is above zone but already falling
-const INTEGRAL_DECAY_ON_FALLING_HR: f64 = 0.7;
 /// Minimum commanded power (watts)
 const MIN_POWER: u16 = 50;
 /// Safety: reduce to this power when HR ceiling exceeded
@@ -54,8 +48,6 @@ struct ControlLoopState {
     max_hr: Option<u8>,
     /// Instant of the last processed tick, for measuring actual elapsed time
     last_tick_at: Option<Instant>,
-    /// Whether HR was above zone on previous tick (for integral reset on re-entry)
-    was_above_zone: bool,
     /// Power zone percentages from user config (for HR mode power banding)
     power_zones: Option<[u16; 6]>,
 }
@@ -83,7 +75,6 @@ impl ControlLoopState {
             ftp: None,
             max_hr: None,
             last_tick_at: None,
-            was_above_zone: false,
             power_zones: None,
         }
     }
@@ -183,7 +174,6 @@ impl ZoneController {
             state.last_power_seen = Some(Instant::now());
             state.ftp = ftp;
             state.max_hr = max_hr;
-            state.was_above_zone = false;
             state.power_zones = power_zones;
         }
 
@@ -349,7 +339,7 @@ async fn control_loop(
     tick.tick().await;
 
     // HR mode PID and smoother (only used for HeartRate mode)
-    let mut pid = PidController::new(2.0, 0.1, 0.5);
+    let mut pid = HrPid::new(state.lock().await.commanded_power);
     let mut hr_smoother = HrSmoother::new(5);
 
     loop {
@@ -411,7 +401,7 @@ async fn process_tick(
     target: &ZoneTarget,
     device_manager: &Arc<Mutex<DeviceManager>>,
     sensor_tx: &broadcast::Sender<SensorReading>,
-    pid: &mut PidController,
+    pid: &mut HrPid,
     hr_smoother: &HrSmoother,
 ) -> bool {
     let mut s = state.lock().await;
@@ -561,25 +551,17 @@ fn process_power_tick(s: &mut ControlLoopState, target: &ZoneTarget, tick_ms: u6
     }
 }
 
-/// HR mode tick: uses PID controller with adaptive gains to adjust power.
+/// HR mode tick: positional PID (design ADR-1) adjusts power toward the HR target.
 /// Returns Some(new_watts) if power should be changed, None to hold.
 fn process_hr_tick(
     s: &mut ControlLoopState,
     target: &ZoneTarget,
-    pid: &mut PidController,
+    pid: &mut HrPid,
     hr_smoother: &HrSmoother,
     tick_ms: u64,
 ) -> Option<u16> {
     let smoothed_hr = hr_smoother.smoothed()?;
-    let target_hr = ((target.lower_bound + target.upper_bound) / 2) as f64;
-    let error = target_hr - smoothed_hr as f64;
-
-    // Integral reset on zone re-entry: clear integral when HR drops from above-zone back into zone
-    let above_zone = (smoothed_hr as u16) > target.upper_bound;
-    if s.was_above_zone && !above_zone {
-        pid.reset_integral();
-    }
-    s.was_above_zone = above_zone;
+    let target_hr = (target.lower_bound as f64 + target.upper_bound as f64) / 2.0;
 
     // Track time in zone
     let prev_phase = s.phase.clone();
@@ -592,67 +574,34 @@ fn process_hr_tick(
     } else {
         s.phase = "adjusting".to_string();
     }
-
     if s.phase != prev_phase {
         debug!("Phase transition: {} -> {}", prev_phase, s.phase);
     }
-
-    // Adaptive gains based on distance from target
-    let (kp, ki, kd) = adaptive_gains(error.abs());
-    pid.set_gains(kp, ki, kd);
-
-    let dt_secs = tick_ms as f64 / 1000.0;
-    let watts_adjustment = pid.update(error, dt_secs);
 
     // Derive power band from HR zone number and power zone config
     let (power_floor, power_ceiling) = match (s.ftp, s.power_zones) {
         (Some(ftp), Some(pz)) => {
             let zone = target.zone;
-            // Floor: one power zone below (zone-2 index, or MIN_POWER for zone 1)
             let floor = if zone >= 2 {
                 (ftp as f64 * pz[(zone - 2) as usize] as f64 / 100.0) as u16
             } else {
                 MIN_POWER
             };
-            // Ceiling: one power zone above (zone index, capped at array length)
             let ceil_idx = (zone as usize).min(5);
             let ceiling = (ftp as f64 * pz[ceil_idx] as f64 / 100.0) as u16;
             (floor.max(MIN_POWER), ceiling)
         }
         _ => (MIN_POWER, s.ftp.map(|f| (f as f64 * 1.5) as u16).unwrap_or(400)),
     };
+    let band = PowerBand { floor: power_floor, ceiling: power_ceiling };
 
-    // Rate limit: asymmetric — ramp down faster than up, with faster recovery when below band
-    let band_midpoint = (power_floor + power_ceiling) / 2;
-    let max_up = if error > 0.0 && s.commanded_power < band_midpoint.saturating_sub(20) {
-        HR_MAX_WATTS_UP_PER_TICK * 2.0 // 20W/tick during recovery
-    } else {
-        HR_MAX_WATTS_UP_PER_TICK // 10W/tick normal
-    };
-    let clamped_adjustment = if watts_adjustment < 0.0 {
-        watts_adjustment.max(-HR_MAX_WATTS_DOWN_PER_TICK)
-    } else {
-        watts_adjustment.min(max_up)
-    };
-
-    // Decay integral when HR is above zone but already falling
-    if error < 0.0 {
-        if let Some(prev_hr) = s.last_hr {
-            if (prev_hr as f64) > smoothed_hr as f64 {
-                pid.decay_integral(INTEGRAL_DECAY_ON_FALLING_HR);
-            }
-        }
-    }
-
-    let new_power_f = s.commanded_power as f64 + clamped_adjustment;
-
-    // Clamp to power band [power_floor, power_ceiling]
-    let new_power = (new_power_f as u16).clamp(power_floor, power_ceiling);
+    let dt_secs = tick_ms as f64 / 1000.0;
+    let new_power = pid.update(target_hr, smoothed_hr as f64, dt_secs, band);
 
     if new_power != s.commanded_power {
         debug!(
-            "HR PID: smoothed_hr={}, error={:.1}, adjustment={:.1}W, power {}W -> {}W",
-            smoothed_hr, error, clamped_adjustment, s.commanded_power, new_power
+            "HR PID: smoothed_hr={}, target={:.1}, integral={:.1}W, power {}W -> {}W",
+            smoothed_hr, target_hr, pid.integral(), s.commanded_power, new_power
         );
         Some(new_power)
     } else {
@@ -663,36 +612,8 @@ fn process_hr_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::pid::{HrSmoother, PidController};
+    use super::super::pid::{HrPid, HrSmoother};
     use super::super::types::{ZoneMode, ZoneTarget};
-
-    fn assert_approx(actual: f64, expected: f64, epsilon: f64, msg: &str) {
-        assert!(
-            (actual - expected).abs() <= epsilon,
-            "{msg}: expected {expected} ± {epsilon}, got {actual}"
-        );
-    }
-
-    /// Build a ControlLoopState with commanded_power and last_hr pre-set.
-    fn make_state(commanded_power: u16, last_hr: Option<u8>) -> ControlLoopState {
-        let mut s = ControlLoopState::new();
-        s.active = true;
-        s.commanded_power = commanded_power;
-        s.last_hr = last_hr;
-        s.ftp = Some(300);
-        s
-    }
-
-    /// HR zone target: 130-140 bpm, midpoint 135.
-    fn hr_target() -> ZoneTarget {
-        ZoneTarget {
-            mode: ZoneMode::HeartRate,
-            zone: 3,
-            lower_bound: 130,
-            upper_bound: 140,
-            duration_secs: None,
-        }
-    }
 
     /// Push `bpm` into smoother 5 times so smoothed() == bpm.
     fn fill_smoother(smoother: &mut HrSmoother, bpm: u8) {
@@ -701,149 +622,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ramp_down_faster_than_ramp_up() {
-        // HR=155 (20 above midpoint 135) → error=-20, PID wants large negative.
-        // Down limit is 30W, so single tick should drop > 10W.
-        let target = hr_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-        fill_smoother(&mut smoother, 155);
-        let mut s = make_state(200, None);
-
-        let new = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let drop = 200_i32 - new.unwrap() as i32;
-        assert!(drop > 10, "ramp-down should exceed old 10W limit, got {drop}W drop");
-    }
-
-    #[test]
-    fn ramp_up_still_limited_to_10w() {
-        // HR=120 (15 below midpoint 135) → error=+15, PID wants large positive.
-        // At 250W (near fallback midpoint 250), normal mode: up limit is 10W/tick.
-        let target = hr_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-        fill_smoother(&mut smoother, 120);
-        let mut s = make_state(250, None);
-
-        let new = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let gain = new.unwrap() as i32 - 250;
-        assert!(gain <= 10, "ramp-up should stay <= 10W, got {gain}W gain");
-    }
-
-    #[test]
-    fn integral_decays_when_hr_above_zone_and_falling() {
-        // HR above zone (error < 0), last_hr higher than smoothed → decay.
-        let target = hr_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-
-        // First tick: HR=150, build some negative integral
-        fill_smoother(&mut smoother, 150);
-        let mut s = make_state(200, None);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let integral_after_first = pid.integral();
-
-        // Second tick: HR=148 (falling), last_hr=150 (from raw reading)
-        fill_smoother(&mut smoother, 148);
-        s.last_hr = Some(150);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let integral_after_second = pid.integral();
-
-        // Integral should be less negative than just accumulating (decay pulled it toward zero)
-        // Without decay: integral would be integral_after_first + (-13 * 5) = more negative
-        // With decay: integral_after_first * 0.7 + (-13 * 5) = less negative
-        assert!(
-            integral_after_second.abs() < (integral_after_first + (-13.0 * 5.0)).abs(),
-            "integral should decay when HR above zone and falling: first={integral_after_first}, second={integral_after_second}"
-        );
-    }
-
-    #[test]
-    fn no_integral_decay_when_hr_below_zone() {
-        // HR=120 → error=+15 (positive), no decay should happen.
-        let target = hr_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-
-        // First tick to establish integral
-        fill_smoother(&mut smoother, 120);
-        let mut s = make_state(100, None);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let integral_after_first = pid.integral();
-
-        // Second tick: HR still below zone, last_hr=125 (falling but error > 0)
-        fill_smoother(&mut smoother, 120);
-        s.last_hr = Some(125);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let integral_after_second = pid.integral();
-
-        // Integral should keep growing (no decay), approximately first + 15*5
-        let expected_no_decay = integral_after_first + 15.0 * 5.0;
-        assert_approx(
-            integral_after_second,
-            expected_no_decay,
-            0.5,
-            "no decay when HR below zone",
-        );
-    }
-
-    #[test]
-    fn no_integral_decay_when_hr_above_zone_but_rising() {
-        // HR above zone (error < 0), but HR is rising (last_hr < smoothed) → no decay.
-        let target = hr_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-
-        // First tick at HR=150
-        fill_smoother(&mut smoother, 150);
-        let mut s = make_state(200, None);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let integral_after_first = pid.integral();
-
-        // Second tick: HR=152 (rising), last_hr=148 (lower than smoothed)
-        fill_smoother(&mut smoother, 152);
-        s.last_hr = Some(148);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let integral_after_second = pid.integral();
-
-        // Integral should just accumulate without decay: first + (-17 * 5)
-        let expected_no_decay = integral_after_first + (-17.0 * 5.0);
-        assert_approx(
-            integral_after_second,
-            expected_no_decay,
-            0.5,
-            "no decay when HR rising",
-        );
-    }
-
-    #[test]
-    fn ramp_down_multi_tick_reaches_target_faster() {
-        // Simulate 6 ticks at HR=155, starting at 200W.
-        // With 30W/tick down limit, power should reach well below 140W.
-        // Old symmetric 10W/tick would only get to 200 - 60 = 140W floor.
-        let target = hr_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-        fill_smoother(&mut smoother, 155);
-        let mut s = make_state(200, None);
-
-        for _ in 0..6 {
-            if let Some(new) = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000) {
-                s.commanded_power = new;
-            }
-        }
-
-        assert!(
-            s.commanded_power < 140,
-            "after 6 ticks, power should be < 140W (was {}W)",
-            s.commanded_power
-        );
-    }
-
-    // --- HR zone 2 helpers for power band / integral reset tests ---
-
-    /// HR zone 2 target: 139-151 bpm (matching plan context).
+    /// HR zone 2 target: 139-151 bpm.
     fn hr_zone2_target() -> ZoneTarget {
         ZoneTarget {
             mode: ZoneMode::HeartRate,
@@ -854,149 +633,162 @@ mod tests {
         }
     }
 
-    /// Build a state configured for HR zone 2 with FTP=200 and standard power zones.
-    /// Power zones [55,75,90,105,120,150]% → Z1≤110, Z2≤150, Z3≤180, Z4≤210, Z5≤240, Z6≤300.
-    /// For HR zone 2: floor=200×55%=110W (pz[0]), ceiling=200×90%=180W (pz[2]).
-    fn make_zone2_state(commanded_power: u16, last_hr: Option<u8>) -> ControlLoopState {
+    /// State for HR zone 2 with FTP=200 and standard power zones.
+    /// Power zones [55,75,90,105,120,150]% → HR zone 2 band: floor 110 W (pz[0]), ceiling 180 W (pz[2]).
+    fn make_zone2_state(commanded_power: u16) -> ControlLoopState {
         let mut s = ControlLoopState::new();
         s.active = true;
         s.commanded_power = commanded_power;
-        s.last_hr = last_hr;
         s.ftp = Some(200);
         s.power_zones = Some([55, 75, 90, 105, 120, 150]);
         s
     }
 
-    #[test]
-    fn integral_resets_on_above_to_in_zone_transition() {
-        // HR 155→145: above zone then back in zone → integral should reset to 0.
-        let target = hr_zone2_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-
-        // First tick: HR=155 (above zone, upper_bound=151)
-        fill_smoother(&mut smoother, 155);
-        let mut s = make_zone2_state(150, None);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        // Integral should be non-zero (negative from error < 0)
-        assert!(pid.integral() != 0.0, "integral should be non-zero after first tick");
-
-        // Second tick: HR=145 (in zone, not above). Transition from above→in triggers reset.
-        fill_smoother(&mut smoother, 145);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        assert_approx(pid.integral(), 0.0, 0.5, "integral should reset on above→in-zone transition");
-    }
-
-    #[test]
-    fn integral_not_reset_on_below_to_in_zone_transition() {
-        // HR 130→145: below zone then into zone → integral should NOT reset.
-        let target = hr_zone2_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-
-        // First tick: HR=130 (below zone, lower_bound=139)
-        fill_smoother(&mut smoother, 130);
-        let mut s = make_zone2_state(150, None);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let integral_after_first = pid.integral();
-        assert!(integral_after_first > 0.0, "integral should be positive when HR below target");
-
-        // Second tick: HR=145 (in zone). Coming from below, not above → no reset.
-        fill_smoother(&mut smoother, 145);
-        process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        // Integral should have continued accumulating (not reset to 0)
-        assert!(pid.integral() != 0.0, "integral should not reset on below→in-zone transition");
+    fn run_ticks(s: &mut ControlLoopState, target: &ZoneTarget, pid: &mut HrPid, smoother: &HrSmoother, n: usize) {
+        for _ in 0..n {
+            if let Some(new) = process_hr_tick(s, target, pid, smoother, 5000) {
+                s.commanded_power = new;
+            }
+        }
     }
 
     #[test]
     fn power_band_clamps_floor() {
-        // FTP=200, zone 2, power_zones=[55,75,90,105,120,150]
-        // Floor = 200 * 55% = 110W. PID wants to push below → clamped at 110.
+        // HR far above zone pushes power down; zone-2 floor is 110 W.
         let target = hr_zone2_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
         let mut smoother = HrSmoother::new(5);
-
-        // HR=160 (well above zone) → large negative error → PID wants to decrease power
         fill_smoother(&mut smoother, 160);
-        let mut s = make_zone2_state(115, None);
-
-        // Run several ticks to push power down
-        for _ in 0..10 {
-            if let Some(new) = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000) {
-                s.commanded_power = new;
-            }
-        }
-
-        assert!(
-            s.commanded_power >= 110,
-            "power should not go below floor of 110W (was {}W)",
-            s.commanded_power
-        );
+        let mut s = make_zone2_state(115);
+        let mut pid = HrPid::new(115);
+        run_ticks(&mut s, &target, &mut pid, &smoother, 10);
+        assert_eq!(s.commanded_power, 110);
     }
 
     #[test]
     fn power_band_clamps_ceiling() {
-        // FTP=200, zone 2, power_zones=[55,75,90,105,120,150]
-        // Ceiling = 200 * 90% = 180W. PID wants to push above → clamped at 180.
+        // HR far below zone pushes power up; zone-2 ceiling is 180 W.
         let target = hr_zone2_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
+        let mut smoother = HrSmoother::new(5);
+        fill_smoother(&mut smoother, 120);
+        let mut s = make_zone2_state(175);
+        let mut pid = HrPid::new(175);
+        run_ticks(&mut s, &target, &mut pid, &smoother, 10);
+        assert_eq!(s.commanded_power, 180);
+    }
+
+    fn new_hr_pid(p0: u16) -> HrPid {
+        HrPid::new(p0)
+    }
+
+    // --- AC1: deterministic first-order-lag + delay HR plant simulation ---
+
+    struct PlantParams {
+        tau_s: f64,
+        delay_s: f64,
+        gain_bpm_per_w: f64,
+        rest_bpm: f64,
+    }
+
+    struct SimResult {
+        peak_hr: u8,
+        /// (sim time secs, smoothed HR, commanded watts) at each controller tick
+        ticks: Vec<(f64, u8, u16)>,
+    }
+
+    /// Simulates `minutes` of riding: HR follows a first-order lag of the
+    /// commanded power delayed by `delay_s`. HR is sampled at 1 Hz into a
+    /// real HrSmoother; the controller ticks every 5 s. No clock involved.
+    fn simulate_hr_plant(p: &PlantParams, start_hr: f64, minutes: u32) -> SimResult {
+        let target = ZoneTarget {
+            mode: ZoneMode::HeartRate,
+            zone: 0,
+            lower_bound: 130,
+            upper_bound: 140,
+            duration_secs: None,
+        };
+        // Start in steady state at start_hr: P0 = (HR - rest) / gain
+        let p0 = ((start_hr - p.rest_bpm) / p.gain_bpm_per_w).round() as u16;
+        let mut s = ControlLoopState::new();
+        s.active = true;
+        s.commanded_power = p0;
+        s.ftp = Some(250); // band [50, 375]
+        s.power_zones = None;
+        let mut pid = new_hr_pid(p0);
         let mut smoother = HrSmoother::new(5);
 
-        // HR=120 (well below zone) → large positive error → PID wants to increase power
-        fill_smoother(&mut smoother, 120);
-        let mut s = make_zone2_state(175, None);
-
-        // Run several ticks to push power up
-        for _ in 0..10 {
-            if let Some(new) = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000) {
-                s.commanded_power = new;
+        let dt = 0.1;
+        let delay_steps = (p.delay_s / dt).round() as usize;
+        let mut delay_line: std::collections::VecDeque<f64> =
+            std::iter::repeat(p0 as f64).take(delay_steps + 1).collect();
+        let mut hr = start_hr;
+        let mut peak_hr = 0u8;
+        let mut ticks = Vec::new();
+        let total_steps = (minutes as usize) * 60 * 10;
+        for step in 1..=total_steps {
+            let delayed = delay_line.pop_front().unwrap();
+            delay_line.push_back(s.commanded_power as f64);
+            hr += (p.rest_bpm + p.gain_bpm_per_w * delayed - hr) / p.tau_s * dt;
+            if step % 10 == 0 {
+                smoother.push(hr.round() as u8);
+            }
+            if step % 50 == 0 {
+                if let Some(w) = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000) {
+                    s.commanded_power = w;
+                }
+                let sm = smoother.smoothed().unwrap();
+                peak_hr = peak_hr.max(sm);
+                ticks.push((step as f64 * dt, sm, s.commanded_power));
             }
         }
+        SimResult { peak_hr, ticks }
+    }
 
+    fn assert_settles_without_overshoot(p: &PlantParams, label: &str) {
+        let minutes = 20;
+        let r = simulate_hr_plant(p, 115.0, minutes);
+        let end = (minutes * 60) as f64;
+        // Overshoot bound: one zone half-width (5 bpm) above the 135 midpoint
         assert!(
-            s.commanded_power <= 180,
-            "power should not go above ceiling of 180W (was {}W)",
-            s.commanded_power
+            r.peak_hr <= 140,
+            "{label}: overshoot — peak smoothed HR {} > 140",
+            r.peak_hr
         );
+        // Settled: every tick in the last 10 minutes inside the band
+        for &(t, hr, _) in r.ticks.iter().filter(|(t, _, _)| *t > end - 600.0) {
+            assert!(
+                (130..=140).contains(&hr),
+                "{label}: HR {hr} outside 130-140 at t={t}s"
+            );
+        }
+        // No sustained oscillation: power swing over last 5 minutes <= 10 W
+        let last: Vec<u16> = r
+            .ticks
+            .iter()
+            .filter(|(t, _, _)| *t > end - 300.0)
+            .map(|x| x.2)
+            .collect();
+        let swing = last.iter().max().unwrap() - last.iter().min().unwrap();
+        assert!(swing <= 10, "{label}: power swing {swing} W in last 5 min");
     }
 
     #[test]
-    fn faster_ramp_up_when_below_band_midpoint() {
-        // FTP=200, zone 2: floor=110, ceiling=180, midpoint=145.
-        // At 110W with error>0 (HR below target), 110 < 145-20=125 → recovery mode (20W/tick).
-        let target = hr_zone2_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-
-        // HR=130 (below zone) → positive error
-        fill_smoother(&mut smoother, 130);
-        let mut s = make_zone2_state(110, None);
-
-        let new = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let gain = new.unwrap() as i32 - 110;
-        assert!(
-            gain > 10,
-            "recovery ramp-up should exceed 10W/tick, got {gain}W gain"
-        );
+    fn hr_plant_20bpm_below_settles_without_overshoot_or_oscillation() {
+        let p = PlantParams { tau_s: 60.0, delay_s: 15.0, gain_bpm_per_w: 0.35, rest_bpm: 60.0 };
+        assert_settles_without_overshoot(&p, "reference plant");
     }
 
     #[test]
-    fn normal_ramp_up_when_near_band_midpoint() {
-        // FTP=200, zone 2: floor=110, ceiling=180, midpoint=145.
-        // At 140W with error>0, 140 >= 125 → normal mode (10W/tick).
-        let target = hr_zone2_target();
-        let mut pid = PidController::new(2.0, 0.1, 0.5);
-        let mut smoother = HrSmoother::new(5);
-
-        // HR=130 (below zone) → positive error
-        fill_smoother(&mut smoother, 130);
-        let mut s = make_zone2_state(140, None);
-
-        let new = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000);
-        let gain = new.unwrap() as i32 - 140;
-        assert!(
-            gain <= 10,
-            "normal ramp-up should stay <= 10W/tick, got {gain}W gain"
-        );
+    fn hr_plant_grid_settles_across_lag_and_delay() {
+        for tau_s in [30.0, 60.0, 90.0] {
+            for delay_s in [5.0, 15.0, 25.0] {
+                for gain in [0.25, 0.35] {
+                    let p = PlantParams { tau_s, delay_s, gain_bpm_per_w: gain, rest_bpm: 60.0 };
+                    assert_settles_without_overshoot(
+                        &p,
+                        &format!("tau={tau_s} delay={delay_s} gain={gain}"),
+                    );
+                }
+            }
+        }
     }
 }

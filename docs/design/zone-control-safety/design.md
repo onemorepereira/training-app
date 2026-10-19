@@ -1,5 +1,5 @@
 # Zone control & trainer safety — Design
-**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 2, after design review 1)   **Status:** Draft
+**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 2, after design review 1)   **Status:** Approved (building)
 
 ## Overview
 
@@ -289,7 +289,7 @@ Pause and resume are shared: a session pause and a zone-only pause set the same 
 **Decision.**
 - `start()` spawns a **supervisor**: `tokio::spawn(async move { let inner = tokio::spawn(control_loop(..)); let reason = match inner.await { Ok(r) => r, Err(e) if e.is_panic() => { error!(…); StopReason::ControllerFault }, Err(_) => StopReason::ControllerFault }; finalize(state, sink, reason).await })`.
 - `control_loop` returns `StopReason` (`UserStopped` / `SessionStopped` / `AppClosing` from `ControlMsg::Stop`, the self-stop reasons, or `ControllerFault` if the mpsc closes).
-- `finalize` sets `active=false`, `paused=false`, `phase="stopped"` and `stop_reason=Some(reason)`, then calls `sink.release()` and logs.
+- `finalize` first calls `sink.release()` and logs. While the release runs, the status stays `active: true`. Once the release has completed, delivered or not, it sets `active=false`, `paused=false`, `phase="stopped"` and `stop_reason=Some(reason)` (ADR-21).
 - `tokio::Mutex` does not poison, so `finalize` can always lock `state`. The release profile does not set `panic = "abort"` (checked in `Cargo.toml`), so unwinding is caught by the `JoinHandle`.
 
 > **Amended by ADR-12:** `finalize` only touches its own run's state `Arc` and signals that run's `done` watch.
@@ -500,6 +500,33 @@ They depend only on `ZoneController` (generic over `TrainerSink`), so tests driv
 The Tauri handlers in `commands.rs` and `lib.rs` each gain **one line** calling these, placed before the session save. Only that wiring is checked manually (accepted).
 
 **Reversibility:** easy.
+
+### Review-2 rulings (ADR-19 to ADR-22)
+These fold in the spec owner's rulings on the reviewer's non-blocking questions (2026-10-18). Where they conflict with an earlier ADR, they win.
+
+### ADR-19: Hard cap on the close budget (amends ADR-17)
+- `ControlMsg::Stop(reason, Option<Duration>)` carries the budget to `finalize`, which hands it to `release(budget)`.
+- `ZoneController::stop_with_budget(reason, budget)` wraps its **whole** body (acquiring `lifecycle`, waiting on `done`) in `tokio::time::timeout(budget)`.
+- On expiry it logs `error!("Zone control stop ({reason:?}) exceeded {budget:?}: trainer release unconfirmed")` and returns `None`. The supervisor keeps running in the background and still finalizes. The app-close path therefore never blocks longer than 4 s.
+- Test: `stop_with_budget_returns_at_budget_when_release_hangs`.
+
+### ADR-20: A dropped `done` sender is a fault (amends ADR-12)
+- If `done.wait_for(..)` returns `Err` (the sender was dropped because `finalize` itself panicked), `stop()` treats it as `ControllerFault`. It never unwraps.
+- The supervisor runs `finalize` inside its own task and catches a panic there too. The run's state is then marked inactive with `ControllerFault` from the supervisor where possible.
+- Test: `finalize_panic_reports_controller_fault_to_stop` (FakeTrainer panics inside `release`).
+
+### ADR-21: Status during finalize (fixes ADR-8 text)
+- The run's status stays `active: true` with its last phase while `finalize` is releasing the trainer. Only after the release completes (delivered or not) does it flip to `active: false`, `phase: "stopped"`, `stop_reason: Some(reason)`. This is the contract given to Area D.
+- ADR-8's description ("finalize sets active=false … then calls release") is **corrected**: release first, then the status flip.
+- Test: `status_active_until_release_completes`.
+
+### ADR-22: Pause and cadence-zero overlap
+- While paused, the target is `Released` regardless of any safety override. Released wins.
+- The undelivered-safety-tick counter (ADR-15) neither runs nor accumulates while paused. The pause release has its own retry and the 30 s `trainer_lost` timing (ADR-13).
+- After resume, a still-active cadence-zero override applies as normal, and the counter starts from 0.
+- Test: `paused_with_cadence_zero_sends_release_and_never_trainer_unresponsive`.
+
+**Serde names are fixed:** `SessionStopped`, `AppClosing`, `ControllerFault`, `TrainerUnresponsive` (Area D depends on them).
 
 ## Failure modes
 
