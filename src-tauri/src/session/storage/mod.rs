@@ -702,6 +702,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_power_curve_for_deleted_session_writes_nothing() {
+        let (storage, _tmp) = test_storage().await;
+        storage.save_session(&make_summary("pc-gone-1"), b"raw").await.unwrap();
+        // Background curve save after stop races a delete
+        storage.delete_session("pc-gone-1").await.unwrap();
+        storage.save_power_curve("pc-gone-1", &[
+            PowerCurvePoint { duration_secs: 1, watts: 900 },
+        ]).await.unwrap();
+
+        assert!(!storage.has_power_curve("pc-gone-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn best_power_curve_ignores_orphan_rows() {
+        let (storage, _tmp) = test_storage().await;
+        storage.save_session(&make_summary("pc-live-1"), b"raw").await.unwrap();
+        storage.save_power_curve("pc-live-1", &[
+            PowerCurvePoint { duration_secs: 1, watts: 300 },
+        ]).await.unwrap();
+        // Orphan row left by an older build for a session that no longer exists
+        sqlx::query("INSERT INTO session_power_curves (session_id, duration_secs, watts) VALUES ('ghost', 1, 900)")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+
+        let best = storage.get_best_power_curve(None).await.unwrap();
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].watts, 300, "orphan 900 W must not count");
+    }
+
+    #[tokio::test]
     async fn best_power_curve_takes_max_across_sessions() {
         let (storage, _tmp) = test_storage().await;
 
