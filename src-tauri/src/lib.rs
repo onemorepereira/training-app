@@ -242,6 +242,20 @@ pub fn run() {
                 });
 
                 let storage = Arc::new(storage);
+
+                // One-time repair of stored metrics with the fixed pause/gap maths.
+                // Runs in the background so it never blocks startup; it is a no-op
+                // once app_meta.metrics_version is current.
+                {
+                    let repair_storage = storage.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::session::repair::run_metrics_repair(repair_storage).await
+                        {
+                            log::error!("Metrics repair aborted (will retry next launch): {}", e);
+                        }
+                    });
+                }
                 let mut device_manager = DeviceManager::new();
                 device_manager.set_storage(storage.clone());
                 let primary_devices = device_manager.primaries_handle();

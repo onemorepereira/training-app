@@ -31,8 +31,9 @@
   let bestCurve = $state<PowerCurvePoint[]>([]);
 
   let units = $derived(config?.units ?? 'metric');
-  let hrZones = $derived(config?.hr_zones ?? null);
-  let powerZonePcts = $derived(config?.power_zones ?? null);
+  // Zones in effect when the session was recorded (falls back to current zones in the backend)
+  let hrZones = $derived(analysis?.zones.hr_zones ?? config?.hr_zones ?? null);
+  let powerZonePcts = $derived(analysis?.zones.power_zones ?? config?.power_zones ?? null);
 
   $effect(() => {
     const sessionId = $page.params.id;
@@ -278,6 +279,7 @@
       <ZoneRideAnalysis
         config={zoneConfig}
         timeseries={analysis.timeseries.map((pt) => ({
+          elapsed_secs: pt.elapsed_secs,
           power: pt.power ?? null,
           heart_rate: pt.heart_rate ?? null,
         }))}

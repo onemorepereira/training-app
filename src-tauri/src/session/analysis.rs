@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use super::gap::{self, capped_interval_ms};
 
 use crate::device::types::SensorReading;
-use crate::session::types::{SessionConfig, SessionSummary};
+use crate::session::types::{SessionConfig, SessionSummary, ZoneSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionAnalysis {
@@ -10,6 +13,9 @@ pub struct SessionAnalysis {
     pub power_zone_distribution: Vec<ZoneBucket>,
     pub hr_zone_distribution: Vec<ZoneBucket>,
     pub pwc: Option<PwcMarkers>,
+    /// Zones the distributions were computed with: the session's snapshot,
+    /// or the current zones for sessions recorded before snapshots existed.
+    pub zones: ZoneSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,8 +48,6 @@ pub struct ZoneBucket {
     pub percentage: f64,
 }
 
-const MAX_READING_GAP_MS: u64 = 5000;
-
 const POWER_CURVE_DURATIONS: &[u32] = &[
     1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120, 300, 600, 1200, 1800, 3600,
 ];
@@ -53,11 +57,12 @@ pub fn compute_analysis(
     session: &SessionSummary,
     config: &SessionConfig,
 ) -> SessionAnalysis {
-    let timeseries = build_timeseries(readings, session.duration_secs);
+    let timeseries = build_timeseries(readings);
     let power_curve = compute_power_curve(readings);
     let ftp = session.ftp.unwrap_or(config.ftp);
+    let zones = session.zones.unwrap_or_else(|| ZoneSnapshot::from(config));
     let (power_zone_distribution, hr_zone_distribution) =
-        compute_zone_distribution(readings, ftp, &config.power_zones, &config.hr_zones);
+        compute_zone_distribution(readings, ftp, &zones.power_zones, &zones.hr_zones);
     let pwc = compute_pwc(&timeseries);
     SessionAnalysis {
         timeseries,
@@ -65,6 +70,7 @@ pub fn compute_analysis(
         power_zone_distribution,
         hr_zone_distribution,
         pwc,
+        zones,
     }
 }
 
@@ -102,22 +108,22 @@ pub fn compute_power_curve_from_readings(readings: &[SensorReading]) -> Vec<Powe
 
 /// Build a 1-second timeseries from raw sensor readings.
 /// Public wrapper for use by zone control history estimation.
-pub fn build_timeseries_from_readings(
-    readings: &[SensorReading],
-    duration_secs: u64,
-) -> Vec<TimeseriesPoint> {
-    build_timeseries(readings, duration_secs)
+pub fn build_timeseries_from_readings(readings: &[SensorReading]) -> Vec<TimeseriesPoint> {
+    build_timeseries(readings)
 }
 
-fn build_timeseries(readings: &[SensorReading], duration_secs: u64) -> Vec<TimeseriesPoint> {
+/// One point per wall-clock second (since the first reading) that has data.
+/// Indexed sparsely so pauses neither truncate the series nor allocate the
+/// wall-clock span (`elapsed_secs` includes pause time; paused seconds are absent).
+fn build_timeseries(readings: &[SensorReading]) -> Vec<TimeseriesPoint> {
     if readings.is_empty() {
         return Vec::new();
     }
 
     let t0 = readings.iter().map(|r| r.epoch_ms()).min().unwrap();
-    let num_slots = duration_secs as usize;
 
     // Each slot holds the last-seen value for each channel.
+    #[derive(Default)]
     struct Slot {
         power: Option<u16>,
         heart_rate: Option<u8>,
@@ -125,22 +131,14 @@ fn build_timeseries(readings: &[SensorReading], duration_secs: u64) -> Vec<Times
         speed: Option<f32>,
     }
 
-    let mut slots: Vec<Slot> = (0..num_slots)
-        .map(|_| Slot {
-            power: None,
-            heart_rate: None,
-            cadence: None,
-            speed: None,
-        })
-        .collect();
+    let mut slots: BTreeMap<u64, Slot> = BTreeMap::new();
 
     for reading in readings {
-        let elapsed_ms = reading.epoch_ms().saturating_sub(t0);
-        let sec = (elapsed_ms / 1000) as usize;
-        if sec >= num_slots {
+        if matches!(reading, SensorReading::TrainerCommand { .. }) {
             continue;
         }
-        let slot = &mut slots[sec];
+        let sec = reading.epoch_ms().saturating_sub(t0) / 1000;
+        let slot = slots.entry(sec).or_default();
         match reading {
             SensorReading::Power { watts, .. } => slot.power = Some(*watts),
             SensorReading::HeartRate { bpm, .. } => slot.heart_rate = Some(*bpm),
@@ -152,93 +150,54 @@ fn build_timeseries(readings: &[SensorReading], duration_secs: u64) -> Vec<Times
 
     slots
         .into_iter()
-        .enumerate()
-        .filter_map(|(i, s)| {
-            if s.power.is_none() && s.heart_rate.is_none() && s.cadence.is_none() && s.speed.is_none()
-            {
-                None
-            } else {
-                Some(TimeseriesPoint {
-                    elapsed_secs: i as f64,
-                    power: s.power,
-                    heart_rate: s.heart_rate,
-                    cadence: s.cadence,
-                    speed: s.speed,
-                })
-            }
+        .map(|(sec, s)| TimeseriesPoint {
+            elapsed_secs: sec as f64,
+            power: s.power,
+            heart_rate: s.heart_rate,
+            cadence: s.cadence,
+            speed: s.speed,
         })
         .collect()
 }
 
+/// Best average power per target duration, over contiguous gap-free segments
+/// only: holes ≤ 5 s hold the previous second, values are never carried
+/// across a gap (shared gap rule, see `gap.rs`).
 fn compute_power_curve(readings: &[SensorReading]) -> Vec<PowerCurvePoint> {
-    // Extract power readings sorted by time.
-    let mut power_data: Vec<(u64, u16)> = readings
+    let samples: Vec<(u64, f64)> = readings
         .iter()
         .filter_map(|r| match r {
-            SensorReading::Power { watts, epoch_ms, .. } => Some((*epoch_ms, *watts)),
+            SensorReading::Power { watts, epoch_ms, .. } => Some((*epoch_ms, *watts as f64)),
             _ => None,
         })
         .collect();
+    let segments = gap::resample_1hz_segments(&samples);
 
-    if power_data.is_empty() {
-        return Vec::new();
-    }
-
-    power_data.sort_by_key(|(ms, _)| *ms);
-
-    // Resample to 1-second array with hold-last-value.
-    let min_sec = power_data[0].0 / 1000;
-    let max_sec = power_data.last().unwrap().0 / 1000;
-    let len = (max_sec - min_sec + 1) as usize;
-
-    // Accumulate sum and count per second for averaging.
-    let mut sums = vec![0u64; len];
-    let mut counts = vec![0u32; len];
-
-    for &(ms, watts) in &power_data {
-        let idx = (ms / 1000 - min_sec) as usize;
-        sums[idx] += watts as u64;
-        counts[idx] += 1;
-    }
-
-    // Build the 1-second array: average where data exists, hold-last-value otherwise.
-    // Skip leading empty seconds by finding the first populated index.
-    let first_populated = counts.iter().position(|&c| c > 0).unwrap();
-    let arr_offset = first_populated;
-    let arr_len = len - arr_offset;
-    let mut arr = vec![0u32; arr_len];
-
-    let mut last_val = 0u32;
-    for i in 0..arr_len {
-        let src = i + arr_offset;
-        if counts[src] > 0 {
-            last_val = (sums[src] / counts[src] as u64) as u32;
-        }
-        arr[i] = last_val;
-    }
-
-    // Sliding window for each target duration.
     let mut result = Vec::new();
     for &d in POWER_CURVE_DURATIONS {
         let d_usize = d as usize;
-        if d_usize > arr.len() {
-            continue;
-        }
-
-        let mut window_sum: u64 = arr[..d_usize].iter().map(|&v| v as u64).sum();
-        let mut max_sum = window_sum;
-
-        for i in 1..=(arr.len() - d_usize) {
-            window_sum = window_sum - arr[i - 1] as u64 + arr[i + d_usize - 1] as u64;
-            if window_sum > max_sum {
-                max_sum = window_sum;
+        let mut best_sum: Option<f64> = None;
+        for seg in &segments {
+            let v = &seg.values;
+            if v.len() < d_usize {
+                continue;
             }
+            let mut window_sum: f64 = v[..d_usize].iter().sum();
+            let mut max_sum = window_sum;
+            for i in d_usize..v.len() {
+                window_sum += v[i] - v[i - d_usize];
+                if window_sum > max_sum {
+                    max_sum = window_sum;
+                }
+            }
+            best_sum = Some(best_sum.map_or(max_sum, |b| b.max(max_sum)));
         }
-
-        result.push(PowerCurvePoint {
-            duration_secs: d,
-            watts: (max_sum as f64 / d as f64).round() as u16,
-        });
+        if let Some(sum) = best_sum {
+            result.push(PowerCurvePoint {
+                duration_secs: d,
+                watts: (sum / d as f64).round() as u16,
+            });
+        }
     }
 
     result
@@ -281,7 +240,7 @@ fn compute_zone_distribution(
 
     let mut power_zone_time = [0.0f64; 7];
     for pair in power_data.windows(2) {
-        let delta_ms = pair[1].0.saturating_sub(pair[0].0).min(MAX_READING_GAP_MS);
+        let delta_ms = capped_interval_ms(pair[0].0, pair[1].0);
         let zone = classify_power_zone(pair[0].1, ftp, power_zones);
         power_zone_time[(zone - 1) as usize] += delta_ms as f64 / 1000.0;
     }
@@ -313,7 +272,7 @@ fn compute_zone_distribution(
 
     let mut hr_zone_time = [0.0f64; 5];
     for pair in hr_data.windows(2) {
-        let delta_ms = pair[1].0.saturating_sub(pair[0].0).min(MAX_READING_GAP_MS);
+        let delta_ms = capped_interval_ms(pair[0].0, pair[1].0);
         let zone = classify_hr_zone(pair[0].1, hr_zones);
         hr_zone_time[(zone - 1) as usize] += delta_ms as f64 / 1000.0;
     }
@@ -475,6 +434,7 @@ mod tests {
             activity_type: None,
             rpe: None,
             notes: None,
+            zones: None,
         }
     }
 
@@ -540,6 +500,47 @@ mod tests {
         for pt in &curve {
             assert!(pt.duration_secs <= 30);
         }
+    }
+
+    #[test]
+    fn power_curve_not_carried_across_gap() {
+        // 300W for 5 min (0..=299 s), 20-min gap, 100W for 5 min (1500..=1799 s)
+        let mut readings: Vec<SensorReading> =
+            (0..300).map(|i| power_reading(300, i * 1000)).collect();
+        readings.extend((1500..1800).map(|i| power_reading(100, i * 1000)));
+
+        let curve = compute_power_curve(&readings);
+
+        // No contiguous 10 or 20 minutes of data → no such points at all
+        assert!(curve.iter().all(|p| p.duration_secs <= 300), "got {:?}", curve);
+        let p300 = curve.iter().find(|p| p.duration_secs == 300).unwrap();
+        assert_eq!(p300.watts, 300, "5-min best is the 300W block");
+    }
+
+    #[test]
+    fn power_curve_holds_value_across_short_hole() {
+        // 200W at 0..=9 s, 3 s hole, 200W at 13..=19 s → one 20 s segment
+        let mut readings: Vec<SensorReading> =
+            (0..10).map(|i| power_reading(200, i * 1000)).collect();
+        readings.extend((13..20).map(|i| power_reading(200, i * 1000)));
+
+        let curve = compute_power_curve(&readings);
+
+        let p20 = curve.iter().find(|p| p.duration_secs == 20).expect("20 s point");
+        assert_eq!(p20.watts, 200);
+    }
+
+    #[test]
+    fn power_curve_best_found_in_later_segment() {
+        // 100W for 30 s, gap, 250W for 30 s → 30 s best = 250
+        let mut readings: Vec<SensorReading> =
+            (0..30).map(|i| power_reading(100, i * 1000)).collect();
+        readings.extend((100..130).map(|i| power_reading(250, i * 1000)));
+
+        let curve = compute_power_curve(&readings);
+
+        let p30 = curve.iter().find(|p| p.duration_secs == 30).unwrap();
+        assert_eq!(p30.watts, 250);
     }
 
     #[test]
@@ -657,7 +658,7 @@ mod tests {
             }
         }
 
-        let ts = build_timeseries(&readings, 3);
+        let ts = build_timeseries(&readings);
 
         assert_eq!(ts.len(), 3, "should have 3 second-slots");
         // Last value in each second is the one at sub=3, so watts = 203
@@ -674,7 +675,7 @@ mod tests {
             hr_reading(145, 1500),
         ];
 
-        let ts = build_timeseries(&readings, 5);
+        let ts = build_timeseries(&readings);
 
         assert_eq!(ts.len(), 1, "one slot has data");
         let pt = &ts[0];
@@ -688,8 +689,76 @@ mod tests {
 
     #[test]
     fn timeseries_empty() {
-        let ts = build_timeseries(&[], 60);
+        let ts = build_timeseries(&[]);
         assert!(ts.is_empty());
+    }
+
+    #[test]
+    fn timeseries_includes_readings_after_pause() {
+        // 60 min of riding with a 15-min pause after 45 min:
+        // power at 0..=2699 s, pause, 3600..=4499 s; active duration 3600 s
+        let mut readings: Vec<SensorReading> =
+            (0..2700).map(|i| power_reading(200, i * 1000)).collect();
+        readings.extend((3600..4500).map(|i| power_reading(250, i * 1000)));
+        let session = test_session(3600, 200);
+
+        let analysis = compute_analysis(&readings, &session, &test_config());
+
+        assert_eq!(analysis.timeseries.len(), 3600, "one point per second of data");
+        let last = analysis.timeseries.last().unwrap();
+        assert_eq!(last.elapsed_secs, 4499.0, "final 15 minutes are present");
+        assert_eq!(last.power, Some(250));
+    }
+
+    #[test]
+    fn timeseries_bad_epoch_does_not_allocate_wall_clock_span() {
+        // One reading with epoch 0 and one at a realistic epoch: span ≈ 1.7e9 s.
+        let readings = vec![power_reading(100, 0), power_reading(200, 1_718_445_600_000)];
+        let session = test_session(2, 200);
+
+        let analysis = compute_analysis(&readings, &session, &test_config());
+
+        assert_eq!(analysis.timeseries.len(), 2);
+        assert_eq!(analysis.timeseries[1].elapsed_secs, 1_718_445_600.0);
+    }
+
+    // --- Zone snapshot ---
+
+    fn snapshot_zones() -> ZoneSnapshot {
+        ZoneSnapshot {
+            power_zones: [45, 60, 75, 90, 105, 120],
+            hr_zones: [100, 120, 140, 160, 180],
+        }
+    }
+
+    #[test]
+    fn zone_distribution_uses_session_zones_snapshot() {
+        // 100W at FTP 200 = 50%: Z1 with today's zones (≤55%), Z2 with the
+        // snapshot (45 < 50 ≤ 60). HR 110: Z1 today (≤120), Z2 in snapshot.
+        let readings: Vec<SensorReading> = (0..10)
+            .flat_map(|i| [power_reading(100, i * 1000), hr_reading(110, i * 1000 + 500)])
+            .collect();
+        let mut session = test_session(10, 200);
+        session.zones = Some(snapshot_zones());
+
+        let analysis = compute_analysis(&readings, &session, &test_config());
+
+        assert_approx(analysis.power_zone_distribution[1].percentage, 100.0, 0.01, "power Z2");
+        assert_approx(analysis.hr_zone_distribution[1].percentage, 100.0, 0.01, "HR Z2");
+        assert_eq!(analysis.zones, snapshot_zones(), "reports the zones it used");
+    }
+
+    #[test]
+    fn analysis_falls_back_to_config_zones_when_snapshot_missing() {
+        let readings: Vec<SensorReading> =
+            (0..10).map(|i| power_reading(100, i * 1000)).collect();
+        let session = test_session(10, 200); // zones: None (pre-snapshot session)
+        let config = test_config();
+
+        let analysis = compute_analysis(&readings, &session, &config);
+
+        assert_approx(analysis.power_zone_distribution[0].percentage, 100.0, 0.01, "power Z1");
+        assert_eq!(analysis.zones, ZoneSnapshot::from(&config));
     }
 
     // --- compute_analysis FTP fallback ---

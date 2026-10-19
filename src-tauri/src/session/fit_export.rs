@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+
+use super::gap;
 use super::types::SessionSummary;
 use crate::device::types::SensorReading;
 use crate::error::AppError;
@@ -89,6 +92,81 @@ impl FitWriter {
     }
 }
 
+// FIT profile 21.217 enums: event 0 = timer; event_type 0 = start, 4 = stop_all.
+const EVENT_TIMER: u8 = 0;
+const EVENT_TYPE_START: u8 = 0;
+const EVENT_TYPE_STOP_ALL: u8 = 4;
+
+/// Write a timer event using the event definition (local message 2).
+fn write_timer_event(w: &mut FitWriter, ts: u32, event_type: u8) {
+    let mut evt = Vec::with_capacity(6);
+    evt.extend_from_slice(&ts.to_le_bytes());
+    evt.push(EVENT_TIMER);
+    evt.push(event_type);
+    w.write_data(2, &evt);
+}
+
+/// Per-epoch-second aggregate of all channels, for the merged record stream.
+#[derive(Default)]
+struct SecondAgg {
+    first_ms: u64,
+    last_ms: u64,
+    power_sum: u64,
+    power_n: u32,
+    power_last_ms: u64,
+    /// (sample ms, value) of the last sample in this second
+    hr: Option<(u64, u8)>,
+    cadence: Option<(u64, u8)>,
+    speed: Option<(u64, u16)>,
+    /// Cumulative distance (m × 100) at the last speed sample in this second
+    distance_m100: Option<u32>,
+}
+
+/// Group readings by epoch-second (sorted by time). Distance is integrated
+/// from speed with the shared gap rule: each interval counts at most 5 s.
+fn aggregate_seconds(readings: &[SensorReading]) -> BTreeMap<u64, SecondAgg> {
+    let mut sorted: Vec<&SensorReading> = readings
+        .iter()
+        .filter(|r| !matches!(r, SensorReading::TrainerCommand { .. }))
+        .collect();
+    sorted.sort_by_key(|r| r.epoch_ms());
+
+    let mut seconds: BTreeMap<u64, SecondAgg> = BTreeMap::new();
+    let mut distance_m: f64 = 0.0;
+    let mut prev_speed: Option<(u64, f64)> = None; // (ms, m/s)
+
+    for r in sorted {
+        let ms = r.epoch_ms();
+        let agg = seconds.entry(ms / 1000).or_insert_with(|| SecondAgg {
+            first_ms: ms,
+            ..Default::default()
+        });
+        agg.last_ms = ms;
+        match r {
+            SensorReading::Power { watts, .. } => {
+                agg.power_sum += *watts as u64;
+                agg.power_n += 1;
+                agg.power_last_ms = ms;
+            }
+            SensorReading::HeartRate { bpm, .. } => agg.hr = Some((ms, *bpm)),
+            SensorReading::Cadence { rpm, .. } => {
+                agg.cadence = Some((ms, rpm.clamp(0.0, 254.0).round() as u8))
+            }
+            SensorReading::Speed { kmh, .. } => {
+                let mps = (*kmh as f64 / 3.6).max(0.0);
+                if let Some((p_ms, p_mps)) = prev_speed {
+                    distance_m += p_mps * gap::capped_interval_ms(p_ms, ms) as f64 / 1000.0;
+                }
+                prev_speed = Some((ms, mps));
+                agg.speed = Some((ms, (mps * 1000.0).round().min(65534.0) as u16));
+                agg.distance_m100 = Some((distance_m * 100.0).round() as u32);
+            }
+            SensorReading::TrainerCommand { .. } => {}
+        }
+    }
+    seconds
+}
+
 /// Export a session as a FIT file.
 pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Result<Vec<u8>, AppError> {
     let mut w = FitWriter::new();
@@ -111,10 +189,12 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
     w.write_data(0, &file_id_data);
 
     // --- device_info message (local 1, global 23) ---
+    // Field numbers per Garmin FIT SDK Profile 21.217 (@garmin/fitsdk profile.js):
+    // 2 = manufacturer (uint16); 3 is serial_number (uint32z), not manufacturer.
     w.write_definition(1, 23, &[
         (253, 4, 134), // timestamp: uint32
         (0, 1, 2),     // device_index: uint8
-        (3, 2, 132),   // manufacturer: uint16
+        (2, 2, 132),   // manufacturer: uint16
         (4, 2, 132),   // product: uint16
         (5, 2, 132),   // software_version: uint16
         (27, 16, 7),   // product_name: string (16 bytes)
@@ -139,12 +219,8 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
         (1, 1, 0),     // event_type: enum
     ]);
 
-    // Start event (timer start)
-    let mut start_evt = Vec::new();
-    start_evt.extend_from_slice(&start_ts.to_le_bytes());
-    start_evt.push(0); // event = timer
-    start_evt.push(0); // event_type = start
-    w.write_data(2, &start_evt);
+    // Start event (timer start) — before the first record, per the FIT cookbook
+    write_timer_event(&mut w, start_ts, EVENT_TYPE_START);
 
     // --- record messages (local 3, global 20) ---
     w.write_definition(3, 20, &[
@@ -156,59 +232,74 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
         (5, 4, 134),   // distance: uint32 (m * 100)
     ]);
 
-    let mut last_hr: u8 = 0xFF;
-    let mut last_cadence: u8 = 0xFF;
-    let mut last_speed: u16 = 0xFFFF;
-    let mut cumulative_distance_m100: u32 = 0;
-    let mut last_speed_ms: f64 = 0.0;
-    let mut last_speed_epoch_ms: Option<u64> = None;
-    let mut max_speed_ms1000: u16 = 0;
+    // Records: one per epoch-second that has any sensor sample (merged 1 Hz
+    // stream). "Record messages should not be encoded to the file when the
+    // timer is paused" (Garmin FIT cookbook, Encoding Activity Files), so seconds
+    // without data are skipped. Each channel is held for ≤ 5 s after its last
+    // sample and written as invalid after that (shared gap rule).
+    let seconds = aggregate_seconds(readings);
+    let max_speed_ms1000 = seconds
+        .values()
+        .filter_map(|a| a.speed.map(|(_, v)| v))
+        .max()
+        .unwrap_or(0);
 
-    for reading in readings {
-        match reading {
-            SensorReading::HeartRate { bpm, .. } => {
-                last_hr = *bpm;
-            }
-            SensorReading::Cadence { rpm, .. } => {
-                last_cadence = (*rpm).min(254.0) as u8;
-            }
-            SensorReading::Speed { kmh, epoch_ms, .. } => {
-                if let Some(prev) = last_speed_epoch_ms {
-                    let dt_s = (*epoch_ms as f64 - prev as f64) / 1000.0;
-                    cumulative_distance_m100 += (last_speed_ms * dt_s * 100.0) as u32;
-                }
-                last_speed_ms = *kmh as f64 / 3.6;
-                last_speed_epoch_ms = Some(*epoch_ms);
-                let ms_1000 = (*kmh / 3.6 * 1000.0) as u16;
-                last_speed = ms_1000;
-                max_speed_ms1000 = max_speed_ms1000.max(ms_1000);
-            }
-            SensorReading::Power {
-                watts, epoch_ms, ..
-            } => {
-                let ts = unix_to_fit_timestamp(*epoch_ms);
-                let mut rec = Vec::with_capacity(14);
-                rec.extend_from_slice(&ts.to_le_bytes());
-                rec.extend_from_slice(&watts.to_le_bytes());
-                rec.push(last_hr);
-                rec.push(last_cadence);
-                rec.extend_from_slice(&last_speed.to_le_bytes());
-                rec.extend_from_slice(&cumulative_distance_m100.to_le_bytes());
-                w.write_data(3, &rec);
-            }
-            SensorReading::TrainerCommand { .. } => {}
-        }
+    let mut last_power: Option<(u64, u16)> = None;
+    let mut last_hr: Option<(u64, u8)> = None;
+    let mut last_cadence: Option<(u64, u8)> = None;
+    let mut last_speed: Option<(u64, u16)> = None;
+    let mut last_distance_m100: Option<u32> = None;
+    let mut prev: Option<(u64, u64)> = None; // (sec, last sample ms) of previous record
+    let mut last_record_ts: Option<u32> = None;
+
+    fn fresh<T: Copy>(last: Option<(u64, T)>, at_ms: u64) -> Option<T> {
+        last.filter(|(ms, _)| !gap::is_gap(*ms, at_ms)).map(|(_, v)| v)
     }
 
-    let end_ts = start_ts + summary.duration_secs as u32;
-    let elapsed_ms = (summary.duration_secs * 1000) as u32;
+    for (&sec, agg) in &seconds {
+        let ts = unix_to_fit_timestamp(sec * 1000);
+        // Pause or dropout > 5 s between records: timer stop/start pair. Pauses
+        // ≤ 5 s are indistinguishable from sensor holes and get no events.
+        if let Some((prev_sec, prev_last_ms)) = prev {
+            if gap::is_gap(prev_last_ms, agg.first_ms) {
+                write_timer_event(&mut w, unix_to_fit_timestamp(prev_sec * 1000), EVENT_TYPE_STOP_ALL);
+                write_timer_event(&mut w, ts, EVENT_TYPE_START);
+            }
+        }
+        if agg.power_n > 0 {
+            let mean = (agg.power_sum as f64 / agg.power_n as f64).round() as u16;
+            last_power = Some((agg.power_last_ms, mean));
+        }
+        last_hr = agg.hr.or(last_hr);
+        last_cadence = agg.cadence.or(last_cadence);
+        last_speed = agg.speed.or(last_speed);
+        last_distance_m100 = agg.distance_m100.or(last_distance_m100);
+
+        let at_ms = sec * 1000;
+        let mut rec = Vec::with_capacity(17);
+        rec.extend_from_slice(&ts.to_le_bytes());
+        rec.extend_from_slice(&fresh(last_power, at_ms).unwrap_or(0xFFFF).to_le_bytes());
+        rec.push(fresh(last_hr, at_ms).unwrap_or(0xFF));
+        rec.push(fresh(last_cadence, at_ms).unwrap_or(0xFF));
+        rec.extend_from_slice(&fresh(last_speed, at_ms).unwrap_or(0xFFFF).to_le_bytes());
+        rec.extend_from_slice(&last_distance_m100.unwrap_or(0xFFFF_FFFF).to_le_bytes());
+        w.write_data(3, &rec);
+
+        prev = Some((sec, agg.last_ms));
+        last_record_ts = Some(ts);
+    }
+
+    // Session end can't precede the last record; elapsed = wall-clock span,
+    // timer = active duration (never more than elapsed).
+    let end_ts = last_record_ts
+        .unwrap_or(start_ts)
+        .max(start_ts + summary.duration_secs as u32);
+    let elapsed_secs = end_ts - start_ts;
+    let elapsed_ms = elapsed_secs.saturating_mul(1000);
+    let timer_ms = (summary.duration_secs.min(elapsed_secs as u64) * 1000) as u32;
 
     // Stop event (timer stop_all)
-    let mut stop_evt = Vec::new();
-    stop_evt.extend_from_slice(&end_ts.to_le_bytes());
-    stop_evt.push(0); // event = timer
-    stop_evt.push(4); // event_type = stop_all
-    w.write_data(2, &stop_evt);
+    write_timer_event(&mut w, end_ts, EVENT_TYPE_STOP_ALL);
 
     // --- lap message (local 4, global 19) ---
     w.write_definition(4, 19, &[
@@ -223,7 +314,7 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
     lap_data.extend_from_slice(&end_ts.to_le_bytes());
     lap_data.extend_from_slice(&start_ts.to_le_bytes());
     lap_data.extend_from_slice(&elapsed_ms.to_le_bytes());
-    lap_data.extend_from_slice(&elapsed_ms.to_le_bytes());
+    lap_data.extend_from_slice(&timer_ms.to_le_bytes());
     lap_data.push(2); // sport = cycling
     lap_data.push(6); // sub_sport = indoor_cycling
     w.write_data(4, &lap_data);
@@ -232,7 +323,7 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
     let total_distance = summary
         .distance_km
         .map(|km| (km * 100_000.0) as u32)
-        .unwrap_or(cumulative_distance_m100);
+        .unwrap_or(last_distance_m100.unwrap_or(0xFFFF_FFFF));
     let total_calories = summary
         .work_kj
         .map(|kj| kj.round() as u16)
@@ -271,13 +362,15 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
         (34, 2, 132),  // normalized_power: uint16
         (35, 2, 132),  // tss: uint16 (* 10)
         (36, 2, 132),  // intensity_factor: uint16 (* 1000)
-        (38, 2, 132),  // threshold_power: uint16
+        // Per FIT SDK Profile 21.217: threshold_power is session field 45 (uint16, W).
+        // Field 38 is end_position_lat (sint32) and must not be used here.
+        (45, 2, 132),  // threshold_power: uint16
     ]);
     let mut sess_data = Vec::new();
     sess_data.extend_from_slice(&end_ts.to_le_bytes());
     sess_data.extend_from_slice(&start_ts.to_le_bytes());
     sess_data.extend_from_slice(&elapsed_ms.to_le_bytes());
-    sess_data.extend_from_slice(&elapsed_ms.to_le_bytes());
+    sess_data.extend_from_slice(&timer_ms.to_le_bytes());
     sess_data.push(2); // sport = cycling
     sess_data.push(6); // sub_sport = indoor_cycling
     sess_data.extend_from_slice(&total_distance.to_le_bytes());
@@ -311,7 +404,7 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
     ]);
     let mut act_data = Vec::new();
     act_data.extend_from_slice(&end_ts.to_le_bytes());
-    act_data.extend_from_slice(&elapsed_ms.to_le_bytes());
+    act_data.extend_from_slice(&timer_ms.to_le_bytes());
     act_data.extend_from_slice(&1u16.to_le_bytes()); // num_sessions = 1
     act_data.push(0); // type = manual
     act_data.push(26); // event = activity
@@ -349,6 +442,7 @@ mod tests {
             activity_type: None,
             rpe: None,
             notes: None,
+            zones: None,
         }
     }
 
@@ -417,7 +511,7 @@ mod tests {
 
     #[test]
     fn fit_export_with_readings() {
-        let summary = make_summary();
+        let summary = summary_with_duration(2);
         let readings = vec![
             SensorReading::Power {
                 watts: 200,
@@ -553,7 +647,7 @@ mod tests {
         let data = export_fit(&make_summary(), &[]).unwrap();
         let msgs = parse_fit_messages(&data);
         let dev = msgs.iter().find(|m| m.global_msg == 23).expect("no device_info message");
-        assert_eq!(dev.field_u16(3), Some(255), "manufacturer should be 255 (development)");
+        assert_eq!(dev.field_u16(2), Some(255), "manufacturer should be 255 (development)");
         assert_eq!(
             dev.field_string(27).as_deref(),
             Some("My Training App"),
@@ -581,7 +675,7 @@ mod tests {
 
     #[test]
     fn fit_export_distance_from_speed_readings() {
-        let summary = make_summary();
+        let summary = summary_with_duration(10);
         let base_ms: u64 = 1718445600_000;
         // 10 seconds of speed readings at 36 km/h = 10 m/s
         // Expected distance: 10m/s * 10s = 100m => 100 * 100 = 10000 (m*100)
@@ -629,7 +723,7 @@ mod tests {
         assert_eq!(session.field_u8(18), Some(90), "avg_cadence");
         assert_eq!(session.field_u16(35), Some(750), "tss * 10");
         assert_eq!(session.field_u16(36), Some(950), "intensity_factor * 1000");
-        assert_eq!(session.field_u16(38), Some(200), "threshold_power (ftp)");
+        assert_eq!(session.field_u16(45), Some(200), "threshold_power (ftp)");
         assert_eq!(session.field_u16(11), Some(648), "total_calories");
         // 30 km * 100_000 = 3_000_000
         assert_eq!(session.field_u32(9), Some(3_000_000), "total_distance");
@@ -647,5 +741,298 @@ mod tests {
         // Second event: stop_all
         assert_eq!(events[1].field_u8(0), Some(0), "second event should be timer (0)");
         assert_eq!(events[1].field_u8(1), Some(4), "second event_type should be stop_all (4)");
+    }
+
+    #[test]
+    fn fit_session_threshold_power_is_field_45() {
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let session = msgs.iter().find(|m| m.global_msg == 18).expect("no session");
+        assert_eq!(session.field_u16(45), Some(200), "threshold_power (field 45) = FTP");
+        assert!(
+            session.field_bytes.iter().all(|(n, _)| *n != 38),
+            "field 38 is end_position_lat and must not be written"
+        );
+    }
+
+    #[test]
+    fn fit_device_info_manufacturer_is_field_2() {
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let dev = msgs.iter().find(|m| m.global_msg == 23).expect("no device_info");
+        assert_eq!(dev.field_u16(2), Some(255), "manufacturer (field 2) = development");
+        assert!(
+            dev.field_bytes.iter().all(|(n, _)| *n != 3),
+            "field 3 is serial_number (uint32z) and must not carry the manufacturer"
+        );
+    }
+
+    // --- Independent decoder (fitparser, generated from the FIT SDK profile) ---
+
+    fn decode(data: &[u8]) -> Vec<fitparser::FitDataRecord> {
+        fitparser::from_bytes(data).expect("fitparser failed to decode exported FIT file")
+    }
+
+    fn named<'a>(rec: &'a fitparser::FitDataRecord, name: &str) -> Option<&'a fitparser::Value> {
+        rec.fields().iter().find(|f| f.name() == name).map(|f| f.value())
+    }
+
+    fn first_of(
+        recs: &[fitparser::FitDataRecord],
+        kind: fitparser::profile::MesgNum,
+    ) -> &fitparser::FitDataRecord {
+        recs.iter().find(|r| r.kind() == kind).expect("message kind missing")
+    }
+
+    #[test]
+    fn fit_export_decodes_with_fitparser() {
+        use fitparser::profile::MesgNum;
+        use fitparser::Value;
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let recs = decode(&data);
+        let session = first_of(&recs, MesgNum::Session);
+        assert_eq!(named(session, "threshold_power"), Some(&Value::UInt16(200)));
+        assert_eq!(named(session, "end_position_lat"), None);
+        assert_eq!(named(session, "normalized_power"), Some(&Value::UInt16(190)));
+        assert_eq!(named(session, "training_stress_score"), Some(&Value::Float64(75.0)));
+        let dev = first_of(&recs, MesgNum::DeviceInfo);
+        assert_eq!(named(dev, "manufacturer"), Some(&Value::String("development".into())));
+        assert_eq!(named(dev, "serial_number"), None);
+    }
+
+    // --- Record stream, pauses and timer events (A5) ---
+
+    const BASE_MS: u64 = 1718445600_000; // == make_summary().start_time
+    const BASE_FIT: u32 = 1087380000; // FIT timestamp of BASE_MS
+
+    fn pw(watts: u16, sec: u64) -> SensorReading {
+        SensorReading::Power {
+            watts, timestamp: None, epoch_ms: BASE_MS + sec * 1000,
+            device_id: "t".into(), pedal_balance: None,
+        }
+    }
+    fn hr_at(bpm: u8, ms_offset: u64) -> SensorReading {
+        SensorReading::HeartRate { bpm, timestamp: None, epoch_ms: BASE_MS + ms_offset, device_id: "t".into() }
+    }
+    fn spd_at(kmh: f32, ms_offset: u64) -> SensorReading {
+        SensorReading::Speed { kmh, timestamp: None, epoch_ms: BASE_MS + ms_offset, device_id: "t".into() }
+    }
+
+    /// Summary whose active duration matches the readings fed with it.
+    fn summary_with_duration(duration_secs: u64) -> SessionSummary {
+        let mut s = make_summary();
+        s.duration_secs = duration_secs;
+        s
+    }
+
+    #[test]
+    fn fit_end_ts_falls_back_to_active_duration_when_longer_than_span() {
+        // Active duration (3600 s) exceeds the data span (records 0..=59 s):
+        // end_ts = start + duration, still ≥ the last record; timer ≤ elapsed.
+        let readings: Vec<SensorReading> = (0..60).map(|s| pw(200, s)).collect();
+        let data = export_fit(&summary_with_duration(3600), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let last_record_ts = records(&msgs).last().unwrap().field_u32(253).unwrap();
+        assert_eq!(last_record_ts, BASE_FIT + 59);
+        for global in [18u16, 19] {
+            let m = msgs.iter().find(|m| m.global_msg == global).unwrap();
+            let end = m.field_u32(253).unwrap();
+            assert_eq!(end, BASE_FIT + 3600, "msg {global} end = start + active duration");
+            assert!(end >= last_record_ts);
+            let (elapsed, timer) = (m.field_u32(7).unwrap(), m.field_u32(8).unwrap());
+            assert_eq!(elapsed, 3_600_000);
+            assert!(timer <= elapsed, "msg {global}: timer {timer} > elapsed {elapsed}");
+        }
+    }
+
+    #[test]
+    fn fit_end_ts_is_last_record_when_span_exceeds_duration() {
+        // Records span 59 s but only 30 s were active: end = last record,
+        // elapsed = 59 s, timer = 30 s.
+        let readings: Vec<SensorReading> = (0..60).map(|s| pw(200, s)).collect();
+        let data = export_fit(&summary_with_duration(30), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let session = msgs.iter().find(|m| m.global_msg == 18).unwrap();
+        assert_eq!(session.field_u32(253), Some(BASE_FIT + 59));
+        assert_eq!(session.field_u32(7), Some(59_000));
+        assert_eq!(session.field_u32(8), Some(30_000));
+    }
+
+    fn records(msgs: &[FitMsg]) -> Vec<&FitMsg> {
+        msgs.iter().filter(|m| m.global_msg == 20).collect()
+    }
+
+    /// 60 s riding, 10-min pause, 60 s riding; active duration 120 s.
+    fn paused_ride() -> (SessionSummary, Vec<SensorReading>) {
+        let mut summary = make_summary();
+        summary.duration_secs = 120;
+        let mut readings = Vec::new();
+        for s in (0..60).chain(660..720) {
+            readings.push(pw(200, s));
+            readings.push(hr_at(140, s * 1000 + 200));
+        }
+        (summary, readings)
+    }
+
+    #[test]
+    fn fit_hr_speed_only_ride_has_one_record_per_second() {
+        let readings: Vec<SensorReading> = (0..60)
+            .flat_map(|s| [hr_at(140, s * 1000), spd_at(36.0, s * 1000 + 500)])
+            .collect();
+        let data = export_fit(&summary_with_duration(60), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let recs = records(&msgs);
+        assert_eq!(recs.len(), 60, "one record per second of data");
+        assert_eq!(recs[0].field_u32(253), Some(BASE_FIT));
+        assert_eq!(recs[59].field_u32(253), Some(BASE_FIT + 59));
+        assert_eq!(recs[10].field_u8(3), Some(140), "HR present");
+        assert_eq!(recs[10].field_u16(7), Some(0xFFFF), "no power sensor → invalid");
+        assert_eq!(recs[10].field_u16(6), Some(10_000), "36 km/h = 10 m/s × 1000");
+    }
+
+    #[test]
+    fn fit_power_at_4hz_yields_one_record_per_second_with_mean_power() {
+        let readings: Vec<SensorReading> = (0..10u64)
+            .flat_map(|s| {
+                [100u16, 200, 300, 400].into_iter().enumerate().map(move |(i, w)| {
+                    SensorReading::Power {
+                        watts: w, timestamp: None, epoch_ms: BASE_MS + s * 1000 + i as u64 * 250,
+                        device_id: "t".into(), pedal_balance: None,
+                    }
+                })
+            })
+            .collect();
+        let data = export_fit(&summary_with_duration(10), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let recs = records(&msgs);
+        assert_eq!(recs.len(), 10);
+        assert_eq!(recs[3].field_u16(7), Some(250), "(100+200+300+400)/4");
+    }
+
+    #[test]
+    fn fit_paused_ride_end_ts_not_before_last_record() {
+        let (summary, readings) = paused_ride();
+        let data = export_fit(&summary, &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let last_record_ts = records(&msgs).last().unwrap().field_u32(253).unwrap();
+        assert_eq!(last_record_ts, BASE_FIT + 719);
+        for global in [18u16, 19] {
+            let m = msgs.iter().find(|m| m.global_msg == global).unwrap();
+            assert!(m.field_u32(253).unwrap() >= last_record_ts, "msg {global} ends before last record");
+        }
+    }
+
+    #[test]
+    fn fit_paused_ride_elapsed_is_wall_clock_timer_is_active() {
+        let (summary, readings) = paused_ride();
+        let data = export_fit(&summary, &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        for global in [18u16, 19] {
+            let m = msgs.iter().find(|m| m.global_msg == global).unwrap();
+            assert_eq!(m.field_u32(7), Some(719_000), "msg {global} total_elapsed_time = wall clock");
+            assert_eq!(m.field_u32(8), Some(120_000), "msg {global} total_timer_time = active");
+        }
+        let act = msgs.iter().find(|m| m.global_msg == 34).unwrap();
+        assert_eq!(act.field_u32(0), Some(120_000), "activity total_timer_time = active");
+    }
+
+    #[test]
+    fn fit_writes_timer_stop_start_around_gap() {
+        let (summary, readings) = paused_ride();
+        let data = export_fit(&summary, &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let events: Vec<(u32, u8, u8)> = msgs
+            .iter()
+            .filter(|m| m.global_msg == 21)
+            .map(|m| (m.field_u32(253).unwrap(), m.field_u8(0).unwrap(), m.field_u8(1).unwrap()))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                (BASE_FIT, 0, 0),       // timer start
+                (BASE_FIT + 59, 0, 4),  // stop_all at last record before the gap
+                (BASE_FIT + 660, 0, 0), // start at first record after the gap
+                (BASE_FIT + 719, 0, 4), // final stop_all at end_ts
+            ]
+        );
+        // Event order in the file follows time: the pause pair sits between records
+        let order: Vec<u16> = msgs.iter().map(|m| m.global_msg).filter(|g| *g == 20 || *g == 21).collect();
+        let stop_idx = order.iter().enumerate().filter(|(_, g)| **g == 21).nth(1).unwrap().0;
+        assert_eq!(order[..stop_idx].iter().filter(|g| **g == 20).count(), 60);
+    }
+
+    #[test]
+    fn fit_short_pause_writes_no_timer_events() {
+        // 4 s hole (≤ 5 s) is indistinguishable from a sensor hole → no timer events
+        let readings: Vec<SensorReading> = (0..10).chain(14..20).map(|s| pw(200, s)).collect();
+        let data = export_fit(&summary_with_duration(20), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        assert_eq!(msgs.iter().filter(|m| m.global_msg == 21).count(), 2);
+    }
+
+    #[test]
+    fn fit_record_distance_follows_gap_rule() {
+        // 36 km/h (10 m/s) for 0..=10 s, 10-min gap, 36 km/h for 610..=620 s
+        let readings: Vec<SensorReading> =
+            (0..=10).chain(610..=620).map(|s| spd_at(36.0, s * 1000)).collect();
+        let data = export_fit(&summary_with_duration(25), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let last = *records(&msgs).last().unwrap();
+        // (10 s + 5 s capped gap + 10 s) × 10 m/s = 250 m → ×100 = 25000
+        assert_eq!(last.field_u32(5), Some(25_000));
+    }
+
+    #[test]
+    fn fit_hr_invalid_after_5s_without_reading() {
+        // Power every second for 20 s; HR strap drops after its reading at 4 s
+        let mut readings: Vec<SensorReading> = (0..20).map(|s| pw(200, s)).collect();
+        readings.extend((0..=4).map(|s| hr_at(150, s * 1000)));
+        let data = export_fit(&summary_with_duration(20), &readings).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let recs = records(&msgs);
+        assert_eq!(recs[9].field_u8(3), Some(150), "5 s after last HR: still valid");
+        assert_eq!(recs[10].field_u8(3), Some(0xFF), "> 5 s after last HR: invalid");
+    }
+
+    #[test]
+    fn fit_paused_ride_decodes_with_fitparser() {
+        use fitparser::profile::MesgNum;
+        use fitparser::Value;
+        let (summary, readings) = paused_ride();
+        let data = export_fit(&summary, &readings).unwrap();
+        let recs = decode(&data);
+        assert_eq!(recs.iter().filter(|r| r.kind() == MesgNum::Record).count(), 120);
+        let session = first_of(&recs, MesgNum::Session);
+        assert_eq!(named(session, "total_elapsed_time"), Some(&Value::Float64(719.0)));
+        assert_eq!(named(session, "total_timer_time"), Some(&Value::Float64(120.0)));
+        let event_types: Vec<String> = recs
+            .iter()
+            .filter(|r| r.kind() == MesgNum::Event)
+            .map(|r| named(r, "event_type").unwrap().to_string())
+            .collect();
+        assert_eq!(event_types, vec!["start", "stop_all", "start", "stop_all"]);
+    }
+
+    /// Writes FIT fixtures for the recorded independent check with Python
+    /// `fitdecode` (see design.md Verification). Run with
+    /// `FIT_FIXTURE_DIR=/some/dir cargo test --lib write_fit_fixtures -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_fit_fixtures() {
+        let dir = std::env::var("FIT_FIXTURE_DIR").expect("set FIT_FIXTURE_DIR");
+        let (paused, paused_readings) = paused_ride();
+        let hr_speed: Vec<SensorReading> = (0..60)
+            .flat_map(|s| [hr_at(140, s * 1000), spd_at(36.0, s * 1000 + 500)])
+            .collect();
+        let power_hr: Vec<SensorReading> =
+            (0..60).flat_map(|s| [pw(200, s), hr_at(140, s * 1000 + 300)]).collect();
+        for (name, summary, readings) in [
+            ("paused.fit", &paused, &paused_readings),
+            ("hr_speed_only.fit", &summary_with_duration(60), &hr_speed),
+            ("power_hr.fit", &summary_with_duration(60), &power_hr),
+        ] {
+            let data = export_fit(summary, readings).unwrap();
+            std::fs::write(std::path::Path::new(&dir).join(name), data).unwrap();
+        }
     }
 }

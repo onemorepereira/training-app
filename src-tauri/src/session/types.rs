@@ -37,6 +37,23 @@ impl Default for SessionConfig {
     }
 }
 
+/// Training zones in effect when a session was recorded (persisted per session
+/// so later zone edits don't rewrite past analyses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZoneSnapshot {
+    pub power_zones: [u16; 6],
+    pub hr_zones: [u8; 5],
+}
+
+impl From<&SessionConfig> for ZoneSnapshot {
+    fn from(config: &SessionConfig) -> Self {
+        Self {
+            power_zones: config.power_zones,
+            hr_zones: config.hr_zones,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
@@ -59,6 +76,11 @@ pub struct SessionSummary {
     pub activity_type: Option<String>,
     pub rpe: Option<u8>,
     pub notes: Option<String>,
+    /// Zones in effect at recording time; None for sessions recorded before
+    /// snapshots existed (analysis then falls back to the current zones).
+    /// `serde(default)` keeps autosave JSON from older builds loadable.
+    #[serde(default)]
+    pub zones: Option<ZoneSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

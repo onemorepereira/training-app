@@ -72,21 +72,28 @@ export function computeTimeInZone(
   return { inZoneSecs, belowSecs, aboveSecs };
 }
 
+interface TimedValuePoint extends ValuePoint {
+  elapsed_secs: number;
+}
+
 /**
- * Compute the time (in seconds) until the first in-zone reading.
+ * Compute the time (in seconds) from the first point until the first in-zone reading.
  *
+ * Uses each point's `elapsed_secs` rather than its array index: the backend
+ * timeseries omits seconds without data, so indexes are not seconds.
  * Returns null if the value never enters the zone.
  */
 export function computeTimeToZone(
-  timeseries: ValuePoint[],
+  timeseries: TimedValuePoint[],
   lower: number,
   upper: number,
-  intervalSecs: number,
 ): number | null {
-  for (let i = 0; i < timeseries.length; i++) {
-    const v = timeseries[i].value;
+  if (timeseries.length === 0) return null;
+  const start = timeseries[0].elapsed_secs;
+  for (const pt of timeseries) {
+    const v = pt.value;
     if (v != null && v >= lower && v <= upper) {
-      return i * intervalSecs;
+      return pt.elapsed_secs - start;
     }
   }
   return null;

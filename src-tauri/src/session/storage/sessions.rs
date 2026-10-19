@@ -3,10 +3,13 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use super::fsio::{io_error, remove_durable, write_durable};
+use super::power_curves::replace_power_curve_in_tx;
 use super::Storage;
 use crate::device::types::{CommandSource, SensorReading};
 use crate::error::AppError;
-use crate::session::types::SessionSummary;
+use crate::session::analysis::PowerCurvePoint;
+use crate::session::metrics::SummaryMetrics;
+use crate::session::types::{SessionSummary, ZoneSnapshot};
 
 /// Legacy sensor reading format: Power variant lacked pedal_balance field because
 /// #[serde(skip_serializing_if)] silently dropped it from bincode output.
@@ -102,6 +105,7 @@ struct SessionRow {
     activity_type: Option<String>,
     rpe: Option<i32>,
     notes: Option<String>,
+    zones: Option<String>,
 }
 
 impl TryFrom<SessionRow> for SessionSummary {
@@ -116,6 +120,13 @@ impl TryFrom<SessionRow> for SessionSummary {
                     row.start_time, row.id, e
                 ))
             })?;
+        // A malformed snapshot must not hide the session: fall back to "unknown"
+        // (analysis then uses the current zones) and log it.
+        let zones = row.zones.as_deref().and_then(|json| {
+            serde_json::from_str::<ZoneSnapshot>(json)
+                .map_err(|e| warn!("Ignoring malformed zones for session {}: {}", row.id, e))
+                .ok()
+        });
         Ok(Self {
             id: row.id,
             start_time,
@@ -137,6 +148,7 @@ impl TryFrom<SessionRow> for SessionSummary {
             activity_type: row.activity_type,
             rpe: row.rpe.map(|v| v as u8),
             notes: row.notes,
+            zones,
         })
     }
 }
@@ -182,6 +194,13 @@ impl Storage {
             summary.id, summary.duration_secs
         );
         let raw_file = self.raw_path(&summary.id);
+        // Encode before touching any file so an encoding error can't leave a
+        // raw file without a row.
+        let zones_json = summary
+            .zones
+            .map(|z| serde_json::to_string(&z))
+            .transpose()
+            .map_err(|e| AppError::Serialization(format!("Failed to encode zones: {}", e)))?;
 
         if self.session_exists(&summary.id).await? {
             let raw_present = tokio::fs::try_exists(&raw_file)
@@ -228,8 +247,8 @@ impl Storage {
             "INSERT OR IGNORE INTO sessions (id, start_time, duration_secs, ftp, avg_power, max_power, \
              normalized_power, tss, intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, \
              work_kj, variability_index, distance_km, \
-             raw_file_path, title, activity_type, rpe, notes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             raw_file_path, title, activity_type, rpe, notes, zones) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&summary.id)
         .bind(summary.start_time.to_rfc3339())
@@ -252,6 +271,7 @@ impl Storage {
         .bind(&summary.activity_type)
         .bind(summary.rpe.map(|v| v as i32))
         .bind(&summary.notes)
+        .bind(zones_json)
         .execute(&self.pool)
         .await
         .map_err(AppError::Database)?;
@@ -297,7 +317,7 @@ impl Storage {
         let rows = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
              intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
-             distance_km, title, activity_type, rpe, notes FROM sessions ORDER BY start_time DESC",
+             distance_km, title, activity_type, rpe, notes, zones FROM sessions ORDER BY start_time DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -309,7 +329,7 @@ impl Storage {
         let row = sqlx::query_as::<_, SessionRow>(
             "SELECT id, start_time, duration_secs, ftp, avg_power, max_power, normalized_power, tss, \
              intensity_factor, avg_hr, max_hr, avg_cadence, avg_speed, work_kj, variability_index, \
-             distance_km, title, activity_type, rpe, notes FROM sessions WHERE id = ?",
+             distance_km, title, activity_type, rpe, notes, zones FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_one(&self.pool)
@@ -420,6 +440,54 @@ impl Storage {
             return Err(AppError::Session(format!("Session not found: {}", session_id)));
         }
         Ok(())
+    }
+
+    /// Overwrite a session's recomputed summary metrics and power-curve cache
+    /// in one transaction (used by the one-time metrics repair). Only metric
+    /// columns are touched; duration, FTP, metadata and zones are left alone.
+    /// When `update_if_and_tss` is false the stored IF and TSS are kept.
+    /// Returns false (and writes nothing) if the session no longer exists.
+    pub async fn replace_session_metrics(
+        &self,
+        session_id: &str,
+        m: &SummaryMetrics,
+        update_if_and_tss: bool,
+        curve: &[PowerCurvePoint],
+    ) -> Result<bool, AppError> {
+        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+        let result = sqlx::query(
+            "UPDATE sessions SET avg_power = ?, max_power = ?, normalized_power = ?, \
+             tss = CASE WHEN ? THEN ? ELSE tss END, \
+             intensity_factor = CASE WHEN ? THEN ? ELSE intensity_factor END, \
+             variability_index = ?, work_kj = ?, distance_km = ?, \
+             avg_hr = ?, max_hr = ?, avg_cadence = ?, avg_speed = ? \
+             WHERE id = ?",
+        )
+        .bind(m.avg_power.map(|v| v as i32))
+        .bind(m.max_power.map(|v| v as i32))
+        .bind(m.normalized_power.map(|v| v as i32))
+        .bind(update_if_and_tss)
+        .bind(m.tss.map(|v| v as f64))
+        .bind(update_if_and_tss)
+        .bind(m.intensity_factor.map(|v| v as f64))
+        .bind(m.variability_index.map(|v| v as f64))
+        .bind(m.work_kj.map(|v| v as f64))
+        .bind(m.distance_km.map(|v| v as f64))
+        .bind(m.avg_hr.map(|v| v as i32))
+        .bind(m.max_hr.map(|v| v as i32))
+        .bind(m.avg_cadence.map(|v| v as f64))
+        .bind(m.avg_speed.map(|v| v as f64))
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(AppError::Database)?;
+            return Ok(false);
+        }
+        replace_power_curve_in_tx(&mut tx, session_id, curve).await?;
+        tx.commit().await.map_err(AppError::Database)?;
+        Ok(true)
     }
 
     pub async fn get_zone_config(&self, session_id: &str) -> Result<Option<String>, AppError> {

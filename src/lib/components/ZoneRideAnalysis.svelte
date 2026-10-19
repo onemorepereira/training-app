@@ -8,7 +8,7 @@
     timeseries,
   }: {
     config: ZoneRideConfig;
-    timeseries: { power: number | null; heart_rate: number | null }[];
+    timeseries: { elapsed_secs: number; power: number | null; heart_rate: number | null }[];
   } = $props();
 
   let modeLabel = $derived(config.mode === 'HeartRate' ? 'HR' : 'Power');
@@ -18,6 +18,7 @@
   // Build value series from the appropriate channel
   let valueSeries = $derived.by(() => {
     return timeseries.map((pt) => ({
+      elapsed_secs: pt.elapsed_secs,
       value: config.mode === 'HeartRate' ? (pt.heart_rate as number | null) : (pt.power as number | null),
     }));
   });
@@ -27,7 +28,7 @@
   );
 
   let timeToZone = $derived(
-    computeTimeToZone(valueSeries, config.lower_bound, config.upper_bound, 1),
+    computeTimeToZone(valueSeries, config.lower_bound, config.upper_bound),
   );
 
   let decoupling = $derived(computeDecoupling(timeseries));
