@@ -120,6 +120,11 @@ impl SessionManager {
     }
 
     pub async fn process_reading(&self, reading: SensorReading) {
+        self.process_reading_at(reading, Instant::now()).await;
+    }
+
+    /// `process_reading` with an explicit arrival time (tests drive the clock).
+    async fn process_reading_at(&self, reading: SensorReading, now: Instant) {
         let mut lock = self.current_session.lock().await;
         let Some(session) = lock.as_mut() else {
             return;
@@ -128,15 +133,19 @@ impl SessionManager {
             return;
         }
 
-        // Accumulate active elapsed time (any reading type counts)
-        let now = Instant::now();
-        if let Some(prev) = session.last_reading_time {
-            let delta_ms = prev.elapsed().as_millis() as u64;
-            // Cap gap to avoid counting sensor dropouts or reconnects
-            let capped = delta_ms.min(MAX_READING_GAP_MS);
-            session.active_elapsed_ms += capped;
+        // Accumulate active elapsed time from sensor readings only. Trainer
+        // commands are logged but are not rider activity: counting them would
+        // let a zone controller keep the clock running while sensors are silent
+        // (and diverge from the gap rule used by metrics, analysis and FIT).
+        if !matches!(reading, SensorReading::TrainerCommand { .. }) {
+            if let Some(prev) = session.last_reading_time {
+                let delta_ms = now.saturating_duration_since(prev).as_millis() as u64;
+                // Cap gap to avoid counting sensor dropouts or reconnects
+                let capped = delta_ms.min(MAX_READING_GAP_MS);
+                session.active_elapsed_ms += capped;
+            }
+            session.last_reading_time = Some(now);
         }
-        session.last_reading_time = Some(now);
 
         // Same entry point the one-time repair uses when replaying the raw log.
         session.metrics.record(&reading);
@@ -552,6 +561,41 @@ mod tests {
         feed_constant_power(&mgr, 199, 12, 18).await;
         mgr.process_reading(power_reading_at(199, 30_000)).await;
         assert_eq!(mgr.stop_session().await.unwrap().normalized_power, Some(200));
+    }
+
+    #[tokio::test]
+    async fn trainer_commands_do_not_extend_active_time() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        mgr.process_reading_at(power_reading_at(200, 0), at(0)).await;
+        // Sensors silent for 21 s while the zone controller keeps commanding
+        for s in 1..=20 {
+            let cmd = SensorReading::TrainerCommand {
+                target_watts: 200,
+                epoch_ms: s * 1000,
+                source: crate::device::types::CommandSource::ZoneControl,
+            };
+            mgr.process_reading_at(cmd, at(s)).await;
+        }
+        mgr.process_reading_at(power_reading_at(200, 21_000), at(21)).await;
+
+        let summary = mgr.stop_session().await.unwrap();
+        // Power → power is a 21 s gap, capped at 5 s; commands add nothing
+        assert_eq!(summary.duration_secs, 5);
+    }
+
+    #[tokio::test]
+    async fn active_time_counts_continuous_readings() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        let t0 = Instant::now();
+        for s in 0..=10u64 {
+            mgr.process_reading_at(power_reading_at(200, s * 1000), t0 + std::time::Duration::from_secs(s))
+                .await;
+        }
+        assert_eq!(mgr.stop_session().await.unwrap().duration_secs, 10);
     }
 
     #[tokio::test]
