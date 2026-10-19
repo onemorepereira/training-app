@@ -213,6 +213,15 @@ impl SessionManager {
         })
     }
 
+    /// Status of the active (running or paused) session, or None if no session.
+    pub async fn status(&self) -> Option<ActiveSessionStatus> {
+        let lock = self.current_session.lock().await;
+        lock.as_ref().map(|s| ActiveSessionStatus {
+            session_id: s.id.clone(),
+            paused: s.status == SessionStatus::Paused,
+        })
+    }
+
     #[allow(dead_code)]
     pub async fn is_active(&self) -> bool {
         self.current_session.lock().await.is_some()
@@ -295,6 +304,39 @@ mod tests {
             epoch_ms: 0,
             device_id: "test".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn status_none_without_session() {
+        let mgr = SessionManager::new();
+        assert!(mgr.status().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_running_after_start() {
+        let mgr = SessionManager::new();
+        let id = mgr.start_session(default_config()).await.unwrap();
+        let status = mgr.status().await.unwrap();
+        assert_eq!(status.session_id, id);
+        assert!(!status.paused);
+    }
+
+    #[tokio::test]
+    async fn status_paused_after_pause() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        mgr.pause_session().await;
+        assert!(mgr.status().await.unwrap().paused);
+        mgr.resume_session().await;
+        assert!(!mgr.status().await.unwrap().paused);
+    }
+
+    #[tokio::test]
+    async fn status_none_after_stop() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        mgr.stop_session().await;
+        assert!(mgr.status().await.is_none());
     }
 
     #[tokio::test]

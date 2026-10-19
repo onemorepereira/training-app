@@ -8,19 +8,21 @@
   import ZoneRideStatus from '$lib/components/ZoneRideStatus.svelte';
   import ConnectionHealth from '$lib/components/ConnectionHealth.svelte';
   import { currentPower, currentHR, currentCadence, currentSpeed, liveMetrics } from '$lib/stores/sensor';
-  import { sessionActive, sessionPaused, sessionId, dashboardView, requestStart, requestStop } from '$lib/stores/session';
+  import { sessionActive, sessionPaused, dashboardView } from '$lib/stores/session';
+  import { endSession, startSession, postRideSession, lifecycleError } from '$lib/stores/sessionLifecycle';
   import { autoSessionEnabled, autoSessionCountdown } from '$lib/stores/autoSession';
   import { trainerConnected } from '$lib/stores/devices';
   import { unitSystem, formatSpeed, speedUnit } from '$lib/stores/units';
   import { trainerError } from '$lib/stores/trainer';
-  import { get } from 'svelte/store';
-  import { zoneActive, zoneStatus, startZoneRide, stopZoneRide, pauseZoneRide, resumeZoneRide, stopZonePolling } from '$lib/stores/zoneRide';
-  import { api, extractError, type SessionSummary, type SessionConfig, type ZoneTarget, type ZoneRideConfig } from '$lib/tauri';
+  import { zoneActive, zoneStatus, zoneRideResult, startZoneRide, stopZoneRide, pauseZoneRide, resumeZoneRide, describeZoneStop, type ZoneRideResult } from '$lib/stores/zoneRide';
+  import { api, extractError, type SessionConfig, type ZoneTarget } from '$lib/tauri';
   import ActivityModal from '$lib/components/ActivityModal.svelte';
   import { formatDuration } from '$lib/utils/format';
 
   let error = $state('');
-  let postRideSession = $state<SessionSummary | null>(null);
+  /** Zone-ride notice the user dismissed (the result itself is kept until saved). */
+  let dismissedZoneResult = $state.raw<ZoneRideResult | null>(null);
+  let zoneNotice = $derived($zoneRideResult && $zoneRideResult !== dismissedZoneResult ? $zoneRideResult : null);
   let showZoneBuilder = $state(false);
   let userConfig = $state<SessionConfig | null>(null);
 
@@ -37,43 +39,16 @@
 
   async function toggleSession() {
     error = '';
+    if ($sessionActive) {
+      showZoneBuilder = false;
+      await endSession(); // surfaces its own errors via lifecycleError
+      return;
+    }
+    lifecycleError.set('');
     try {
-      if ($sessionActive) {
-        // Snapshot zone status before stopping (stopZoneRide clears the store)
-        const zoneSnap = get(zoneStatus);
-        if ($zoneActive) {
-          try { await stopZoneRide(); } catch { /* best-effort */ }
-        }
-        const currentSessionId = $sessionId;
-        const result = await requestStop();
-        showZoneBuilder = false;
-        stopZonePolling();
-
-        // Persist zone ride config if zone ride was active
-        if (zoneSnap?.active && currentSessionId) {
-          try {
-            const zoneConfig: ZoneRideConfig = {
-              mode: zoneSnap.mode!,
-              zone: zoneSnap.target_zone ?? 0,
-              lower_bound: zoneSnap.lower_bound ?? 0,
-              upper_bound: zoneSnap.upper_bound ?? 0,
-              duration_secs: zoneSnap.duration_secs ?? null,
-              time_in_zone_secs: zoneSnap.time_in_zone_secs,
-              commanded_power_series: zoneSnap.commanded_power != null ? [zoneSnap.commanded_power] : [],
-              time_to_zone_secs: null,
-            };
-            await api.saveZoneRideConfig(currentSessionId, JSON.stringify(zoneConfig));
-          } catch { /* best-effort, don't block session save */ }
-        }
-
-        if (result) {
-          postRideSession = result;
-        }
-      } else {
-        await requestStart();
-      }
+      await startSession();
     } catch (e) {
-      error = extractError(e);
+      lifecycleError.set(extractError(e));
     }
   }
 
@@ -239,6 +214,23 @@
       {/if}
     </div>
 
+    {#if $lifecycleError}
+      <div class="inline-notice error" role="alert">
+        <span>{$lifecycleError}</span>
+        <button class="notice-dismiss" onclick={() => lifecycleError.set('')} aria-label="Dismiss">&times;</button>
+      </div>
+    {/if}
+    {#if zoneNotice}
+      <div class="inline-notice" class:error={zoneNotice.error != null} role="status">
+        <span>
+          {describeZoneStop(zoneNotice)}
+          &middot; {formatDuration(zoneNotice.config.time_in_zone_secs)} in zone
+          {#if zoneNotice.error}<br />{zoneNotice.error}{/if}
+        </span>
+        <button class="notice-dismiss" onclick={() => { dismissedZoneResult = zoneNotice; }} aria-label="Dismiss">&times;</button>
+      </div>
+    {/if}
+
     <!-- Trainer controls -->
     {#if $trainerConnected}
       {#if $zoneActive}
@@ -280,21 +272,21 @@
   {/if}
 </div>
 
-{#if postRideSession}
+{#if $postRideSession}
   <ActivityModal
-    session={postRideSession}
+    session={$postRideSession}
     mode="post-ride"
     onSave={async (title, activityType, rpe, notes) => {
-      const id = postRideSession?.id;
+      const id = $postRideSession?.id;
       if (!id) return;
       try {
         await api.updateSessionMetadata(id, title, activityType, rpe, notes);
       } catch (e) {
         error = extractError(e);
       }
-      postRideSession = null;
+      postRideSession.set(null);
     }}
-    onClose={() => { postRideSession = null; }}
+    onClose={() => { postRideSession.set(null); }}
   />
 {/if}
 
@@ -593,6 +585,39 @@
 
   .btn-zone-toggle svg {
     opacity: 0.7;
+  }
+
+  .inline-notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-lg);
+    border-top: 1px solid var(--border-subtle);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: var(--text-sm);
+    animation: slide-up 150ms ease;
+  }
+
+  .inline-notice.error {
+    background: rgba(244, 67, 54, 0.08);
+    color: var(--danger);
+  }
+
+  .notice-dismiss {
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: var(--text-lg);
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.7;
+  }
+
+  .notice-dismiss:hover {
+    opacity: 1;
   }
 
   .trainer-error {

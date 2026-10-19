@@ -26,6 +26,20 @@ export function displayWeight(kg: number, units: 'metric' | 'imperial'): number 
   return units === 'imperial' ? Math.round(kgToLbs(kg) * 10) / 10 : kg;
 }
 
+/**
+ * Convert a weight the user typed from one unit system to another (1 decimal).
+ * Non-numeric input (e.g. an emptied field) is returned unchanged.
+ */
+export function convertDisplayedWeight(
+  value: number,
+  from: 'metric' | 'imperial',
+  to: 'metric' | 'imperial',
+): number {
+  if (from === to || typeof value !== 'number' || !Number.isFinite(value)) return value;
+  const converted = to === 'imperial' ? kgToLbs(value) : lbsToKg(value);
+  return Math.round(converted * 10) / 10;
+}
+
 export function toStorageWeight(displayed: number, units: 'metric' | 'imperial'): number {
   return units === 'imperial' ? Math.round(lbsToKg(displayed) * 10) / 10 : displayed;
 }

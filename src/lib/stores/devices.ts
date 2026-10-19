@@ -128,3 +128,13 @@ export function handleDeviceDisconnected(deviceId: string) {
     return d;
   });
 }
+
+/**
+ * User-initiated reconnect from the connection banner. connect_device does not
+ * emit device_reconnected, so mark the banner reconnected here (it auto-clears).
+ * Errors are rethrown for the caller to display.
+ */
+export async function reconnectDevice(deviceId: string): Promise<void> {
+  await api.connectDevice(deviceId);
+  handleDeviceReconnected(deviceId);
+}

@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import type { SessionConfig } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
-  import { unitSystem, displayWeight, toStorageWeight } from '$lib/stores/units';
+  import { unitSystem, displayWeight, toStorageWeight, convertDisplayedWeight } from '$lib/stores/units';
 
   let config = $state<SessionConfig>({
     ftp: 200,
@@ -29,10 +29,10 @@
     }
   });
 
+  // Converts the typed (possibly unsaved) weight; the app-wide unit changes only on Save.
   function onUnitsChange(units: 'metric' | 'imperial') {
+    weightDisplay = convertDisplayedWeight(weightDisplay, config.units, units);
     config.units = units;
-    unitSystem.set(units);
-    weightDisplay = displayWeight(config.weight_kg, units);
   }
 
   async function save() {
@@ -41,6 +41,7 @@
     try {
       config.weight_kg = toStorageWeight(weightDisplay, config.units);
       await api.saveUserConfig(config);
+      unitSystem.set(config.units);
       saved = true;
       setTimeout(() => (saved = false), 2000);
     } catch (e) {

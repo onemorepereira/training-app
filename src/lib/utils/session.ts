@@ -19,7 +19,7 @@ export const TYPE_LABELS: Record<string, string> = {
 };
 
 export function displayTitle(session: SessionSummary): string {
-  return session.title ?? autoTitle(session.start_time);
+  return session.title?.trim() ? session.title : autoTitle(session.start_time);
 }
 
 /** RPE gradient: green (1) -> yellow (5) -> red (10) */

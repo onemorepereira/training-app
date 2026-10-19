@@ -6,7 +6,35 @@ import {
   formatSpeed,
   displayWeight,
   toStorageWeight,
+  convertDisplayedWeight,
 } from './units';
+
+describe('convertDisplayedWeight', () => {
+  it('convert_75kg_to_imperial_is_165_3', () => {
+    // 75 × 2.20462 = 165.35 → 165.3
+    expect(convertDisplayedWeight(75, 'metric', 'imperial')).toBe(165.3);
+  });
+
+  it('convert_typed_80kg_to_imperial_is_176_4', () => {
+    // 80 × 2.20462 = 176.37 → 176.4
+    expect(convertDisplayedWeight(80, 'metric', 'imperial')).toBe(176.4);
+  });
+
+  it('convert_165_3lbs_to_metric_is_75_0', () => {
+    // 165.3 / 2.20462 = 74.98 → 75.0
+    expect(convertDisplayedWeight(165.3, 'imperial', 'metric')).toBe(75);
+  });
+
+  it('same_unit_conversion_is_identity', () => {
+    expect(convertDisplayedWeight(72.4, 'metric', 'metric')).toBe(72.4);
+  });
+
+  it('non_finite_weight_passes_through', () => {
+    // An emptied number input binds to null
+    expect(convertDisplayedWeight(null as unknown as number, 'metric', 'imperial')).toBeNull();
+    expect(convertDisplayedWeight(Number.NaN, 'metric', 'imperial')).toBeNaN();
+  });
+});
 
 describe('kmhToMph', () => {
   it('converts 100 km/h', () => {

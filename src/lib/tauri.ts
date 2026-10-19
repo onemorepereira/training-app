@@ -67,6 +67,20 @@ export interface SessionSummary {
   zones?: ZoneSnapshot | null;
 }
 
+/**
+ * Primary device id per metric, from get_primary_devices. Cadence/speed sensors
+ * use `Cadence` and `Speed` (newer backends) or the legacy `CadenceSpeed` key.
+ */
+export type PrimaryDevices = Partial<
+  Record<'HeartRate' | 'Power' | 'Cadence' | 'Speed' | 'CadenceSpeed' | 'FitnessTrainer', string>
+>;
+
+/** In-progress session as reported by `get_session_status`. */
+export interface ActiveSessionStatus {
+  session_id: string;
+  paused: boolean;
+}
+
 export interface SessionConfig {
   ftp: number;
   weight_kg: number;
@@ -169,8 +183,11 @@ export interface ZoneControlStatus {
   elapsed_secs: number;
   duration_secs: number | null;
   paused: boolean;
+  /** 'idle' | 'ramping' | 'adjusting' | 'in_zone' | 'paused' | 'trainer_lost' | 'stopped' */
   phase: string;
   safety_note: string | null;
+  /** Why the controller stopped; set once inactive. Optional until Area B's backend lands. */
+  stop_reason?: StopReason | null;
 }
 
 export type StopReason =
@@ -178,7 +195,11 @@ export type StopReason =
   | 'DurationComplete'
   | 'SafetyStop'
   | 'TrainerDisconnected'
-  | 'SensorLost';
+  | 'SensorLost'
+  | 'SessionStopped'
+  | 'AppClosing'
+  | 'ControllerFault'
+  | 'TrainerUnresponsive';
 
 export interface ZoneRideConfig {
   mode: ZoneMode;
@@ -219,6 +240,11 @@ export function extractError(e: unknown): string {
   return String(e);
 }
 
+/** True for the error connect_device returns when a user disconnect cancelled it. */
+export function isConnectCancelled(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as { code?: unknown }).code === 'connect_cancelled';
+}
+
 export const api = {
   getKnownDevices: () => invoke<DeviceInfo[]>('get_known_devices'),
   scanDevices: () => invoke<DeviceInfo[]>('scan_devices'),
@@ -227,6 +253,7 @@ export const api = {
   disconnectDevice: (deviceId: string) => invoke<void>('disconnect_device', { deviceId }),
   startSession: () => invoke<string>('start_session'),
   stopSession: () => invoke<SessionSummary | null>('stop_session'),
+  getSessionStatus: () => invoke<ActiveSessionStatus | null>('get_session_status'),
   pauseSession: () => invoke<void>('pause_session'),
   resumeSession: () => invoke<void>('resume_session'),
   listSessions: () => invoke<SessionSummary[]>('list_sessions'),
@@ -243,8 +270,9 @@ export const api = {
   exportSessionFit: (sessionId: string) => invoke<string>('export_session_fit', { sessionId }),
   setPrimaryDevice: (deviceType: string, deviceId: string) =>
     invoke<void>('set_primary_device', { deviceType, deviceId }),
-  getPrimaryDevices: () => invoke<Record<string, string>>('get_primary_devices'),
+  getPrimaryDevices: () => invoke<PrimaryDevices>('get_primary_devices'),
   unlinkDevices: (deviceId: string) => invoke<void>('unlink_devices', { deviceId }),
+  /** Full-replace: all fields are written; null clears a field. */
   updateSessionMetadata: (
     sessionId: string,
     title: string | null,

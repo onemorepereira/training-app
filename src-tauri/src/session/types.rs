@@ -83,6 +83,14 @@ pub struct SessionSummary {
     pub zones: Option<ZoneSnapshot>,
 }
 
+/// Identity and pause state of the in-progress session, used by the frontend to
+/// rehydrate its UI state after a webview reload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSessionStatus {
+    pub session_id: String,
+    pub paused: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveMetrics {
     pub elapsed_secs: u64,

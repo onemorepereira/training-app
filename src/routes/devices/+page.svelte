@@ -1,9 +1,11 @@
 <script lang="ts">
   import type { DeviceInfo, DeviceDetails, SensorReading } from '$lib/tauri';
-  import { api, extractError } from '$lib/tauri';
+  import { api, extractError, isConnectCancelled, type PrimaryDevices } from '$lib/tauri';
+  import { deviceAction, isPrimaryDevice } from '$lib/utils/deviceActions';
   import SetupBanner from '$lib/components/SetupBanner.svelte';
   import { listen } from '@tauri-apps/api/event';
   import { onMount, onDestroy } from 'svelte';
+  import { createDisposeGuard } from '$lib/utils/disposeGuard';
   import {
     connectedDevices,
     refreshDevices,
@@ -18,9 +20,9 @@
   let scanning = $state(false);
   let error = $state('');
   let sensorPreview = $state<Record<string, string>>({});
-  let primaryDevices = $state<Record<string, string>>({});
+  let primaryDevices = $state<PrimaryDevices>({});
   let pedalLabels = $state<Record<string, string>>({});
-  let unlisten: (() => void) | null = null;
+  const guard = createDisposeGuard();
 
   let detailModal = $state<DeviceDetails | null>(null);
   let detailLoading = $state('');
@@ -40,7 +42,8 @@
       primaryDevices = await api.getPrimaryDevices();
     } catch { /* no primaries yet */ }
 
-    unlisten = await listen<SensorReading>('sensor_reading', (event) => {
+    if (guard.disposed) return;
+    const unlisten = await listen<SensorReading>('sensor_reading', (event) => {
       const r = event.payload;
       if (r.Power) {
         sensorPreview['Power'] = `${r.Power.watts}W`;
@@ -61,9 +64,11 @@
       }
       sensorPreview = { ...sensorPreview };
     });
+    // Runs immediately if the page was left while listen() was pending.
+    guard.add(unlisten);
   });
 
-  onDestroy(() => { unlisten?.(); });
+  onDestroy(() => guard.dispose());
 
   async function scan() {
     scanning = true;
@@ -77,12 +82,23 @@
     }
   }
 
+  function actionFor(device: DeviceInfo) {
+    return deviceAction(device.status, {
+      connecting: connectingIds.has(device.id),
+      disconnecting: disconnectingIds.has(device.id),
+      inRange: device.in_range,
+    });
+  }
+
   async function toggleConnection(device: DeviceInfo) {
     error = '';
-    const isConnect = device.status !== 'Connected';
+    const action = actionFor(device);
+    if (action.disabled) return;
+    const isConnect = action.kind === 'connect';
     if (isConnect) {
       connectingIds = new Set([...connectingIds, device.id]);
     } else {
+      // disconnect, or stop: cancels an in-flight connect / reconnect loop
       disconnectingIds = new Set([...disconnectingIds, device.id]);
     }
     try {
@@ -92,7 +108,8 @@
         await storeDisconnect(device.id);
       }
     } catch (e) {
-      error = extractError(e);
+      // A connect cancelled by the user's own Stop/Cancel is not an error.
+      if (!isConnectCancelled(e)) error = extractError(e);
     } finally {
       const next = new Set(isConnect ? connectingIds : disconnectingIds);
       next.delete(device.id);
@@ -105,13 +122,14 @@
   }
 
   function isPrimary(device: DeviceInfo): boolean {
-    return primaryDevices[device.device_type] === device.id;
+    return isPrimaryDevice(device, primaryDevices);
   }
 
   async function setPrimary(device: DeviceInfo) {
     try {
       await api.setPrimaryDevice(device.device_type, device.id);
-      primaryDevices = { ...primaryDevices, [device.device_type]: device.id };
+      // Re-read: the backend may map one device type to several metric keys.
+      primaryDevices = await api.getPrimaryDevices();
     } catch (e) {
       error = extractError(e);
     }
@@ -398,23 +416,20 @@
                     Set Primary
                   </button>
                 {/if}
+                {@const action = actionFor(td)}
+                {#if action.searching}
+                  <span class="searching-hint">Searching…</span>
+                {/if}
                 <button
                   class="action-btn"
-                  class:danger={td.status === 'Connected' && !disconnectingIds.has(td.id)}
-                  disabled={connectingIds.has(td.id) || disconnectingIds.has(td.id) || (td.status !== 'Connected' && td.in_range === false)}
+                  class:danger={action.kind !== 'connect' && !action.disabled}
+                  disabled={action.disabled}
                   onclick={() => toggleConnection(td)}
                 >
-                  {#if connectingIds.has(td.id)}
+                  {#if action.busy}
                     <span class="btn-spinner"></span>
-                    {td.transport === 'Ble' ? 'BLE' : 'ANT+'}…
-                  {:else if disconnectingIds.has(td.id)}
-                    <span class="btn-spinner"></span>
-                    {td.transport === 'Ble' ? 'BLE' : 'ANT+'}…
-                  {:else if dd.linked.length > 0}
-                    {td.status === 'Connected' ? 'Disconnect' : 'Connect'} {td.transport === 'Ble' ? 'BLE' : 'ANT+'}
-                  {:else}
-                    {td.status === 'Connected' ? 'Disconnect' : 'Connect'}
                   {/if}
+                  {action.label}{#if dd.linked.length > 0}{' '}{td.transport === 'Ble' ? 'BLE' : 'ANT+'}{/if}
                 </button>
               {/each}
             </div>
@@ -818,6 +833,12 @@
     border-color: var(--warning);
     color: var(--warning);
     background: rgba(255, 183, 77, 0.08);
+  }
+
+  .searching-hint {
+    align-self: center;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 
   .primary-badge {
