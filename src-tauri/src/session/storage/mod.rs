@@ -1,8 +1,12 @@
 mod autosave;
 mod config;
 mod devices;
+mod fsio;
 mod power_curves;
+mod schema;
 mod sessions;
+
+pub use sessions::SaveOutcome;
 
 use log::info;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -10,16 +14,6 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::error::AppError;
-
-/// Execute an ALTER TABLE statement, ignoring "duplicate column" errors (expected
-/// on re-run) but propagating all other errors (disk full, corruption, malformed SQL).
-async fn run_alter_ignore_duplicate(pool: &SqlitePool, stmt: &str) -> Result<(), AppError> {
-    match sqlx::raw_sql(stmt).execute(pool).await {
-        Ok(_) => Ok(()),
-        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
-        Err(e) => Err(AppError::Database(e)),
-    }
-}
 
 pub struct Storage {
     pub(crate) pool: SqlitePool,
@@ -40,89 +34,8 @@ impl Storage {
             .await
             .map_err(AppError::Database)?;
         info!("Database opened: {}", db_path.display());
-        let migration_sql = include_str!("../../../migrations/001_init.sql");
-        sqlx::raw_sql(migration_sql)
-            .execute(&pool)
-            .await
-            .map_err(AppError::Database)?;
-        // Run each ALTER TABLE individually, ignoring "duplicate column" errors on
-        // re-run but propagating real failures (disk full, corruption, etc.)
-        let migration_002_stmts = [
-            "ALTER TABLE user_config ADD COLUMN units TEXT NOT NULL DEFAULT 'metric'",
-            "ALTER TABLE user_config ADD COLUMN power_zone_1 INTEGER NOT NULL DEFAULT 55",
-            "ALTER TABLE user_config ADD COLUMN power_zone_2 INTEGER NOT NULL DEFAULT 75",
-            "ALTER TABLE user_config ADD COLUMN power_zone_3 INTEGER NOT NULL DEFAULT 90",
-            "ALTER TABLE user_config ADD COLUMN power_zone_4 INTEGER NOT NULL DEFAULT 105",
-            "ALTER TABLE user_config ADD COLUMN power_zone_5 INTEGER NOT NULL DEFAULT 120",
-            "ALTER TABLE user_config ADD COLUMN power_zone_6 INTEGER NOT NULL DEFAULT 150",
-        ];
-        for stmt in migration_002_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        let migration_003_stmts = [
-            "ALTER TABLE user_config ADD COLUMN date_of_birth TEXT",
-            "ALTER TABLE user_config ADD COLUMN sex TEXT",
-            "ALTER TABLE user_config ADD COLUMN resting_hr INTEGER",
-            "ALTER TABLE user_config ADD COLUMN max_hr INTEGER",
-        ];
-        for stmt in migration_003_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 004: store FTP used in each session for audit trail
-        run_alter_ignore_duplicate(&pool, "ALTER TABLE sessions ADD COLUMN ftp INTEGER").await?;
-        // Migration 005: device metadata for cross-transport deduplication
-        let migration_005_stmts = [
-            "ALTER TABLE known_devices ADD COLUMN device_group TEXT",
-            "ALTER TABLE known_devices ADD COLUMN manufacturer TEXT",
-            "ALTER TABLE known_devices ADD COLUMN model_number TEXT",
-            "ALTER TABLE known_devices ADD COLUMN serial_number TEXT",
-        ];
-        for stmt in migration_005_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 006: activity metadata on sessions
-        let migration_006_stmts = [
-            "ALTER TABLE sessions ADD COLUMN title TEXT",
-            "ALTER TABLE sessions ADD COLUMN activity_type TEXT",
-            "ALTER TABLE sessions ADD COLUMN rpe INTEGER",
-            "ALTER TABLE sessions ADD COLUMN notes TEXT",
-        ];
-        for stmt in migration_006_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 007: zone ride config snapshot per session
-        run_alter_ignore_duplicate(
-            &pool,
-            "ALTER TABLE sessions ADD COLUMN zone_config TEXT",
-        )
-        .await?;
-        // Migration 008: work (kJ) and variability index
-        let migration_008_stmts = [
-            "ALTER TABLE sessions ADD COLUMN work_kj REAL",
-            "ALTER TABLE sessions ADD COLUMN variability_index REAL",
-        ];
-        for stmt in migration_008_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 009: distance
-        run_alter_ignore_duplicate(
-            &pool,
-            "ALTER TABLE sessions ADD COLUMN distance_km REAL",
-        )
-        .await?;
-        // Power curve cache table (idempotent CREATE IF NOT EXISTS)
-        sqlx::raw_sql(
-            "CREATE TABLE IF NOT EXISTS session_power_curves (
-                session_id TEXT NOT NULL,
-                duration_secs INTEGER NOT NULL,
-                watts INTEGER NOT NULL,
-                PRIMARY KEY (session_id, duration_secs)
-            )"
-        )
-        .execute(&pool)
-        .await
-        .map_err(AppError::Database)?;
-        info!("Database migrations complete");
+        let version = schema::migrate(&pool, &db_path).await?;
+        info!("Database schema at version {}", version);
         Ok(Self {
             pool,
             data_dir: data_dir.to_string(),
@@ -441,7 +354,7 @@ mod tests {
             .join(".autosave_cleanup-1.bin");
         assert!(autosave_path.exists());
 
-        storage.remove_autosave("cleanup-1");
+        storage.remove_autosave("cleanup-1").await.unwrap();
         assert!(!autosave_path.exists());
     }
 
@@ -828,5 +741,273 @@ mod tests {
         assert_eq!(devices[0].id, "d3");
         assert_eq!(devices[1].id, "d2");
         assert_eq!(devices[2].id, "d1");
+    }
+
+    // --- Ride-data lifecycle: save / autosave recovery / finalize / delete ---
+
+    const RIDE_ID: &str = "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+    fn power_log(n: u64) -> Vec<SensorReading> {
+        (0..n)
+            .map(|i| SensorReading::Power {
+                watts: 200 + i as u16,
+                timestamp: None,
+                epoch_ms: 1_000 * (i + 1),
+                device_id: "pm".to_string(),
+                pedal_balance: None,
+            })
+            .collect()
+    }
+
+    /// Summary whose duration equals the number of readings, so a test can tell
+    /// which snapshot a row came from.
+    fn summary_for(n: u64) -> SessionSummary {
+        let mut s = make_summary(RIDE_ID);
+        s.duration_secs = n;
+        s.title = None;
+        s
+    }
+
+    fn raw(n: u64) -> Vec<u8> {
+        bincode::serialize(&power_log(n)).unwrap()
+    }
+
+    fn sessions_dir(storage: &Storage) -> std::path::PathBuf {
+        std::path::Path::new(storage.data_dir()).join("sessions")
+    }
+
+    fn files_in(storage: &Storage) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(sessions_dir(storage))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    async fn restart(tmp: &tempfile::TempDir) -> Storage {
+        Storage::new(&tmp.path().to_string_lossy()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn save_session_returns_inserted_then_already_existed() {
+        let (storage, _tmp) = test_storage().await;
+        let s = summary_for(10);
+        assert_eq!(storage.save_session(&s, &raw(10)).await.unwrap(), SaveOutcome::Inserted);
+        assert_eq!(
+            storage.save_session(&s, &raw(10)).await.unwrap(),
+            SaveOutcome::AlreadyExisted
+        );
+    }
+
+    #[tokio::test]
+    async fn save_session_existing_row_keeps_original_raw_file() {
+        let (storage, _tmp) = test_storage().await;
+        storage.save_session(&summary_for(10), &raw(10)).await.unwrap();
+        // An older snapshot of the same ride must not overwrite the final log
+        storage.save_session(&summary_for(6), &raw(6)).await.unwrap();
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 10);
+        assert_eq!(storage.get_session(RIDE_ID).await.unwrap().duration_secs, 10);
+    }
+
+    #[tokio::test]
+    async fn crash_after_final_autosave_before_raw_recovers_full_ride() {
+        let (storage, tmp) = test_storage().await;
+        storage.write_autosave(RIDE_ID, &summary_for(10), &power_log(10)).await.unwrap();
+        drop(storage);
+
+        let storage = restart(&tmp).await;
+        assert_eq!(storage.recover_autosaved_sessions().await.unwrap(), 1);
+        assert_eq!(storage.get_session(RIDE_ID).await.unwrap().duration_secs, 10);
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 10);
+        assert_eq!(files_in(&storage), vec![format!("{RIDE_ID}.bin")]);
+    }
+
+    #[tokio::test]
+    async fn crash_after_raw_before_row_inserts_row_and_keeps_raw() {
+        let (storage, tmp) = test_storage().await;
+        storage.write_autosave(RIDE_ID, &summary_for(10), &power_log(10)).await.unwrap();
+        std::fs::write(sessions_dir(&storage).join(format!("{RIDE_ID}.bin")), raw(10)).unwrap();
+        drop(storage);
+
+        let storage = restart(&tmp).await;
+        assert_eq!(storage.recover_autosaved_sessions().await.unwrap(), 1);
+        assert_eq!(storage.get_session(RIDE_ID).await.unwrap().duration_secs, 10);
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 10);
+        assert_eq!(files_in(&storage), vec![format!("{RIDE_ID}.bin")]);
+    }
+
+    #[tokio::test]
+    async fn crash_after_raw_before_row_with_stale_autosave_keeps_orphan_and_consistent_pair() {
+        let (storage, tmp) = test_storage().await;
+        // Final autosave failed: only the 30-s-old periodic one (6 readings) exists,
+        // while the raw file holds the full 10 readings but no row describes it.
+        storage.write_autosave(RIDE_ID, &summary_for(6), &power_log(6)).await.unwrap();
+        std::fs::write(sessions_dir(&storage).join(format!("{RIDE_ID}.bin")), raw(10)).unwrap();
+        drop(storage);
+
+        let storage = restart(&tmp).await;
+        assert_eq!(storage.recover_autosaved_sessions().await.unwrap(), 1);
+        // Row and raw describe the same snapshot
+        assert_eq!(storage.get_session(RIDE_ID).await.unwrap().duration_secs, 6);
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 6);
+        // The unmatched full log is preserved, not destroyed
+        let files = files_in(&storage);
+        let orphan: Vec<_> = files.iter().filter(|f| f.contains(".bin.orphan-")).collect();
+        assert_eq!(orphan.len(), 1, "files: {files:?}");
+        let kept = std::fs::read(sessions_dir(&storage).join(orphan[0])).unwrap();
+        assert_eq!(kept, raw(10));
+    }
+
+    #[tokio::test]
+    async fn crash_after_row_before_autosave_removal_keeps_final_raw() {
+        let (storage, tmp) = test_storage().await;
+        storage.save_session(&summary_for(10), &raw(10)).await.unwrap();
+        storage.write_autosave(RIDE_ID, &summary_for(6), &power_log(6)).await.unwrap();
+        drop(storage);
+
+        let storage = restart(&tmp).await;
+        assert_eq!(storage.recover_autosaved_sessions().await.unwrap(), 0);
+        assert_eq!(storage.get_session(RIDE_ID).await.unwrap().duration_secs, 10);
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 10);
+        assert_eq!(files_in(&storage), vec![format!("{RIDE_ID}.bin")]);
+    }
+
+    #[tokio::test]
+    async fn legacy_row_without_raw_is_repaired_from_autosave() {
+        let (storage, tmp) = test_storage().await;
+        // Old code inserted the row first, then crashed before writing the file
+        storage.save_session(&summary_for(10), &raw(10)).await.unwrap();
+        storage
+            .update_session_metadata(RIDE_ID, Some("Hill repeats".into()), None, None, None)
+            .await
+            .unwrap();
+        std::fs::remove_file(sessions_dir(&storage).join(format!("{RIDE_ID}.bin"))).unwrap();
+        storage.write_autosave(RIDE_ID, &summary_for(6), &power_log(6)).await.unwrap();
+        drop(storage);
+
+        let storage = restart(&tmp).await;
+        assert_eq!(storage.recover_autosaved_sessions().await.unwrap(), 0);
+        let row = storage.get_session(RIDE_ID).await.unwrap();
+        assert_eq!(row.duration_secs, 6, "summary must describe the restored file");
+        assert_eq!(row.title.as_deref(), Some("Hill repeats"), "user metadata kept");
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn recovery_removes_stray_tmp_files() {
+        let (storage, _tmp) = test_storage().await;
+        let dir = sessions_dir(&storage);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{RIDE_ID}.bin.tmp")), b"half").unwrap();
+        std::fs::write(dir.join(format!(".autosave_{RIDE_ID}.tmp")), b"half").unwrap();
+        storage.recover_autosaved_sessions().await.unwrap();
+        assert!(files_in(&storage).is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_autosave_missing_file_is_ok() {
+        let (storage, _tmp) = test_storage().await;
+        storage.remove_autosave(RIDE_ID).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_success_persists_and_removes_autosave() {
+        let (storage, _tmp) = test_storage().await;
+        storage.finalize_session(&summary_for(10), &power_log(10)).await.unwrap();
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 10);
+        assert_eq!(files_in(&storage), vec![format!("{RIDE_ID}.bin")]);
+    }
+
+    #[tokio::test]
+    async fn finalize_with_failed_db_save_keeps_full_log_on_disk() {
+        let (storage, tmp) = test_storage().await;
+        // Older periodic autosave exists from 30 s ago
+        storage.write_autosave(RIDE_ID, &summary_for(6), &power_log(6)).await.unwrap();
+        storage.pool.close().await; // every DB call now fails
+
+        let err = storage
+            .finalize_session(&summary_for(10), &power_log(10))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be saved"), "{err}");
+        assert!(err.contains("recovered the next time the app starts"), "{err}");
+        drop(storage);
+
+        let storage = restart(&tmp).await;
+        assert_eq!(storage.recover_autosaved_sessions().await.unwrap(), 1);
+        assert_eq!(storage.get_session(RIDE_ID).await.unwrap().duration_secs, 10);
+        assert_eq!(
+            storage.load_sensor_data(RIDE_ID).unwrap().len(),
+            10,
+            "all readings up to stop must survive, not just the last autosave"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_row_curves_and_file() {
+        let (storage, _tmp) = test_storage().await;
+        storage.save_session(&summary_for(10), &raw(10)).await.unwrap();
+        storage
+            .save_power_curve(RIDE_ID, &[PowerCurvePoint { duration_secs: 1, watts: 209 }])
+            .await
+            .unwrap();
+        storage.delete_session(RIDE_ID).await.unwrap();
+        assert!(storage.list_sessions().await.unwrap().is_empty());
+        assert!(!storage.has_power_curve(RIDE_ID).await.unwrap());
+        assert!(files_in(&storage).is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_session_failed_transaction_leaves_row_curves_and_file() {
+        let (storage, _tmp) = test_storage().await;
+        storage.save_session(&summary_for(10), &raw(10)).await.unwrap();
+        storage
+            .save_power_curve(RIDE_ID, &[PowerCurvePoint { duration_secs: 1, watts: 209 }])
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TRIGGER block_delete BEFORE DELETE ON sessions \
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+        )
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+
+        assert!(storage.delete_session(RIDE_ID).await.is_err());
+        assert_eq!(storage.list_sessions().await.unwrap().len(), 1);
+        assert!(storage.has_power_curve(RIDE_ID).await.unwrap(), "curve delete rolled back");
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 10, "raw file kept");
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_leftover_autosave_so_restart_cannot_resurrect() {
+        let (storage, tmp) = test_storage().await;
+        storage.save_session(&summary_for(10), &raw(10)).await.unwrap();
+        storage.write_autosave(RIDE_ID, &summary_for(6), &power_log(6)).await.unwrap();
+        storage.delete_session(RIDE_ID).await.unwrap();
+        assert!(files_in(&storage).is_empty());
+        drop(storage);
+
+        let storage = restart(&tmp).await;
+        assert_eq!(storage.recover_autosaved_sessions().await.unwrap(), 0);
+        assert!(storage.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_session_aborts_when_autosave_cannot_be_removed() {
+        let (storage, _tmp) = test_storage().await;
+        storage.save_session(&summary_for(10), &raw(10)).await.unwrap();
+        // A non-empty directory at the autosave path makes removal fail
+        let blocker = sessions_dir(&storage).join(format!(".autosave_{RIDE_ID}.bin"));
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+
+        assert!(storage.delete_session(RIDE_ID).await.is_err());
+        assert_eq!(storage.list_sessions().await.unwrap().len(), 1, "nothing deleted");
+        assert_eq!(storage.load_sensor_data(RIDE_ID).unwrap().len(), 10);
     }
 }

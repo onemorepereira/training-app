@@ -23,5 +23,13 @@ Every test must answer: **"What breaks if this test is deleted?"** Tests verify 
 ```bash
 cd src-tauri && cargo test          # Run all Rust tests
 cd src-tauri && cargo test --lib session::metrics  # Run metrics tests only
+npm test                            # Frontend unit tests (vitest)
 npm run check                       # Frontend type checking
 ```
+
+## Schema Changes
+
+- Schema lives only in `src-tauri/migrations/000N_*.sql`, applied by `session/storage/schema.rs` (tracked in `PRAGMA user_version`)
+- New change = new numbered file + entry in `MIGRATIONS` + its SHA-256 in `PINNED_SHA256`; never edit a shipped file
+- Additive only (no DROP/RENAME/NOT NULL without DEFAULT); never depend on column order
+- Every step must pass against all fixtures in `session/storage/testdata/` (`cargo test --lib storage::schema`)

@@ -90,6 +90,9 @@ jobs:
       - name: Run frontend type check
         run: npm run check
 
+      - name: Run frontend tests
+        run: npm test
+
       - name: Build release
         run: npm run build:release
 

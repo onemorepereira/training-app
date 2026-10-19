@@ -21,6 +21,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so the migration guard can diff against the PR base
+          fetch-depth: 0
+
+      - name: Forbid edits to shipped migrations
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: sh .github/scripts/check-migrations-immutable.sh "origin/$BASE_REF"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -75,3 +84,6 @@ jobs:
 
       - name: Run frontend type check
         run: npm run check
+
+      - name: Run frontend tests
+        run: npm test

@@ -14,6 +14,7 @@ npm install
 
 ```bash
 cd src-tauri && cargo test
+npm test
 npm run check
 ```
 
@@ -49,6 +50,7 @@ Branch name conventions:
 
 ```bash
 cd src-tauri && cargo test          # All Rust tests must pass
+npm test                            # Frontend unit tests must pass
 npm run check                       # Frontend type checking must pass
 ```
 
@@ -107,6 +109,25 @@ Then open a pull request against `main`. In the PR body:
 - Epsilon guidance: watts +/-0.1, ratios +/-0.01, TSS +/-0.5
 - Test one concept per test; name after behavior (e.g., `np_constant_power_equals_that_power`)
 
+### Schema changes
+
+The SQLite schema lives only in `src-tauri/migrations/`. The runner in `src-tauri/src/session/storage/schema.rs` applies the files in order and tracks progress in `PRAGMA user_version`.
+
+To change the schema:
+
+1. Add a new file `src-tauri/migrations/000N_<short_name>.sql`, where N is the next number.
+2. Register it in `MIGRATIONS` in `schema.rs`.
+3. Add its SHA-256 to `PINNED_SHA256`: run `sha256sum` on the LF file.
+4. Run `cargo test --lib storage::schema`. Every step runs against all legacy fixtures (`FIXTURES`, in `src/session/storage/testdata/`) and the latest-`main` fixture. A new step must pass against all of them.
+
+Rules:
+
+- **Never edit a shipped migration.** The pinned hash test fails if you do. Fix mistakes with a new step.
+- **Additive only.** No `DROP`, no `RENAME`, and no `NOT NULL` column without a `DEFAULT`. Older app versions must still be able to open a newer database.
+- **Never depend on column order.** Legacy databases have columns in a different order than fresh ones. Always name columns: no `SELECT *`, and no `INSERT ... VALUES` without a column list.
+- **SQL file format.** Statements end in `;`. No `;` inside string literals. `--` comments go on their own lines. Write `ALTER TABLE <t> ADD COLUMN <c> ...` with `COLUMN` spelled out and unquoted identifiers; the runner skips it when the column already exists.
+- **Backups.** Before applying a step numbered 2 or higher to an existing database, the app writes a backup copy with `VACUUM INTO training.db.pre-v<N>`.
+
 ### Frontend (Svelte 5 / TypeScript)
 
 - Use Svelte 5 runes (`$state`, `$derived`, `$effect`)
@@ -118,6 +139,7 @@ Then open a pull request against `main`. In the PR body:
 ```bash
 cd src-tauri && cargo test                         # All Rust tests
 cd src-tauri && cargo test --lib session::metrics   # Specific module
+npm test                                            # Frontend unit tests
 npm run check                                       # Frontend types
 npm run dev                                         # Dev server
 npm run build:release                               # Production build

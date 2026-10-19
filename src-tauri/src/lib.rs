@@ -16,9 +16,11 @@ use log::Record;
 use session::manager::SessionManager;
 use session::storage::Storage;
 use session::zone_control::controller::ZoneController;
+use std::any::Any;
 use std::io::Write;
-use std::sync::Arc;
-use tauri::{Emitter, Manager, WindowEvent};
+use std::panic::Location;
+use std::sync::{Arc, OnceLock};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tokio::sync::broadcast;
 
 /// Stderr: colored, time-only, shortened module path
@@ -27,6 +29,8 @@ fn stderr_format(
     now: &mut DeferredNow,
     record: &Record,
 ) -> std::io::Result<()> {
+    // Mark the logger write path so a panic raised here is not logged re-entrantly.
+    let _scope = LoggingScope::enter();
     let module = record
         .module_path()
         .unwrap_or("<unknown>")
@@ -48,6 +52,8 @@ fn file_format(
     now: &mut DeferredNow,
     record: &Record,
 ) -> std::io::Result<()> {
+    // Mark the logger write path so a panic raised here is not logged re-entrantly.
+    let _scope = LoggingScope::enter();
     let module = record
         .module_path()
         .unwrap_or("<unknown>")
@@ -61,6 +67,77 @@ fn file_format(
         module,
         record.args()
     )
+}
+
+/// Kept for the whole process. Tauri's `App::run` ends with `std::process::exit`,
+/// so nothing is dropped at exit; flexi_logger 0.29 docs: with any WriteMode but
+/// Direct, the handle must stay alive and buffered lines are only written out on
+/// flush/drop. We flush explicitly on `RunEvent::Exit` and in the panic hook.
+static LOGGER: OnceLock<flexi_logger::LoggerHandle> = OnceLock::new();
+
+fn flush_logger() {
+    if let Some(handle) = LOGGER.get() {
+        handle.flush();
+    }
+}
+
+/// "<message> at <file>:<line>:<col>" for a panic payload.
+fn format_panic(payload: &(dyn Any + Send), location: Option<&Location<'_>>) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    match location {
+        Some(loc) => format!("panic: {} at {}:{}:{}", message, loc.file(), loc.line(), loc.column()),
+        None => format!("panic: {} at <unknown location>", message),
+    }
+}
+
+thread_local! {
+    /// True while this thread is inside our logging code: a log format function
+    /// (i.e. flexi_logger's write path, which may hold its writer lock) or the
+    /// panic hook's own logging.
+    static IN_LOGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII marker for "this thread is inside logging code". `enter` returns None
+/// when the thread is already inside, so only the outermost scope resets it.
+struct LoggingScope;
+
+impl LoggingScope {
+    fn enter() -> Option<LoggingScope> {
+        IN_LOGGING.with(|f| {
+            if f.get() {
+                None
+            } else {
+                f.set(true);
+                Some(LoggingScope)
+            }
+        })
+    }
+}
+
+impl Drop for LoggingScope {
+    fn drop(&mut self) {
+        IN_LOGGING.with(|f| f.set(false));
+    }
+}
+
+/// Log every panic (any thread) at error level and flush, then run the default
+/// hook so stderr output and backtraces are unchanged. If the panic happened
+/// inside the logger's own write path, logging again on this thread could
+/// deadlock on the writer's lock or recurse, so it goes straight to the default
+/// hook.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(_scope) = LoggingScope::enter() {
+            log::error!("{}", format_panic(info.payload(), info.location()));
+            flush_logger();
+        }
+        default_hook(info);
+    }));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -98,7 +175,7 @@ pub fn run() {
             #[cfg(not(feature = "production"))]
             let stderr_dup = Duplicate::All;
 
-            let _logger = Logger::try_with_env_or_str(log_spec)
+            let logger = Logger::try_with_env_or_str(log_spec)
             .expect("Failed to parse log spec")
             .log_to_file(
                 FileSpec::default()
@@ -117,9 +194,10 @@ pub fn run() {
             .start()
             .expect("Failed to start logger");
 
-            // Leak the handle — logger must live for the process lifetime.
-            // Dropping it deregisters the logger and stops all logging.
-            Box::leak(Box::new(_logger));
+            if LOGGER.set(logger).is_err() {
+                log::warn!("Logger handle already initialized");
+            }
+            install_panic_hook();
 
             log::info!("Logging to {}", log_dir.display());
 
@@ -235,29 +313,10 @@ pub fn run() {
                     let session_mgr = session_manager.clone();
                     let storage_clone = storage.clone();
                     tokio::spawn(async move {
-                        let mut accumulated_log: Vec<crate::device::types::SensorReading> = Vec::new();
-                        let mut current_session_id: Option<String> = None;
+                        let mut acc = session::autosave_task::AutosaveAccumulator::default();
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_secs(config::AUTOSAVE_INTERVAL_SECS)).await;
-                            if let Some((session_id, summary, delta)) =
-                                session_mgr.snapshot_for_autosave().await
-                            {
-                                // Reset accumulator if session changed
-                                if current_session_id.as_deref() != Some(&session_id) {
-                                    accumulated_log.clear();
-                                    current_session_id = Some(session_id.clone());
-                                }
-                                accumulated_log.extend(delta);
-                                if let Err(e) =
-                                    storage_clone.write_autosave(&session_id, &summary, &accumulated_log).await
-                                {
-                                    log::warn!("Autosave failed: {}", e);
-                                }
-                            } else {
-                                // No active session — reset accumulator
-                                accumulated_log.clear();
-                                current_session_id = None;
-                            }
+                            session::autosave_task::autosave_tick(&session_mgr, &storage_clone, &mut acc).await;
                         }
                     });
                 }
@@ -306,11 +365,9 @@ pub fn run() {
                 tauri::async_runtime::block_on(async {
                     // Save active session before shutdown
                     if let Some((summary, sensor_log)) = session_mgr.stop_session_with_log().await {
-                        let raw_data = bincode::serialize(&sensor_log).unwrap_or_default();
-                        if let Err(e) = storage.save_session(&summary, &raw_data).await {
-                            log::warn!("Failed to save session on shutdown: {}", e);
+                        if let Err(e) = storage.finalize_session(&summary, &sensor_log).await {
+                            log::error!("Failed to save session on shutdown: {}", e);
                         }
-                        storage.remove_autosave(&summary.id);
                     }
                 });
             }
@@ -405,6 +462,93 @@ pub fn run() {
         ]);
 
         builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let RunEvent::Exit = event {
+                log::info!("Application exiting");
+                flush_logger();
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_panic_str_payload_includes_location() {
+        let loc = Location::caller();
+        let msg = format_panic(&"index out of bounds", Some(loc));
+        assert_eq!(
+            msg,
+            format!("panic: index out of bounds at {}:{}:{}", loc.file(), loc.line(), loc.column())
+        );
+    }
+
+    #[test]
+    fn format_panic_string_payload() {
+        let payload: String = format!("bad value {}", 42);
+        assert_eq!(
+            format_panic(&payload, None),
+            "panic: bad value 42 at <unknown location>"
+        );
+    }
+
+    #[test]
+    fn format_panic_non_string_payload() {
+        assert_eq!(
+            format_panic(&17_u32, None),
+            "panic: <non-string panic payload> at <unknown location>"
+        );
+    }
+
+    fn in_logging() -> bool {
+        IN_LOGGING.with(|f| f.get())
+    }
+
+    #[test]
+    fn logging_scope_blocks_nested_entry_and_resets_on_drop() {
+        assert!(!in_logging());
+        let outer = LoggingScope::enter().expect("first entry succeeds");
+        assert!(in_logging());
+        assert!(LoggingScope::enter().is_none(), "nested entry (re-entrant panic) is refused");
+        assert!(in_logging(), "refused nested entry must not clear the flag");
+        drop(outer);
+        assert!(!in_logging());
+        assert!(LoggingScope::enter().is_some());
+    }
+
+    /// Display impl that reports whether it is rendered inside a logging scope.
+    struct ScopeProbe;
+    impl std::fmt::Display for ScopeProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", if in_logging() { "inside" } else { "outside" })
+        }
+    }
+
+    #[test]
+    fn log_format_functions_run_inside_logging_scope() {
+        for format in [file_format, stderr_format] {
+            let mut out: Vec<u8> = Vec::new();
+            format(
+                &mut out,
+                &mut DeferredNow::new(),
+                &Record::builder()
+                    .args(format_args!("{}", ScopeProbe))
+                    .level(log::Level::Error)
+                    .build(),
+            )
+            .unwrap();
+            let line = String::from_utf8(out).unwrap();
+            assert!(line.ends_with("inside"), "{line}");
+            assert!(!in_logging(), "scope must be released after formatting");
+        }
+    }
+
+    #[test]
+    fn format_panic_on_real_panic_payload() {
+        let err = std::panic::catch_unwind(|| panic!("boom {}", 7)).unwrap_err();
+        assert_eq!(format_panic(err.as_ref(), None), "panic: boom 7 at <unknown location>");
+    }
 }
