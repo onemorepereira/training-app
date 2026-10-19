@@ -20,7 +20,6 @@ use tokio::task::JoinHandle;
 
 use super::ant::listener::atomic_elapsed;
 use super::ant::manager::AntManager;
-use super::ant::usb::AntUsb;
 use super::ble::BleManager;
 use super::ftms::TrainerController;
 use super::listener::listen_to_device;
@@ -35,8 +34,7 @@ pub use super::primary::SharedPrimaryState as PrimariesHandle;
 pub enum TrainerBackend {
     Ftms(TrainerController),
     Fec {
-        usb: Arc<AntUsb>,
-        channel: u8,
+        link: super::fec::FecLink,
         /// Wind coefficient last acknowledged by the trainer (page 0x32 is resent only on change).
         last_cw_raw: Option<u8>,
     },
@@ -349,9 +347,9 @@ impl RealIo {
                 Ok((info, fec))
             })
             .await??;
-        let trainer = fec.map(|(usb, channel)| {
+        let trainer = fec.map(|link| {
             info!("[{}] FE-C trainer controller created", device_id);
-            TrainerBackend::Fec { usb, channel, last_cw_raw: None }
+            TrainerBackend::Fec { link, last_cw_raw: None }
         });
         Ok(Connected { info, listener: None, trainer })
     }

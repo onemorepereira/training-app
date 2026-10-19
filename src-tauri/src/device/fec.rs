@@ -1,6 +1,26 @@
-use super::ant::channel::send_acknowledged;
-use super::ant::usb::AntUsb;
+use std::sync::atomic::AtomicI64;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use super::ant::channel::{send_acknowledged_and_wait, ACK_ATTEMPT_TIMEOUT};
+use super::ant::listener::atomic_elapsed;
+use super::ant::usb::{AntMessage, AntUsb};
 use crate::error::AppError;
+
+/// Skip the ack retry when the trainer's last page is older than this (design ADR-5).
+const FEC_RETRY_FRESH: Duration = Duration::from_secs(3);
+
+/// Everything needed to send FE-C control pages to one trainer channel.
+#[derive(Clone)]
+pub struct FecLink {
+    pub usb: Arc<AntUsb>,
+    pub channel: u8,
+    pub response_queue: Arc<Mutex<Vec<AntMessage>>>,
+    /// Trainer's last-page timestamp (shared with its listener).
+    pub last_seen: Arc<AtomicI64>,
+    /// Serialises acknowledged sends so a second one never hits TRANSFER_IN_PROGRESS.
+    pub send_lock: Arc<Mutex<()>>,
+}
 
 /// Encode target power page (0x31). Power in 0.25W resolution: watts * 4.
 fn encode_target_power(watts: u16) -> [u8; 8] {
@@ -70,28 +90,38 @@ fn simulation_pages(grade: f32, crr: f32, cw: f32, last_cw_raw: Option<u8>) -> (
     (pages, raw)
 }
 
-/// FE-C trainer control via ANT+ acknowledged messages
+/// FE-C trainer control via ANT+ acknowledged messages (blocking; call from spawn_blocking)
 pub struct FecController<'a> {
-    usb: &'a AntUsb,
-    channel_number: u8,
+    link: &'a FecLink,
 }
 
 impl<'a> FecController<'a> {
-    pub fn new(usb: &'a AntUsb, channel_number: u8) -> Self {
-        Self {
-            usb,
-            channel_number,
-        }
+    pub fn new(link: &'a FecLink) -> Self {
+        Self { link }
+    }
+
+    fn send(&self, page: &[u8; 8]) -> Result<(), AppError> {
+        let _serial = self.link.send_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let last_seen = &self.link.last_seen;
+        let fresh = || atomic_elapsed(last_seen).is_some_and(|age| age <= FEC_RETRY_FRESH);
+        send_acknowledged_and_wait(
+            &*self.link.usb,
+            &self.link.response_queue,
+            self.link.channel,
+            page,
+            ACK_ATTEMPT_TIMEOUT,
+            &fresh,
+        )
     }
 
     /// Set target power (Page 0x31)
     pub fn set_target_power(&self, watts: u16) -> Result<(), AppError> {
-        send_acknowledged(self.usb, self.channel_number, &encode_target_power(watts))
+        self.send(&encode_target_power(watts))
     }
 
     /// Set basic resistance (Page 0x30)
     pub fn set_resistance(&self, level: u8) -> Result<(), AppError> {
-        send_acknowledged(self.usb, self.channel_number, &encode_resistance(level))
+        self.send(&encode_resistance(level))
     }
 
     /// Set simulation parameters: Wind Resistance (0x32, only when cw changed) then
@@ -105,7 +135,7 @@ impl<'a> FecController<'a> {
     ) -> Result<u8, AppError> {
         let (pages, raw) = simulation_pages(grade, crr, cw, last_cw_raw);
         for page in &pages {
-            send_acknowledged(self.usb, self.channel_number, page)?;
+            self.send(page)?;
         }
         Ok(raw)
     }

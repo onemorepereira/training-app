@@ -318,18 +318,102 @@ pub fn closed_channel_event(msg: &AntMessage) -> Option<u8> {
     }
 }
 
-/// Send an acknowledged data message on a channel (used for FE-C control)
-pub fn send_acknowledged(
-    usb: &AntUsb,
+/// Per-attempt wait for an acknowledged transfer result. A slave's acknowledged
+/// message goes out right after the next master message (§9.5.5.2): one FE-C channel
+/// period is 250 ms (8192/32768 s), so 600 ms covers two periods.
+pub const ACK_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Outcome of one acknowledged transfer, read from the response queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckOutcome {
+    Completed,
+    Failed(&'static str),
+}
+
+/// True for queue entries that report the result of an acknowledged transfer on `ch`.
+fn ack_result(msg: &AntMessage, ch: u8) -> Option<AckOutcome> {
+    if msg.msg_id != MSG_CHANNEL_RESPONSE || msg.data.len() < 3 || msg.data[0] != ch {
+        return None;
+    }
+    match (msg.data[1], msg.data[2]) {
+        (CHANNEL_EVENT, EVENT_TRANSFER_TX_COMPLETED) => Some(AckOutcome::Completed),
+        (CHANNEL_EVENT, EVENT_TRANSFER_TX_FAILED) => Some(AckOutcome::Failed("no acknowledgement (TX_FAILED)")),
+        // The channel dropped to search: the message was not sent (§9.5.5.2).
+        (CHANNEL_EVENT, EVENT_RX_FAIL_GO_TO_SEARCH) => Some(AckOutcome::Failed("trainer lost (GO_TO_SEARCH)")),
+        (MSG_ACKNOWLEDGED_DATA, TRANSFER_IN_PROGRESS) => Some(AckOutcome::Failed("transfer in progress")),
+        (MSG_ACKNOWLEDGED_DATA, code) if code != RESPONSE_NO_ERROR => Some(AckOutcome::Failed("rejected by stick")),
+        _ => None,
+    }
+}
+
+fn ack_attempt(
+    tx: &dyn AntTx,
+    queue: &Arc<Mutex<Vec<AntMessage>>>,
     channel_number: u8,
     data: &[u8; 8],
-) -> Result<(), AppError> {
+    timeout: Duration,
+) -> Result<AckOutcome, AppError> {
+    // Drop results of earlier transfers on this channel so they can't be mistaken for ours.
+    queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|m| ack_result(m, channel_number).is_none());
+
     let mut msg_data = vec![channel_number];
     msg_data.extend_from_slice(data);
-    usb.send(&AntMessage {
-        msg_id: MSG_ACKNOWLEDGED_DATA,
-        data: msg_data,
-    })
+    tx.send(&AntMessage { msg_id: MSG_ACKNOWLEDGED_DATA, data: msg_data })?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = q.iter().position(|m| ack_result(m, channel_number).is_some()) {
+                let msg = q.remove(pos);
+                if let Some(outcome) = ack_result(&msg, channel_number) {
+                    return Ok(outcome);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(AckOutcome::Failed("timed out waiting for TX_COMPLETED"));
+        }
+        std::thread::sleep(Duration::from_millis(2).min(timeout));
+    }
+}
+
+/// Send an acknowledged data page and wait for the transfer result
+/// (EVENT_TRANSFER_TX_COMPLETED / TX_FAILED, D00000652 Rev 5.1 §9.5.5.2: ANT does not
+/// resend failed data). A failed attempt is retried once, unless `trainer_fresh()`
+/// says the trainer has gone quiet, in which case the error is returned at once.
+pub fn send_acknowledged_and_wait(
+    tx: &dyn AntTx,
+    queue: &Arc<Mutex<Vec<AntMessage>>>,
+    channel_number: u8,
+    data: &[u8; 8],
+    attempt_timeout: Duration,
+    trainer_fresh: &dyn Fn() -> bool,
+) -> Result<(), AppError> {
+    let first = ack_attempt(tx, queue, channel_number, data, attempt_timeout)?;
+    let reason = match first {
+        AckOutcome::Completed => return Ok(()),
+        AckOutcome::Failed(r) => r,
+    };
+    if !trainer_fresh() {
+        return Err(AntError::Channel(format!(
+            "FE-C page 0x{:02X} on ch{} failed ({}); trainer stale, not retrying",
+            data[0], channel_number, reason
+        ))
+        .into());
+    }
+    log::debug!("FE-C page 0x{:02X} on ch{} failed ({}); retrying once", data[0], channel_number, reason);
+    match ack_attempt(tx, queue, channel_number, data, attempt_timeout)? {
+        AckOutcome::Completed => Ok(()),
+        AckOutcome::Failed(r) => Err(AntError::Channel(format!(
+            "FE-C page 0x{:02X} on ch{} failed after retry: {}",
+            data[0], channel_number, r
+        ))
+        .into()),
+    }
 }
 
 /// Poll the response queue for a channel response to the expected command.
@@ -511,5 +595,116 @@ mod tests {
         // A command response whose code byte happens to be 0x07 is not an event
         let resp = AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![4, MSG_CLOSE_CHANNEL, 0x07] };
         assert_eq!(closed_channel_event(&resp), None);
+    }
+
+    // ---- FE-C acknowledged sends (D00000652 Rev 5.1 §9.5.5.2) ----
+
+    use std::collections::VecDeque;
+
+    /// Answers each acknowledged send with the next scripted channel response.
+    struct AckStick {
+        script: Mutex<VecDeque<Option<AntMessage>>>,
+        queue: Arc<Mutex<Vec<AntMessage>>>,
+        sends: Mutex<usize>,
+    }
+
+    fn event(ch: u8, code: u8) -> Option<AntMessage> {
+        Some(AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![ch, CHANNEL_EVENT, code] })
+    }
+
+    impl AckStick {
+        fn new(script: Vec<Option<AntMessage>>) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                queue: Arc::new(Mutex::new(Vec::new())),
+                sends: Mutex::new(0),
+            }
+        }
+        fn sends(&self) -> usize {
+            *self.sends.lock().unwrap()
+        }
+    }
+
+    impl AntTx for AckStick {
+        fn send(&self, msg: &AntMessage) -> Result<(), AppError> {
+            assert_eq!(msg.msg_id, MSG_ACKNOWLEDGED_DATA);
+            *self.sends.lock().unwrap() += 1;
+            if let Some(Some(reply)) = self.script.lock().unwrap().pop_front() {
+                self.queue.lock().unwrap().push(reply);
+            }
+            Ok(())
+        }
+    }
+
+    const PAGE: [u8; 8] = [0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x20, 0x03];
+    const T: Duration = Duration::from_millis(10);
+    const FRESH: &dyn Fn() -> bool = &|| true;
+
+    #[test]
+    fn ack_wait_succeeds_on_tx_completed() {
+        let stick = AckStick::new(vec![event(5, EVENT_TRANSFER_TX_COMPLETED)]);
+        send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).unwrap();
+        assert_eq!(stick.sends(), 1);
+    }
+
+    #[test]
+    fn ack_wait_retries_once_on_tx_failed_then_succeeds() {
+        let stick = AckStick::new(vec![event(5, EVENT_TRANSFER_TX_FAILED), event(5, EVENT_TRANSFER_TX_COMPLETED)]);
+        send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).unwrap();
+        assert_eq!(stick.sends(), 2);
+    }
+
+    #[test]
+    fn ack_wait_errors_after_two_failures() {
+        let stick = AckStick::new(vec![event(5, EVENT_TRANSFER_TX_FAILED), event(5, EVENT_TRANSFER_TX_FAILED)]);
+        assert!(send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).is_err());
+        assert_eq!(stick.sends(), 2, "exactly one retry");
+    }
+
+    #[test]
+    fn ack_wait_times_out_within_bound() {
+        let stick = AckStick::new(vec![None, None]);
+        let start = Instant::now();
+        assert!(send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).is_err());
+        assert!(start.elapsed() < Duration::from_millis(50), "{:?}", start.elapsed());
+        assert_eq!(stick.sends(), 2);
+    }
+
+    #[test]
+    fn ack_wait_ignores_other_channel_events() {
+        let stick = AckStick::new(vec![event(4, EVENT_TRANSFER_TX_COMPLETED), None]);
+        assert!(send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).is_err());
+        assert_eq!(stick.queue.lock().unwrap().len(), 1, "channel 4's event left for its owner");
+    }
+
+    #[test]
+    fn ack_wait_treats_go_to_search_as_failure() {
+        let stick = AckStick::new(vec![event(5, EVENT_RX_FAIL_GO_TO_SEARCH), event(5, EVENT_TRANSFER_TX_COMPLETED)]);
+        send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).unwrap();
+        assert_eq!(stick.sends(), 2, "GO_TO_SEARCH means not sent: retried");
+    }
+
+    #[test]
+    fn ack_wait_transfer_in_progress_is_failure() {
+        let busy = Some(AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![5, MSG_ACKNOWLEDGED_DATA, TRANSFER_IN_PROGRESS] });
+        let stick = AckStick::new(vec![busy, event(5, EVENT_TRANSFER_TX_COMPLETED)]);
+        send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).unwrap();
+        assert_eq!(stick.sends(), 2);
+    }
+
+    #[test]
+    fn ack_retry_skipped_when_trainer_stale() {
+        let stick = AckStick::new(vec![event(5, EVENT_TRANSFER_TX_FAILED), event(5, EVENT_TRANSFER_TX_COMPLETED)]);
+        let stale: &dyn Fn() -> bool = &|| false;
+        assert!(send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, stale).is_err());
+        assert_eq!(stick.sends(), 1, "no retry for a stale trainer");
+    }
+
+    #[test]
+    fn ack_wait_purges_stale_tx_result_before_sending() {
+        let stick = AckStick::new(vec![None, None]);
+        // A completion left over from an earlier transfer must not count for this one.
+        stick.queue.lock().unwrap().push(event(5, EVENT_TRANSFER_TX_COMPLETED).unwrap());
+        assert!(send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).is_err());
     }
 }

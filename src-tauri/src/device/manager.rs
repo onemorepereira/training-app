@@ -715,12 +715,11 @@ impl<Io: DeviceIo> DeviceManager<Io> {
         let watts = config::clamp_trainer_watts(watts as i32);
         let result = match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => controller.set_target_power(watts).await,
-            Some(TrainerBackend::Fec { usb, channel, .. }) => {
-                let usb = usb.clone();
-                let ch = *channel;
+            Some(TrainerBackend::Fec { link, .. }) => {
+                let link = link.clone();
                 let w = watts.max(0) as u16;
                 tokio::task::spawn_blocking(move || {
-                    let fec = FecController::new(&usb, ch);
+                    let fec = FecController::new(&link);
                     fec.set_target_power(w)
                 })
                 .await
@@ -742,11 +741,10 @@ impl<Io: DeviceIo> DeviceManager<Io> {
     pub async fn set_resistance(&mut self, device_id: &str, level: u8) -> Result<(), AppError> {
         let result = match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => controller.set_resistance(level).await,
-            Some(TrainerBackend::Fec { usb, channel, .. }) => {
-                let usb = usb.clone();
-                let ch = *channel;
+            Some(TrainerBackend::Fec { link, .. }) => {
+                let link = link.clone();
                 tokio::task::spawn_blocking(move || {
-                    let fec = FecController::new(&usb, ch);
+                    let fec = FecController::new(&link);
                     fec.set_resistance(level)
                 })
                 .await
@@ -774,12 +772,11 @@ impl<Io: DeviceIo> DeviceManager<Io> {
     ) -> Result<(), AppError> {
         let result = match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => controller.set_simulation(grade, crr, cw).await,
-            Some(TrainerBackend::Fec { usb, channel, last_cw_raw }) => {
-                let usb = usb.clone();
-                let ch = *channel;
+            Some(TrainerBackend::Fec { link, last_cw_raw }) => {
+                let link = link.clone();
                 let last = *last_cw_raw;
                 let sent = tokio::task::spawn_blocking(move || {
-                    let fec = FecController::new(&usb, ch);
+                    let fec = FecController::new(&link);
                     fec.set_simulation(grade, crr, cw, last)
                 })
                 .await

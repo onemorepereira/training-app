@@ -152,10 +152,12 @@ impl AntManager {
             });
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Drain any leftover responses from cleanup
+        // Drain leftover responses for the scan channels only: other channels'
+        // entries (e.g. an FE-C transfer result being awaited) must survive.
         {
+            let scan_chs = ALL_SCAN_PROFILES.len() as u8;
             let mut queue = self.response_queue.lock().unwrap_or_else(|e| e.into_inner());
-            queue.clear();
+            queue.retain(|m| !(m.msg_id == MSG_CHANNEL_RESPONSE && m.data.first().is_some_and(|ch| *ch < scan_chs)));
         }
 
         // Open wildcard channels for each scannable profile
@@ -447,12 +449,19 @@ impl AntManager {
     }
 
     /// Get the USB handle and channel number for a connected FE-C device (for trainer control)
-    pub fn get_fec_channel(&self, device_id: &str) -> Option<(Arc<AntUsb>, u8)> {
+    pub fn get_fec_channel(&self, device_id: &str) -> Option<crate::device::fec::FecLink> {
         let conn = self.connected.get(device_id)?;
         if conn.profile.device_type != DeviceType::FitnessTrainer {
             return None;
         }
-        Some((self.usb.clone(), conn.channel_number))
+        let last_seen = self.links.lock().unwrap_or_else(|e| e.into_inner()).get(device_id)?.last_seen.clone();
+        Some(crate::device::fec::FecLink {
+            usb: self.usb.clone(),
+            channel: conn.channel_number,
+            response_queue: self.response_queue.clone(),
+            last_seen,
+            send_lock: Arc::new(Mutex::new(())),
+        })
     }
 }
 
