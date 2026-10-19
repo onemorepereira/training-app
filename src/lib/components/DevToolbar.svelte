@@ -33,7 +33,7 @@
 </script>
 
 {#if !hidden}
-  <div class="dev-toolbar">
+  <div class="dev-toolbar" data-dev-only>
     <span class="dev-label">SIM</span>
     <select bind:value={profile} disabled={status === 'Running'}>
       {#each profiles as p}

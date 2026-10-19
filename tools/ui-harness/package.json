@@ -1,0 +1,7 @@
+{
+  "name": "training-app-ui-harness",
+  "private": true,
+  "type": "module",
+  "scripts": { "shoot": "node shoot.mjs" },
+  "dependencies": { "playwright": "1.57.0" }
+}

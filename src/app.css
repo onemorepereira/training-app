@@ -22,17 +22,35 @@
 
   --text-primary: #f0f0f5;
   --text-secondary: #a0a0b8;
-  --text-muted: #70708a;
-  --text-faint: #44445a;
+  /* Every text token is >= 4.5:1 on every surface (tokens.test.ts).
+     --text-faint is for disabled states and decoration only (>= 3:1), never body text. */
+  --text-muted: #8c8ca6;
+  --text-faint: #6c6c88;
+  --danger-text: #ff6b60;
+
+  /* Fills for buttons with white text (>= 4.5:1) */
+  --accent-strong: #d42a47;
+  --success-strong: #2e7d32;
+  --danger-strong: #c62828;
+
+  /* Tinted group panels (history detail), composited over --bg-body */
+  --panel-time: rgba(100, 181, 246, 0.07);
+  --panel-effort: rgba(255, 183, 77, 0.07);
+  --panel-power: rgba(255, 77, 109, 0.07);
+  --panel-hr: rgba(244, 67, 54, 0.07);
+  --panel-move: rgba(76, 175, 80, 0.07);
 
   /* Typography */
-  --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-data: 'IBM Plex Mono', 'Fira Code', 'SF Mono', monospace;
+  /* System UI font per OS (SF Pro on macOS, Adwaita Sans/Cantarell on GNOME);
+     IBM Plex Mono is bundled (@fontsource) for numbers. No network fonts. */
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Adwaita Sans', 'Cantarell', 'Noto Sans', 'Segoe UI', sans-serif;
+  --font-data: 'IBM Plex Mono', ui-monospace, 'SF Mono', 'DejaVu Sans Mono', monospace;
 
-  --text-xs: 0.6875rem;
-  --text-sm: 0.75rem;
+  /* 12px is the floor: nothing renders smaller. */
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
   --text-base: 0.9375rem;
-  --text-lg: 1rem;
+  --text-lg: 1.0625rem;
   --text-xl: 1.25rem;
   --text-2xl: 2rem;
   --text-3xl: 2.75rem;
@@ -49,7 +67,15 @@
   --space-3xl: 3rem;
 
   /* Layout */
-  --nav-rail-width: 56px;
+  --nav-rail-width: 64px;
+  --nav-sidebar-width: 200px;
+  --page-max: 1280px;
+  --page-wide-max: 1600px;
+
+  /* Controls */
+  --control-h: 36px;
+  --control-h-lg: 44px;
+  --control-h-sm: 32px;
 
   /* Radii */
   --radius-sm: 4px;
@@ -77,6 +103,10 @@
   box-sizing: border-box;
 }
 
+html {
+  color-scheme: dark;
+}
+
 body {
   margin: 0;
   font-family: var(--font-sans);
@@ -86,6 +116,16 @@ body {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Form controls use the app's fonts, not the browser's defaults */
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
 }
 
 /* Scrollbar styling */
@@ -125,7 +165,7 @@ body {
   background: rgba(244, 67, 54, 0.08);
   border: 1px solid rgba(244, 67, 54, 0.3);
   border-radius: var(--radius-md);
-  color: var(--danger);
+  color: var(--danger-text);
   font-size: var(--text-base);
   animation: slide-up 200ms ease;
 }

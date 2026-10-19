@@ -2,185 +2,172 @@
   import { activeDevices } from '$lib/stores/devices';
   import { currentPower, currentHR, currentCadence, currentSpeed } from '$lib/stores/sensor';
   import { unitSystem, formatSpeed, speedUnit } from '$lib/stores/units';
+  import { SERIES } from '$lib/charts/theme';
 
-  let { compact = false }: { compact?: boolean } = $props();
+  /** Connected-devices summary at the bottom of the nav: full in the sidebar, count + tooltip in the rail. */
+  let { expanded = false }: { expanded?: boolean } = $props();
+
+  let count = $derived($activeDevices.length);
+  let summary = $derived(count === 0 ? 'None connected' : `${count} connected`);
+  let accessibleName = $derived(count === 0 ? 'No devices connected' : `${count} device${count === 1 ? '' : 's'} connected`);
+
+  let channels = $derived(
+    [
+      { key: 'power', label: 'Power', color: SERIES.power, value: $currentPower != null ? `${$currentPower} W` : null },
+      { key: 'hr', label: 'Heart rate', color: SERIES.hr, value: $currentHR != null ? `${$currentHR} bpm` : null },
+      { key: 'cadence', label: 'Cadence', color: SERIES.cadence, value: $currentCadence != null ? `${Math.round($currentCadence)} rpm` : null },
+      { key: 'speed', label: 'Speed', color: SERIES.speed, value: $currentSpeed != null ? `${formatSpeed($currentSpeed, $unitSystem)} ${$speedUnit}` : null },
+    ].filter((c) => c.value != null)
+  );
 </script>
 
-{#if compact}
-  <div class="compact-status">
-    <div class="status-dots">
-      {#if $currentPower != null}
-        <div class="status-dot power" title="Power: {$currentPower}W"></div>
-      {/if}
-      {#if $currentHR != null}
-        <div class="status-dot hr" title="HR: {$currentHR}bpm"></div>
-      {/if}
-      {#if $currentCadence != null}
-        <div class="status-dot cadence" title="Cadence: {Math.round($currentCadence)}rpm"></div>
-      {/if}
-      {#if $currentSpeed != null}
-        <div class="status-dot speed" title="Speed: {formatSpeed($currentSpeed, $unitSystem)}{$speedUnit}"></div>
-      {/if}
-    </div>
-    {#if $activeDevices.length > 0}
-      <span class="compact-count">{$activeDevices.length}</span>
+<a href="/devices" class="device-status" class:expanded aria-label={accessibleName}>
+  <span class="status-head">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8" />
+      <circle cx="12" cy="12" r="1.5" />
+    </svg>
+    <span class="status-dot" class:on={count > 0} aria-hidden="true"></span>
+    {#if expanded}
+      <span class="status-text">{summary}</span>
+    {:else}
+      <span class="status-count" aria-hidden="true">{count}</span>
     {/if}
-  </div>
-{:else}
-  <div class="device-status">
-    <div class="header">
-      <span class="dot" class:active={$activeDevices.length > 0}></span>
-      <span class="count">{$activeDevices.length} device{$activeDevices.length !== 1 ? 's' : ''}</span>
-    </div>
-    <div class="readings">
-      {#if $currentPower != null}
-        <div class="reading">
-          <span class="reading-label">PWR</span>
-          <span class="reading-value">{$currentPower}<span class="reading-unit">W</span></span>
-        </div>
-      {/if}
-      {#if $currentHR != null}
-        <div class="reading">
-          <span class="reading-label">HR</span>
-          <span class="reading-value">{$currentHR}<span class="reading-unit">bpm</span></span>
-        </div>
-      {/if}
-      {#if $currentCadence != null}
-        <div class="reading">
-          <span class="reading-label">CAD</span>
-          <span class="reading-value">{Math.round($currentCadence)}<span class="reading-unit">rpm</span></span>
-        </div>
-      {/if}
-      {#if $currentSpeed != null}
-        <div class="reading">
-          <span class="reading-label">SPD</span>
-          <span class="reading-value">{formatSpeed($currentSpeed, $unitSystem)}<span class="reading-unit">{$speedUnit}</span></span>
-        </div>
-      {/if}
-    </div>
-  </div>
-{/if}
+  </span>
+
+  {#if expanded && channels.length}
+    <span class="channels" aria-hidden="true">
+      {#each channels as c (c.key)}
+        <span class="channel"><span class="channel-dot" style="background: {c.color}"></span>{c.label}<span class="channel-value data">{c.value}</span></span>
+      {/each}
+    </span>
+  {/if}
+
+  {#if !expanded}
+    <span class="tip" role="tooltip" aria-hidden="true">
+      <strong>{summary}</strong>
+      {#each $activeDevices as d (d.id)}<span>{d.name ?? d.id}</span>{/each}
+    </span>
+  {/if}
+</a>
 
 <style>
-  /* ── Compact mode (nav rail) ── */
-  .compact-status {
-    margin-top: auto;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-md) 0;
-  }
-
-  .status-dots {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: var(--radius-full);
-    transition: all var(--transition-base);
-  }
-
-  .status-dot.power {
-    background: var(--accent);
-    box-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  .status-dot.hr {
-    background: var(--danger);
-    box-shadow: 0 0 8px rgba(244, 67, 54, 0.4);
-  }
-
-  .status-dot.cadence {
-    background: var(--info);
-    box-shadow: 0 0 8px rgba(100, 181, 246, 0.4);
-  }
-
-  .status-dot.speed {
-    background: var(--success);
-    box-shadow: 0 0 8px var(--success-glow);
-  }
-
-  .compact-count {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: var(--text-muted);
-    font-family: var(--font-data);
-  }
-
-  /* ── Full mode (legacy) ── */
   .device-status {
-    margin-top: auto;
-    padding: var(--space-lg);
-    border-top: 1px solid var(--border-subtle);
-  }
-
-  .header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    margin-bottom: var(--space-sm);
-  }
-
-  .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: var(--radius-full);
-    background: var(--text-faint);
-    flex-shrink: 0;
-    transition: all var(--transition-base);
-  }
-
-  .dot.active {
-    background: var(--success);
-    box-shadow: 0 0 6px var(--success-glow);
-    animation: pulse-glow 2s ease-in-out infinite;
-  }
-
-  .count {
-    font-size: var(--text-sm);
-    color: var(--text-muted);
-    font-weight: 500;
-  }
-
-  .readings {
+    position: relative;
     display: flex;
     flex-direction: column;
-    gap: 1px;
+    gap: var(--space-sm);
+    min-height: 44px;
+    margin-top: auto;
+    padding: var(--space-sm);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    text-decoration: none;
   }
 
-  .reading {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    padding: 3px 0;
-  }
-
-  .reading-label {
-    font-size: var(--text-xs);
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    font-weight: 600;
-  }
-
-  .reading-value {
-    font-size: var(--text-base);
-    font-family: var(--font-data);
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
+  .device-status:hover {
+    background: var(--bg-hover);
     color: var(--text-primary);
   }
 
-  .reading-unit {
+  .device-status:not(.expanded) {
+    align-items: center;
+    width: 48px;
+    margin-inline: auto;
+  }
+
+  .status-head {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    min-height: 28px;
+  }
+
+  .device-status:not(.expanded) .status-head {
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .status-dot {
+    position: absolute;
+    top: 0;
+    left: 14px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-faint);
+    border: 2px solid var(--bg-surface);
+  }
+
+  .status-dot.on {
+    background: var(--success);
+  }
+
+  .status-text {
+    font-size: var(--text-sm);
+    font-weight: 600;
+  }
+
+  .status-count {
+    font-family: var(--font-data);
+    font-size: var(--text-sm);
+    font-weight: 600;
+  }
+
+  .channels {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .channel {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
     font-size: var(--text-xs);
-    font-weight: 400;
     color: var(--text-muted);
-    margin-left: 2px;
+  }
+
+  .channel-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .channel-value {
+    margin-left: auto;
+    color: var(--text-secondary);
+  }
+
+  .tip {
+    position: absolute;
+    left: calc(100% + 10px);
+    bottom: 0;
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 10px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+    box-shadow: var(--shadow-md);
+  }
+
+  .tip strong {
+    color: var(--text-primary);
+  }
+
+  .device-status:hover .tip,
+  .device-status:focus-visible .tip {
+    opacity: 1;
   }
 </style>
