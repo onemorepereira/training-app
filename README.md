@@ -119,7 +119,7 @@ flowchart LR
 ### Prerequisites
 
 - Linux or macOS (Apple Silicon). Windows isn't built or tested.
-- Rust **1.88+**. CI tests with 1.88.0, and the locked dependencies (`time`, `home`) require at least 1.88
+- Rust **1.91+**. CI and release builds use 1.91.0; Tauri 2.12 requires at least 1.90
 - Node.js **22** (CI version) and npm
 - The Tauri v2 system dependencies for your OS: see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/). On Debian/Ubuntu, CI installs:
 
