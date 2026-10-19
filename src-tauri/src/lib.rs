@@ -29,6 +29,8 @@ fn stderr_format(
     now: &mut DeferredNow,
     record: &Record,
 ) -> std::io::Result<()> {
+    // Mark the logger write path so a panic raised here is not logged re-entrantly.
+    let _scope = LoggingScope::enter();
     let module = record
         .module_path()
         .unwrap_or("<unknown>")
@@ -50,6 +52,8 @@ fn file_format(
     now: &mut DeferredNow,
     record: &Record,
 ) -> std::io::Result<()> {
+    // Mark the logger write path so a panic raised here is not logged re-entrantly.
+    let _scope = LoggingScope::enter();
     let module = record
         .module_path()
         .unwrap_or("<unknown>")
@@ -90,13 +94,48 @@ fn format_panic(payload: &(dyn Any + Send), location: Option<&Location<'_>>) -> 
     }
 }
 
+thread_local! {
+    /// True while this thread is inside our logging code: a log format function
+    /// (i.e. flexi_logger's write path, which may hold its writer lock) or the
+    /// panic hook's own logging.
+    static IN_LOGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII marker for "this thread is inside logging code". `enter` returns None
+/// when the thread is already inside, so only the outermost scope resets it.
+struct LoggingScope;
+
+impl LoggingScope {
+    fn enter() -> Option<LoggingScope> {
+        IN_LOGGING.with(|f| {
+            if f.get() {
+                None
+            } else {
+                f.set(true);
+                Some(LoggingScope)
+            }
+        })
+    }
+}
+
+impl Drop for LoggingScope {
+    fn drop(&mut self) {
+        IN_LOGGING.with(|f| f.set(false));
+    }
+}
+
 /// Log every panic (any thread) at error level and flush, then run the default
-/// hook so stderr output and backtraces are unchanged.
+/// hook so stderr output and backtraces are unchanged. If the panic happened
+/// inside the logger's own write path, logging again on this thread could
+/// deadlock on the writer's lock or recurse, so it goes straight to the default
+/// hook.
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log::error!("{}", format_panic(info.payload(), info.location()));
-        flush_logger();
+        if let Some(_scope) = LoggingScope::enter() {
+            log::error!("{}", format_panic(info.payload(), info.location()));
+            flush_logger();
+        }
         default_hook(info);
     }));
 }
@@ -462,6 +501,49 @@ mod tests {
             format_panic(&17_u32, None),
             "panic: <non-string panic payload> at <unknown location>"
         );
+    }
+
+    fn in_logging() -> bool {
+        IN_LOGGING.with(|f| f.get())
+    }
+
+    #[test]
+    fn logging_scope_blocks_nested_entry_and_resets_on_drop() {
+        assert!(!in_logging());
+        let outer = LoggingScope::enter().expect("first entry succeeds");
+        assert!(in_logging());
+        assert!(LoggingScope::enter().is_none(), "nested entry (re-entrant panic) is refused");
+        assert!(in_logging(), "refused nested entry must not clear the flag");
+        drop(outer);
+        assert!(!in_logging());
+        assert!(LoggingScope::enter().is_some());
+    }
+
+    /// Display impl that reports whether it is rendered inside a logging scope.
+    struct ScopeProbe;
+    impl std::fmt::Display for ScopeProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", if in_logging() { "inside" } else { "outside" })
+        }
+    }
+
+    #[test]
+    fn log_format_functions_run_inside_logging_scope() {
+        for format in [file_format, stderr_format] {
+            let mut out: Vec<u8> = Vec::new();
+            format(
+                &mut out,
+                &mut DeferredNow::new(),
+                &Record::builder()
+                    .args(format_args!("{}", ScopeProbe))
+                    .level(log::Level::Error)
+                    .build(),
+            )
+            .unwrap();
+            let line = String::from_utf8(out).unwrap();
+            assert!(line.ends_with("inside"), "{line}");
+            assert!(!in_logging(), "scope must be released after formatting");
+        }
     }
 
     #[test]
