@@ -34,8 +34,6 @@ struct ActiveConnection {
     info: DeviceInfo,
 }
 
-/// Maximum channels on an ANT+ USB stick
-const MAX_CHANNELS: u8 = 8;
 
 /// Manages ANT+ devices via USB stick.
 /// Uses a single router thread that reads all USB messages and dispatches
@@ -113,162 +111,59 @@ impl AntManager {
         })
     }
 
-    /// Find the lowest free channel number above the scan-reserved range.
-    /// Channels 0..N are reserved for scanning (one per profile).
-    fn allocate_channel(&self) -> Result<u8, AppError> {
-        let reserved = ALL_SCAN_PROFILES.len() as u8;
-        let used: std::collections::HashSet<u8> = self.connected.values().map(|c| c.channel_number).collect();
-        for ch in reserved..MAX_CHANNELS {
-            if !used.contains(&ch) {
-                return Ok(ch);
-            }
-        }
-        Err(AntError::NoFreeChannel(format!(
-            "{} connected, {} reserved for scanning",
-            used.len(),
-            reserved
-        )).into())
+    /// Channel numbers in use by connections.
+    fn used_channels(&self) -> std::collections::HashSet<u8> {
+        self.connected.values().map(|c| c.channel_number).collect()
     }
 
-    /// Scan for ANT+ devices. Opens wildcard channels for each profile,
-    /// listens for a few seconds, then closes them.
+    /// Lowest channel not used by a connection. Scans release their channels before
+    /// returning and run under the same AntSlot lock as connects, so connections
+    /// may use all channels.
+    fn allocate_channel(&self) -> Result<u8, AppError> {
+        let used = self.used_channels();
+        free_channel(&used).ok_or_else(|| {
+            AntError::NoFreeChannel(format!("{} of {} channels connected", used.len(), MAX_CHANNELS)).into()
+        })
+    }
+
+    /// Scan for ANT+ devices on the channels connections aren't using.
+    /// Each profile gets a wildcard channel for a 4 s window. When a channel locks
+    /// onto a device, it is re-opened with that device on its exclusion list so other
+    /// devices of the same profile can be found (up to 1 + 4 per profile per scan).
     /// Must be called from a blocking context (spawn_blocking).
     pub fn scan(&mut self) -> Result<Vec<DeviceInfo>, AppError> {
-        // Don't clear discovered — merge new results into existing.
-        // Previously discovered devices persist across scans.
+        let used = self.used_channels();
+        let free: Vec<u8> = (0..MAX_CHANNELS).filter(|c| !used.contains(c)).collect();
 
-        // Clean up scan channels from any previous scan that didn't fully close.
-        // Try close + unassign on each; ignore errors (channels may already be idle).
-        for i in 0..ALL_SCAN_PROFILES.len() {
-            let ch = i as u8;
-            let _ = self.usb.send(&AntMessage {
-                msg_id: MSG_CLOSE_CHANNEL,
-                data: vec![ch],
-            });
+        // Clean up channels a previous scan may have left open (errors expected for idle ones).
+        for &ch in &free {
+            let _ = self.usb.send(&AntMessage { msg_id: MSG_CLOSE_CHANNEL, data: vec![ch] });
             std::thread::sleep(Duration::from_millis(50));
-            let _ = self.usb.send(&AntMessage {
-                msg_id: MSG_UNASSIGN_CHANNEL,
-                data: vec![ch],
-            });
+            let _ = self.usb.send(&AntMessage { msg_id: MSG_UNASSIGN_CHANNEL, data: vec![ch] });
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Drain leftover responses for the scan channels only: other channels'
-        // entries (e.g. an FE-C transfer result being awaited) must survive.
+        // Drain leftover responses for those channels only: other channels' entries
+        // (e.g. an FE-C transfer result being awaited) must survive.
         {
-            let scan_chs = ALL_SCAN_PROFILES.len() as u8;
             let mut queue = self.response_queue.lock().unwrap_or_else(|e| e.into_inner());
-            queue.retain(|m| !(m.msg_id == MSG_CHANNEL_RESPONSE && m.data.first().is_some_and(|ch| *ch < scan_chs)));
+            queue.retain(|m| !(m.msg_id == MSG_CHANNEL_RESPONSE && m.data.first().is_some_and(|ch| free.contains(ch))));
         }
 
-        // Open wildcard channels for each scannable profile
-        let scan_channels: Vec<(u8, AntProfile)> = ALL_SCAN_PROFILES
+        let batches = scan_batches(&free, ALL_SCAN_PROFILES);
+        if batches.is_empty() {
+            warn!("ANT+ scan skipped: all {} channels are in use by connections", MAX_CHANNELS);
+        }
+        let mut found_ids: Vec<String> = Vec::new();
+        for batch in batches {
+            self.scan_batch(&batch, &mut found_ids);
+        }
+
+        let devices: Vec<DeviceInfo> = found_ids
             .iter()
-            .enumerate()
-            .map(|(i, profile)| {
-                let ch = i as u8;
-                let config = AntChannelConfig {
-                    channel_number: ch,
-                    profile: *profile,
-                    device_number: 0,     // wildcard
-                    transmission_type: 0, // wildcard
-                };
-                if let Err(e) = open_channel(&*self.usb, &config, SCAN_SEARCH, &self.response_queue) {
-                    warn!(
-                        "Failed to open scan channel {} for {:?}: {}",
-                        ch, profile.device_type, e
-                    );
-                }
-                (ch, *profile)
-            })
-            .collect();
-
-        // Register temporary senders for scan channels so router delivers broadcast data
-        let scan_receivers: Vec<(u8, std::sync::mpsc::Receiver<Vec<u8>>)> = {
-            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-            scan_channels
-                .iter()
-                .map(|(ch, _)| {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    senders.insert(*ch, tx);
-                    (*ch, rx)
-                })
-                .collect()
-        };
-
-        // Listen for broadcasts for 4 seconds
-        let scan_end = Instant::now() + Duration::from_secs(4);
-        while Instant::now() < scan_end {
-            // Check scan channel receivers for broadcast data (to trigger Channel ID requests)
-            for (ch, rx) in &scan_receivers {
-                if rx.try_recv().is_ok() {
-                    // Got broadcast data on this channel, request Channel ID
-                    let _ = self.usb.send(&AntMessage {
-                        msg_id: MSG_REQUEST_MESSAGE,
-                        data: vec![*ch, MSG_CHANNEL_ID],
-                    });
-                }
-            }
-
-            // Check the response queue for Channel ID responses
-            {
-                let mut queue = self.response_queue.lock().unwrap_or_else(|e| e.into_inner());
-                let mut i = 0;
-                while i < queue.len() {
-                    let msg = &queue[i];
-                    if msg.msg_id == MSG_CHANNEL_ID && msg.data.len() >= 5 {
-                        let channel = msg.data[0] as usize;
-                        let device_number = u16::from_le_bytes([msg.data[1], msg.data[2]]);
-                        let device_type_id = msg.data[3];
-                        let transmission_type = msg.data[4];
-
-                        if device_number != 0 && channel < scan_channels.len() {
-                            let profile = scan_channels[channel].1;
-                            // I4: Include device type in ANT+ device ID for uniqueness
-                            let id = format!("ant:{}:{}", device_type_id, device_number);
-                            if !self.discovered.contains_key(&id) {
-                                self.discovered.insert(
-                                    id,
-                                    DiscoveredDevice {
-                                        device_number,
-                                        transmission_type,
-                                        profile,
-                                    },
-                                );
-                            }
-                        }
-                        queue.remove(i);
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        // Remove scan senders from router
-        {
-            let mut senders = self.channel_senders.lock().unwrap_or_else(|e| e.into_inner());
-            for (ch, _) in &scan_channels {
-                senders.remove(ch);
-            }
-        }
-
-        // Close scan channels
-        for (ch, _) in &scan_channels {
-            let _ = close_channel(&*self.usb, *ch, &self.response_queue);
-        }
-
-        // Build device info list
-        let devices: Vec<DeviceInfo> = self
-            .discovered
-            .iter()
+            .filter_map(|id| self.discovered.get(id).map(|dev| (id, dev)))
             .map(|(id, dev)| DeviceInfo {
                 id: id.clone(),
-                name: Some(format!(
-                    "ANT+ {:?} {}",
-                    dev.profile.device_type, dev.device_number
-                )),
+                name: Some(format!("ANT+ {:?} {}", dev.profile.device_type, dev.device_number)),
                 device_type: dev.profile.device_type,
                 status: ConnectionStatus::Disconnected,
                 transport: Transport::AntPlus,
@@ -289,6 +184,114 @@ impl AntManager {
             self.connected.len()
         );
         Ok(devices)
+    }
+
+    /// One 4 s scan window over `batch` (channel, profile) pairs.
+    fn scan_batch(&mut self, batch: &[(u8, AntProfile)], found_ids: &mut Vec<String>) {
+        let mut receivers: HashMap<u8, std::sync::mpsc::Receiver<Vec<u8>>> = HashMap::new();
+        let mut excluded: HashMap<u8, Vec<FoundId>> = HashMap::new();
+        let mut open: std::collections::HashSet<u8> = std::collections::HashSet::new();
+
+        for &(ch, profile) in batch {
+            let config = AntChannelConfig {
+                channel_number: ch,
+                profile,
+                device_number: 0,     // wildcard
+                transmission_type: 0, // wildcard
+            };
+            match open_channel(&*self.usb, &config, SCAN_SEARCH, &self.response_queue) {
+                Ok(()) => {
+                    open.insert(ch);
+                    receivers.insert(ch, self.register_sender(ch));
+                }
+                Err(e) => warn!("Failed to open scan channel {} for {:?}: {}", ch, profile.device_type, e),
+            }
+        }
+
+        let scan_end = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < scan_end {
+            // A broadcast on a wildcard channel → ask which device it locked onto.
+            for (ch, rx) in &receivers {
+                if rx.try_recv().is_ok() {
+                    let _ = self.usb.send(&AntMessage { msg_id: MSG_REQUEST_MESSAGE, data: vec![*ch, MSG_CHANNEL_ID] });
+                }
+            }
+
+            let mut newly_found: Vec<(u8, FoundId)> = Vec::new();
+            {
+                let mut queue = self.response_queue.lock().unwrap_or_else(|e| e.into_inner());
+                queue.retain(|msg| {
+                    if msg.msg_id != MSG_CHANNEL_ID || msg.data.len() < 5 {
+                        return true;
+                    }
+                    let ch = msg.data[0];
+                    if open.contains(&ch) {
+                        newly_found.push((
+                            ch,
+                            FoundId {
+                                device_number: u16::from_le_bytes([msg.data[1], msg.data[2]]),
+                                device_type: msg.data[3],
+                                transmission_type: msg.data[4],
+                            },
+                        ));
+                    }
+                    false
+                });
+            }
+
+            for (ch, id) in newly_found {
+                if id.device_number == 0 {
+                    continue; // not paired yet
+                }
+                let Some(&(_, profile)) = batch.iter().find(|(c, _)| *c == ch) else { continue };
+                let list = excluded.entry(ch).or_default();
+                if list.contains(&id) {
+                    continue; // repeat response for the same device
+                }
+                // Bit 7 of the device type is the pairing bit; the id uses the 7-bit type.
+                let key = format!("ant:{}:{}", id.device_type & 0x7F, id.device_number);
+                self.discovered.entry(key.clone()).or_insert(DiscoveredDevice {
+                    device_number: id.device_number,
+                    transmission_type: id.transmission_type,
+                    profile,
+                });
+                if !found_ids.contains(&key) {
+                    found_ids.push(key);
+                }
+                list.push(id);
+
+                // Look for further devices of this profile on the same channel.
+                if list.len() <= MAX_ID_LIST {
+                    self.unregister_sender(ch);
+                    receivers.remove(&ch);
+                    match reopen_excluding(&*self.usb, ch, list, &self.response_queue) {
+                        Ok(()) => {
+                            receivers.insert(ch, self.register_sender(ch));
+                        }
+                        Err(e) => warn!("ANT+ scan ch{}: reopen with exclusion list failed: {}", ch, e),
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        for &ch in &open {
+            self.unregister_sender(ch);
+            if let Err(e) = release_scan_channel(&*self.usb, ch, &self.response_queue) {
+                warn!("ANT+ scan ch{}: release failed: {}", ch, e);
+            }
+        }
+    }
+
+    fn register_sender(&self, ch: u8) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.channel_senders.lock().unwrap_or_else(|e| e.into_inner()).insert(ch, tx);
+        rx
+    }
+
+    fn unregister_sender(&self, ch: u8) {
+        self.channel_senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&ch);
     }
 
     /// Connect to a discovered ANT+ device.

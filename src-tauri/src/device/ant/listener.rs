@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+use super::channel::PROFILE_SPEED_CADENCE;
 use super::protocol::{AntDecoder, DEFAULT_WHEEL_CIRCUMFERENCE_MM};
 use crate::device::primary::{admit_reading, SharedPrimaryState};
 use crate::device::types::{AntDeviceMetadata, DeviceType, SensorReading};
@@ -135,7 +136,9 @@ pub fn listen_ant_channel(
         atomic_now(&last_seen);
 
         // Decode ANT+ Common Data Pages — only lock metadata for these rare pages
-        if page_num == 0x50 || page_num == 0x51 || page_num == 0x52 {
+        // The combined S&C page (121) has no page byte: byte 0 is cadence time data.
+        let has_pages = device_type_id != PROFILE_SPEED_CADENCE.device_type_id;
+        if has_pages && (page_num == 0x50 || page_num == 0x51 || page_num == 0x52) {
             let mut store = metadata_store.lock().unwrap_or_else(|e| e.into_inner());
             let meta = store.entry(device_id.clone()).or_default();
             match page_num {
@@ -150,16 +153,14 @@ pub fn listen_ant_channel(
         let readings: Vec<SensorReading> = match device_type {
             DeviceType::HeartRate => decoder.decode_hr(&data, &device_id).into_iter().collect(),
             DeviceType::Power => decoder.decode_power_page(&data, &device_id),
-            DeviceType::CadenceSpeed => {
-                if device_type_id == 123 {
-                    decoder
-                        .decode_speed(&data, &device_id, DEFAULT_WHEEL_CIRCUMFERENCE_MM)
-                        .into_iter()
-                        .collect()
-                } else {
-                    decoder.decode_cadence(&data, &device_id).into_iter().collect()
-                }
-            }
+            DeviceType::CadenceSpeed => match device_type_id {
+                123 => decoder
+                    .decode_speed(&data, &device_id, DEFAULT_WHEEL_CIRCUMFERENCE_MM)
+                    .into_iter()
+                    .collect(),
+                121 => decoder.decode_combined_sc(&data, &device_id, DEFAULT_WHEEL_CIRCUMFERENCE_MM),
+                _ => decoder.decode_cadence(&data, &device_id).into_iter().collect(),
+            },
             DeviceType::FitnessTrainer => decoder.decode_fec_trainer(&data, &device_id),
         };
 

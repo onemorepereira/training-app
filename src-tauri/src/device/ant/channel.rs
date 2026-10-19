@@ -51,8 +51,83 @@ pub const PROFILE_FEC: AntProfile = AntProfile {
     device_type: DeviceType::FitnessTrainer,
 };
 
-pub const ALL_SCAN_PROFILES: &[AntProfile] =
-    &[PROFILE_HR, PROFILE_POWER, PROFILE_CADENCE, PROFILE_SPEED, PROFILE_FEC];
+/// Combined bike speed & cadence sensor: device type 121, period 8086, RF 57
+/// (ANT+ Bike Speed and Cadence profile; ANT's nRF Connect SDK `ant_bsc.h`).
+pub const PROFILE_SPEED_CADENCE: AntProfile = AntProfile {
+    device_type_id: 121,
+    channel_period: 8086,
+    rf_frequency: 57,
+    device_type: DeviceType::CadenceSpeed,
+};
+
+pub const ALL_SCAN_PROFILES: &[AntProfile] = &[
+    PROFILE_HR,
+    PROFILE_POWER,
+    PROFILE_CADENCE,
+    PROFILE_SPEED,
+    PROFILE_SPEED_CADENCE,
+    PROFILE_FEC,
+];
+
+/// Channels on an ANT USB2 / ANTUSB-m stick (datasheets D00001367, D00001513).
+pub const MAX_CHANNELS: u8 = 8;
+
+/// Maximum entries in a channel's inclusion/exclusion list (D00000652 §9.5.2.10).
+pub const MAX_ID_LIST: usize = 4;
+
+/// Lowest channel number not used by a connection.
+pub fn free_channel(used: &std::collections::HashSet<u8>) -> Option<u8> {
+    (0..MAX_CHANNELS).find(|ch| !used.contains(ch))
+}
+
+/// Split the scan profiles over the channels connections aren't using. With fewer
+/// free channels than profiles, profiles are scanned in successive batches.
+pub fn scan_batches(free: &[u8], profiles: &[AntProfile]) -> Vec<Vec<(u8, AntProfile)>> {
+    if free.is_empty() {
+        return vec![];
+    }
+    profiles
+        .chunks(free.len())
+        .map(|chunk| free.iter().copied().zip(chunk.iter().copied()).collect())
+        .collect()
+}
+
+/// Channel ID found by a wildcard channel (device number, device type, transmission type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundId {
+    pub device_number: u16,
+    pub device_type: u8,
+    pub transmission_type: u8,
+}
+
+/// Messages that make a (closed, still assigned) slave channel ignore `excluded`:
+/// one Add Channel ID to List (0x59, §9.5.2.10) per entry, then Config ID List
+/// (0x5A, §9.5.2.12) with exclude = 1.
+pub fn exclusion_messages(ch: u8, excluded: &[FoundId]) -> Vec<AntMessage> {
+    let mut msgs: Vec<AntMessage> = excluded
+        .iter()
+        .take(MAX_ID_LIST)
+        .enumerate()
+        .map(|(i, id)| {
+            let dn = id.device_number.to_le_bytes();
+            AntMessage {
+                msg_id: MSG_ADD_CHANNEL_ID_TO_LIST,
+                data: vec![ch, dn[0], dn[1], id.device_type, id.transmission_type, i as u8],
+            }
+        })
+        .collect();
+    msgs.push(AntMessage {
+        msg_id: MSG_CONFIG_ID_LIST,
+        data: vec![ch, excluded.len().min(MAX_ID_LIST) as u8, 1],
+    });
+    msgs
+}
+
+/// Config ID List with size 0: disables the channel's inclusion/exclusion list.
+fn reset_id_list(usb: &dyn AntTx, ch: u8, response_queue: &Arc<Mutex<Vec<AntMessage>>>) -> Result<(), AppError> {
+    usb.send(&AntMessage { msg_id: MSG_CONFIG_ID_LIST, data: vec![ch, 0, 0] })?;
+    poll_response(response_queue, ch, MSG_CONFIG_ID_LIST)
+}
 
 /// Something that can transmit ANT messages (the USB stick, or a test recorder).
 pub trait AntTx {
@@ -184,6 +259,9 @@ pub fn open_channel(
         poll_response(response_queue, ch, MSG_ASSIGN_CHANNEL)?;
     }
 
+    // A reused channel number must never inherit a previous scan's exclusion list.
+    reset_id_list(usb, ch, response_queue)?;
+
     // Set channel ID (device number, device type, transmission type)
     let dn = config.device_number.to_le_bytes();
     usb.send(&AntMessage {
@@ -246,36 +324,79 @@ pub fn close_channel(
     channel_number: u8,
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
 ) -> Result<(), AppError> {
-    usb.send(&AntMessage {
-        msg_id: MSG_CLOSE_CHANNEL,
-        data: vec![channel_number],
-    })?;
-
-    // Wait for channel closed event
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        {
-            let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(pos) = queue.iter().position(|msg| {
-                msg.msg_id == MSG_CHANNEL_RESPONSE
-                    && msg.data.len() >= 3
-                    && msg.data[0] == channel_number
-                    && msg.data[2] == EVENT_CHANNEL_CLOSED
-            }) {
-                queue.remove(pos);
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
+    close_only(usb, channel_number, response_queue)?;
     usb.send(&AntMessage {
         msg_id: MSG_UNASSIGN_CHANNEL,
         data: vec![channel_number],
     })?;
     poll_response(response_queue, channel_number, MSG_UNASSIGN_CHANNEL)?;
-
     Ok(())
+}
+
+/// Close a channel and wait (≤ 2 s) for EVENT_CHANNEL_CLOSED; it stays assigned.
+fn close_only(
+    usb: &dyn AntTx,
+    channel_number: u8,
+    response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+) -> Result<(), AppError> {
+    usb.send(&AntMessage {
+        msg_id: MSG_CLOSE_CHANNEL,
+        data: vec![channel_number],
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        {
+            let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
+            // Consume the command response too, so it can't pile up in the queue.
+            queue.retain(|m| {
+                !(m.msg_id == MSG_CHANNEL_RESPONSE
+                    && m.data.len() >= 3
+                    && m.data[0] == channel_number
+                    && m.data[1] == MSG_CLOSE_CHANNEL)
+            });
+            if let Some(pos) = queue.iter().position(|msg| {
+                msg.msg_id == MSG_CHANNEL_RESPONSE
+                    && msg.data.len() >= 3
+                    && msg.data[0] == channel_number
+                    && msg.data[1] == CHANNEL_EVENT
+                    && msg.data[2] == EVENT_CHANNEL_CLOSED
+            }) {
+                queue.remove(pos);
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// Re-open a wildcard scan channel so it ignores the devices already found on it.
+pub fn reopen_excluding(
+    usb: &dyn AntTx,
+    ch: u8,
+    excluded: &[FoundId],
+    response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+) -> Result<(), AppError> {
+    close_only(usb, ch, response_queue)?;
+    for msg in exclusion_messages(ch, excluded) {
+        usb.send(&msg)?;
+        poll_response(response_queue, ch, msg.msg_id)?;
+    }
+    usb.send(&AntMessage { msg_id: MSG_OPEN_CHANNEL, data: vec![ch] })?;
+    poll_response(response_queue, ch, MSG_OPEN_CHANNEL)
+}
+
+/// Release a scan channel: close, reset its exclusion list (while still assigned),
+/// then unassign. Only after this may the channel number be reused.
+pub fn release_scan_channel(
+    usb: &dyn AntTx,
+    ch: u8,
+    response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+) -> Result<(), AppError> {
+    close_only(usb, ch, response_queue)?;
+    reset_id_list(usb, ch, response_queue)?;
+    usb.send(&AntMessage { msg_id: MSG_UNASSIGN_CHANNEL, data: vec![ch] })?;
+    poll_response(response_queue, ch, MSG_UNASSIGN_CHANNEL)
 }
 
 /// Wait for the first data page on a freshly opened channel.
@@ -706,5 +827,102 @@ mod tests {
         // A completion left over from an earlier transfer must not count for this one.
         stick.queue.lock().unwrap().push(event(5, EVENT_TRANSFER_TX_COMPLETED).unwrap());
         assert!(send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).is_err());
+    }
+
+    // ---- Scan channels, exclusion lists, combined S&C ----
+
+    #[test]
+    fn profile_speed_cadence_is_type_121_period_8086() {
+        assert_eq!(PROFILE_SPEED_CADENCE.device_type_id, 121);
+        assert_eq!(PROFILE_SPEED_CADENCE.channel_period, 8086);
+        assert_eq!(PROFILE_SPEED_CADENCE.rf_frequency, 57);
+    }
+
+    #[test]
+    fn scan_profiles_include_combined_sc() {
+        assert!(ALL_SCAN_PROFILES.iter().any(|p| p.device_type_id == 121));
+    }
+
+    #[test]
+    fn scan_channel_allocation_skips_connection_channels() {
+        let used: std::collections::HashSet<u8> = [0, 1, 3].into_iter().collect();
+        assert_eq!(free_channel(&used), Some(2));
+        let all: std::collections::HashSet<u8> = (0..MAX_CHANNELS).collect();
+        assert_eq!(free_channel(&all), None);
+        let free: Vec<u8> = (0..MAX_CHANNELS).filter(|c| !used.contains(c)).collect();
+        let batches = scan_batches(&free, ALL_SCAN_PROFILES);
+        assert_eq!(batches.len(), 2, "5 free channels for 6 profiles → two batches");
+        assert!(batches.iter().flatten().all(|(ch, _)| !used.contains(ch)));
+    }
+
+    #[test]
+    fn scan_profiles_batched_when_channels_scarce() {
+        let batches = scan_batches(&[6, 7], ALL_SCAN_PROFILES);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].iter().map(|(c, _)| *c).collect::<Vec<_>>(), vec![6, 7]);
+        let types: Vec<u8> = batches.iter().flatten().map(|(_, p)| p.device_type_id).collect();
+        assert_eq!(types, vec![120, 11, 122, 123, 121, 17], "every profile scanned once");
+        assert!(scan_batches(&[], ALL_SCAN_PROFILES).is_empty());
+    }
+
+    #[test]
+    fn exclusion_list_messages_bytes() {
+        let found = [
+            FoundId { device_number: 0x1234, device_type: 120, transmission_type: 1 },
+            FoundId { device_number: 0x00AB, device_type: 120, transmission_type: 5 },
+        ];
+        let msgs: Vec<(u8, Vec<u8>)> = exclusion_messages(2, &found).into_iter().map(|m| (m.msg_id, m.data)).collect();
+        assert_eq!(
+            msgs,
+            vec![
+                // 0x59: [ch, dev# LSB, dev# MSB, device type, trans type, list index]
+                (MSG_ADD_CHANNEL_ID_TO_LIST, vec![2, 0x34, 0x12, 120, 1, 0]),
+                (MSG_ADD_CHANNEL_ID_TO_LIST, vec![2, 0xAB, 0x00, 120, 5, 1]),
+                // 0x5A: [ch, list size, exclude = 1]
+                (MSG_CONFIG_ID_LIST, vec![2, 2, 1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn exclusion_list_capped_at_four_entries() {
+        let found: Vec<FoundId> = (1..=6)
+            .map(|n| FoundId { device_number: n, device_type: 11, transmission_type: 1 })
+            .collect();
+        let msgs = exclusion_messages(0, &found);
+        assert_eq!(msgs.len(), MAX_ID_LIST + 1);
+        assert_eq!(msgs.last().unwrap().data, vec![0, 4, 1]);
+    }
+
+    #[test]
+    fn scan_channel_release_sends_close_reset_list_unassign_in_order() {
+        let stick = RecordingStick::new();
+        release_scan_channel(&stick, 2, &stick.queue).unwrap();
+        assert_eq!(
+            stick.sent(),
+            vec![
+                (MSG_CLOSE_CHANNEL, vec![2]),
+                (MSG_CONFIG_ID_LIST, vec![2, 0, 0]),
+                (MSG_UNASSIGN_CHANNEL, vec![2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn open_channel_resets_id_list_after_assign() {
+        let stick = RecordingStick::new();
+        open_channel(&stick, &hr_config(1), SCAN_SEARCH, &stick.queue).unwrap();
+        let sent = stick.sent();
+        assert_eq!(sent[0].0, MSG_ASSIGN_CHANNEL);
+        assert_eq!(sent[1], (MSG_CONFIG_ID_LIST, vec![1, 0, 0]));
+    }
+
+    #[test]
+    fn reopen_excluding_closes_lists_then_opens() {
+        let stick = RecordingStick::new();
+        let found = [FoundId { device_number: 7, device_type: 121, transmission_type: 1 }];
+        reopen_excluding(&stick, 3, &found, &stick.queue).unwrap();
+        let ids: Vec<u8> = stick.sent().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![MSG_CLOSE_CHANNEL, MSG_ADD_CHANNEL_ID_TO_LIST, MSG_CONFIG_ID_LIST, MSG_OPEN_CHANNEL]);
     }
 }
