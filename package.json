@@ -10,6 +10,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "ui:check": "node tools/ui-harness/shoot.mjs --check --no-shots",
     "tauri": "tauri",
     "build:release": "tauri build --features production --config '{\"identifier\":\"com.training-app\",\"app\":{\"windows\":[{\"title\":\"Training App\"}]}}'"
   },
