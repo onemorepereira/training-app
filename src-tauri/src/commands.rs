@@ -15,6 +15,7 @@ use crate::session::storage::Storage;
 use crate::session::types::{SessionConfig, SessionSummary};
 use crate::session::analysis::{compute_hr_power_regression, TimeseriesPoint};
 use crate::session::zone_control::controller::ZoneController;
+use crate::session::zone_control::lifecycle as zone_lifecycle;
 use crate::session::zone_control::types::{
     StopReason, ZoneControlStatus, ZoneMode, ZoneTarget, MAX_HR_BOUND,
 };
@@ -82,7 +83,7 @@ pub struct AppState {
     pub storage: Arc<Storage>,
     pub sensor_tx: broadcast::Sender<SensorReading>,
     pub primary_devices: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>,
-    pub zone_controller: Arc<tokio::sync::Mutex<ZoneController>>,
+    pub zone_controller: Arc<ZoneController>,
     #[cfg(not(feature = "production"))]
     pub simulator: Arc<tokio::sync::Mutex<crate::simulator::Simulator>>,
 }
@@ -143,6 +144,7 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, AppErro
 
 #[tauri::command]
 pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSummary>, AppError> {
+    zone_lifecycle::on_session_stop(&state.zone_controller).await;
     let result = state.session_manager.stop_session_with_log().await;
 
     if let Some((ref summary, ref sensor_log)) = result {
@@ -175,12 +177,14 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSu
 
 #[tauri::command]
 pub async fn pause_session(state: State<'_, AppState>) -> Result<(), AppError> {
+    zone_lifecycle::on_session_pause(&state.zone_controller).await;
     state.session_manager.pause_session().await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn resume_session(state: State<'_, AppState>) -> Result<(), AppError> {
+    zone_lifecycle::on_session_resume(&state.zone_controller).await;
     state.session_manager.resume_session().await;
     Ok(())
 }
@@ -460,10 +464,11 @@ pub async fn start_zone_control(
     };
 
     let power_zones = Some(config.power_zones);
-    let dm = state.device_manager.clone();
     let tx = state.sensor_tx.clone();
-    let mut zc = state.zone_controller.lock().await;
-    zc.start_with_config(target, dm, tx, ftp, max_hr, initial_power_estimate, power_zones).await
+    state
+        .zone_controller
+        .start_with_config(target, tx, ftp, max_hr, initial_power_estimate, power_zones)
+        .await
 }
 
 #[tauri::command]
@@ -478,23 +483,20 @@ pub async fn estimate_initial_power(
 pub async fn stop_zone_control(
     state: State<'_, AppState>,
 ) -> Result<Option<StopReason>, AppError> {
-    let mut zc = state.zone_controller.lock().await;
-    let reason = zc.stop().await;
+    let reason = state.zone_controller.stop(StopReason::UserStopped).await;
     info!("Stop zone control: {:?}", reason);
     Ok(reason)
 }
 
 #[tauri::command]
 pub async fn pause_zone_control(state: State<'_, AppState>) -> Result<(), AppError> {
-    let zc = state.zone_controller.lock().await;
-    zc.pause().await;
+    state.zone_controller.pause().await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn resume_zone_control(state: State<'_, AppState>) -> Result<(), AppError> {
-    let zc = state.zone_controller.lock().await;
-    zc.resume().await;
+    state.zone_controller.resume().await;
     Ok(())
 }
 
@@ -502,8 +504,7 @@ pub async fn resume_zone_control(state: State<'_, AppState>) -> Result<(), AppEr
 pub async fn get_zone_control_status(
     state: State<'_, AppState>,
 ) -> Result<ZoneControlStatus, AppError> {
-    let zc = state.zone_controller.lock().await;
-    Ok(zc.status().await)
+    Ok(state.zone_controller.status().await)
 }
 
 #[tauri::command]

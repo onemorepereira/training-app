@@ -72,15 +72,26 @@ pub struct ZoneControlStatus {
     pub paused: bool,
     pub phase: String,
     pub safety_note: Option<String>,
+    /// Why the latest run ended; None while active or before any run
+    pub stop_reason: Option<StopReason>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Serialized as plain strings; the frontend (Area D) depends on these names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     UserStopped,
     DurationComplete,
     SafetyStop,
     TrainerDisconnected,
     SensorLost,
+    /// Backend stop_session
+    SessionStopped,
+    /// Window close / app exit
+    AppClosing,
+    /// Control task panicked or failed
+    ControllerFault,
+    /// A safety power cut could not be delivered (ADR-15)
+    TrainerUnresponsive,
 }
 
 #[cfg(test)]
@@ -136,6 +147,18 @@ mod tests {
         let msg = err_msg(&target(ZoneMode::HeartRate, 0, 200, 251));
         assert!(msg.contains("at most 250 bpm, got 251"), "{msg}");
         assert!(target(ZoneMode::HeartRate, 0, 200, 250).validate().is_ok());
+    }
+
+    #[test]
+    fn new_stop_reasons_serialize_as_plain_strings() {
+        for (r, name) in [
+            (StopReason::SessionStopped, "SessionStopped"),
+            (StopReason::AppClosing, "AppClosing"),
+            (StopReason::ControllerFault, "ControllerFault"),
+            (StopReason::TrainerUnresponsive, "TrainerUnresponsive"),
+        ] {
+            assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{name}\""));
+        }
     }
 
     #[test]

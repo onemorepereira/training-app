@@ -16,6 +16,8 @@ use log::Record;
 use session::manager::SessionManager;
 use session::storage::Storage;
 use session::zone_control::controller::ZoneController;
+use session::zone_control::lifecycle as zone_lifecycle;
+use session::zone_control::trainer::DeviceManagerBackend;
 use std::any::Any;
 use std::io::Write;
 use std::panic::Location;
@@ -353,7 +355,9 @@ pub fn run() {
                     });
                 }
 
-                let zone_controller = Arc::new(tokio::sync::Mutex::new(ZoneController::new()));
+                let zone_controller = Arc::new(ZoneController::new(DeviceManagerBackend::new(
+                    device_manager.clone(),
+                )));
 
                 AppState {
                     device_manager,
@@ -376,7 +380,10 @@ pub fn run() {
                 let state = window.state::<AppState>();
                 let session_mgr = state.session_manager.clone();
                 let storage = state.storage.clone();
+                let zone_controller = state.zone_controller.clone();
                 tauri::async_runtime::block_on(async {
+                    // Release the trainer first (hard 4 s budget)
+                    zone_lifecycle::on_app_close(&zone_controller).await;
                     // Save active session before shutdown
                     if let Some((summary, sensor_log)) = session_mgr.stop_session_with_log().await {
                         if let Err(e) = storage.finalize_session(&summary, &sensor_log).await {
@@ -478,11 +485,20 @@ pub fn run() {
         builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
-            if let RunEvent::Exit = event {
+        .run(|app, event| match event {
+            // Exits that skip CloseRequested (e.g. macOS Cmd+Q) still release the
+            // trainer. A second stop after CloseRequested is a no-op.
+            RunEvent::ExitRequested { .. } => {
+                if let Some(state) = app.try_state::<AppState>() {
+                    let zone_controller = state.zone_controller.clone();
+                    tauri::async_runtime::block_on(zone_lifecycle::on_app_close(&zone_controller));
+                }
+            }
+            RunEvent::Exit => {
                 log::info!("Application exiting");
                 flush_logger();
             }
+            _ => {}
         });
 }
 
