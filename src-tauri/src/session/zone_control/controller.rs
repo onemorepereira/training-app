@@ -5,6 +5,7 @@ use log::{debug, info, warn};
 use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::config::MAX_TRAINER_WATTS;
 use crate::device::manager::DeviceManager;
 use crate::device::types::{CommandSource, SensorReading};
 use crate::error::AppError;
@@ -118,12 +119,7 @@ impl ZoneController {
         initial_power_estimate: Option<u16>,
         power_zones: Option<[u16; 6]>,
     ) -> Result<(), AppError> {
-        // Validate
-        if target.lower_bound >= target.upper_bound {
-            return Err(AppError::Session(
-                "Zone lower bound must be less than upper bound".into(),
-            ));
-        }
+        target.validate()?;
 
         // Verify trainer connected
         {
@@ -136,20 +132,7 @@ impl ZoneController {
         // Stop any existing control loop
         self.stop_internal().await;
 
-        let midpoint = (target.lower_bound + target.upper_bound) / 2;
-        let initial_power = match target.mode {
-            ZoneMode::Power => midpoint,
-            ZoneMode::HeartRate => {
-                if let Some(estimate) = initial_power_estimate {
-                    // Historical model estimate, clamped to safe range
-                    let max = ftp.map(|f| (f as f64 * 1.2) as u16).unwrap_or(300);
-                    estimate.clamp(MIN_POWER, max)
-                } else {
-                    // Conservative start: 55% FTP if available, else 100W
-                    ftp.map(|f| (f as f64 * 0.55) as u16).unwrap_or(100)
-                }
-            }
-        };
+        let initial_power = initial_power_for(&target, ftp, power_zones, initial_power_estimate);
 
         {
             let mut state = self.state.lock().await;
@@ -551,6 +534,50 @@ fn process_power_tick(s: &mut ControlLoopState, target: &ZoneTarget, tick_ms: u6
     }
 }
 
+/// Initial commanded power. Power mode: target midpoint. HR mode: the
+/// historical estimate (capped at 1.2×FTP / 300 W) or 55 % FTP (100 W without
+/// FTP), always clamped into the HR power band so no clamp can panic.
+fn initial_power_for(
+    target: &ZoneTarget,
+    ftp: Option<u16>,
+    power_zones: Option<[u16; 6]>,
+    estimate: Option<u16>,
+) -> u16 {
+    match target.mode {
+        ZoneMode::Power => target.midpoint().min(MAX_TRAINER_WATTS),
+        ZoneMode::HeartRate => {
+            let band = hr_power_band(ftp, power_zones, target.zone);
+            let raw = match estimate {
+                Some(e) => e.min(ftp.map(|f| pct_of_ftp(f, 120)).unwrap_or(300)),
+                None => ftp.map(|f| pct_of_ftp(f, 55)).unwrap_or(100),
+            };
+            raw.clamp(band.floor, band.ceiling)
+        }
+    }
+}
+
+fn pct_of_ftp(ftp: u16, pct: u16) -> u16 {
+    (ftp as u32 * pct as u32 / 100).min(u16::MAX as u32) as u16
+}
+
+/// Power band an HR target may command (design ADR-9).
+/// Zone 0 (custom), zones beyond 5, or missing zone config → [MIN_POWER, 1.5×FTP]
+/// (400 W without FTP). Zone n → one power zone below to one above.
+/// Always returns floor ≤ ceiling ≤ MAX_TRAINER_WATTS, for any input.
+pub(crate) fn hr_power_band(ftp: Option<u16>, power_zones: Option<[u16; 6]>, zone: u8) -> PowerBand {
+    let (floor, ceiling) = match (ftp, power_zones) {
+        (Some(ftp), Some(pz)) if (1..=5).contains(&zone) => {
+            let floor = if zone >= 2 { pct_of_ftp(ftp, pz[(zone - 2) as usize]) } else { MIN_POWER };
+            let ceiling = pct_of_ftp(ftp, pz[(zone as usize).min(5)]);
+            (floor, ceiling)
+        }
+        _ => (MIN_POWER, ftp.map(|f| pct_of_ftp(f, 150)).unwrap_or(400)),
+    };
+    let floor = floor.max(MIN_POWER).min(MAX_TRAINER_WATTS);
+    let ceiling = ceiling.min(MAX_TRAINER_WATTS).max(floor);
+    PowerBand { floor, ceiling }
+}
+
 /// HR mode tick: positional PID (design ADR-1) adjusts power toward the HR target.
 /// Returns Some(new_watts) if power should be changed, None to hold.
 fn process_hr_tick(
@@ -578,23 +605,7 @@ fn process_hr_tick(
         debug!("Phase transition: {} -> {}", prev_phase, s.phase);
     }
 
-    // Derive power band from HR zone number and power zone config
-    let (power_floor, power_ceiling) = match (s.ftp, s.power_zones) {
-        (Some(ftp), Some(pz)) => {
-            let zone = target.zone;
-            let floor = if zone >= 2 {
-                (ftp as f64 * pz[(zone - 2) as usize] as f64 / 100.0) as u16
-            } else {
-                MIN_POWER
-            };
-            let ceil_idx = (zone as usize).min(5);
-            let ceiling = (ftp as f64 * pz[ceil_idx] as f64 / 100.0) as u16;
-            (floor.max(MIN_POWER), ceiling)
-        }
-        _ => (MIN_POWER, s.ftp.map(|f| (f as f64 * 1.5) as u16).unwrap_or(400)),
-    };
-    let band = PowerBand { floor: power_floor, ceiling: power_ceiling };
-
+    let band = hr_power_band(s.ftp, s.power_zones, target.zone);
     let dt_secs = tick_ms as f64 / 1000.0;
     let new_power = pid.update(target_hr, smoothed_hr as f64, dt_secs, band);
 
@@ -678,6 +689,91 @@ mod tests {
 
     fn new_hr_pid(p0: u16) -> HrPid {
         HrPid::new(p0)
+    }
+
+    // --- AC2 / AC3: power band ---
+
+    const STD_PZ: [u16; 6] = [55, 75, 90, 105, 120, 150];
+
+    #[test]
+    fn custom_hr_zone_band_is_min_to_150pct_ftp() {
+        assert_eq!(
+            hr_power_band(Some(200), Some(STD_PZ), 0),
+            PowerBand { floor: 50, ceiling: 300 }
+        );
+    }
+
+    #[test]
+    fn custom_hr_zone_without_ftp_caps_at_400() {
+        assert_eq!(hr_power_band(None, Some(STD_PZ), 0), PowerBand { floor: 50, ceiling: 400 });
+    }
+
+    #[test]
+    fn hr_zone_3_band_spans_neighbouring_power_zones() {
+        // FTP 200: floor pz[1]=75% → 150, ceiling pz[3]=105% → 210
+        assert_eq!(
+            hr_power_band(Some(200), Some(STD_PZ), 3),
+            PowerBand { floor: 150, ceiling: 210 }
+        );
+    }
+
+    #[test]
+    fn custom_hr_150_160_commands_above_55pct_ftp() {
+        // FTP 200 → 55% = 110 W. HR well below a custom 150-160 target must push above it.
+        let target = ZoneTarget {
+            mode: ZoneMode::HeartRate,
+            zone: 0,
+            lower_bound: 150,
+            upper_bound: 160,
+            duration_secs: None,
+        };
+        let mut s = make_zone2_state(110);
+        let mut pid = HrPid::new(110);
+        let mut smoother = HrSmoother::new(5);
+        fill_smoother(&mut smoother, 120);
+        run_ticks(&mut s, &target, &mut pid, &smoother, 10);
+        assert!(s.commanded_power > 110, "custom zone stuck at {} W", s.commanded_power);
+    }
+
+    #[test]
+    fn hr_band_floor_never_exceeds_ceiling_for_any_ftp() {
+        let zone_sets = [Some(STD_PZ), Some([1, 2, 3, 4, 5, 6]), Some([900, 950, 960, 970, 980, 1000]), None];
+        for ftp in 1..=2000u16 {
+            for zone in 0..=7u8 {
+                for pz in zone_sets {
+                    let b = hr_power_band(Some(ftp), pz, zone);
+                    assert!(b.floor <= b.ceiling, "ftp={ftp} zone={zone} {b:?}");
+                    assert!(b.ceiling <= MAX_TRAINER_WATTS, "ftp={ftp} zone={zone} {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn initial_power_with_tiny_ftp_does_not_panic() {
+        // Old code: estimate.clamp(50, 1.2×FTP=1) panicked (min > max).
+        let target = ZoneTarget {
+            mode: ZoneMode::HeartRate,
+            zone: 3,
+            lower_bound: 130,
+            upper_bound: 140,
+            duration_secs: None,
+        };
+        assert_eq!(initial_power_for(&target, Some(1), Some(STD_PZ), Some(120)), 50);
+        assert_eq!(initial_power_for(&target, Some(1), Some(STD_PZ), None), 50);
+    }
+
+    #[test]
+    fn initial_power_estimate_clamped_into_hr_band() {
+        // FTP 200 zone 3 band [150, 210]; estimate 300 → capped at 1.2×FTP=240 → band 210
+        let target = ZoneTarget {
+            mode: ZoneMode::HeartRate,
+            zone: 3,
+            lower_bound: 130,
+            upper_bound: 140,
+            duration_secs: None,
+        };
+        assert_eq!(initial_power_for(&target, Some(200), Some(STD_PZ), Some(300)), 210);
     }
 
     // --- AC1: deterministic first-order-lag + delay HR plant simulation ---

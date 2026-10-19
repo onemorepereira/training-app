@@ -29,3 +29,7 @@ pub const RECONNECT_MAX_BACKOFF_MS: u64 = 30000;
 
 /// Reconnect backoff multiplier.
 pub const RECONNECT_BACKOFF_MULTIPLIER: u64 = 2;
+
+/// Highest target power ever sent to a trainer (watts). Every target-power
+/// command is clamped to [0, MAX_TRAINER_WATTS] in `DeviceManager::set_target_power`.
+pub const MAX_TRAINER_WATTS: u16 = 2000;

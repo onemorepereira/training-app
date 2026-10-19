@@ -15,7 +15,9 @@ use crate::session::storage::Storage;
 use crate::session::types::{SessionConfig, SessionSummary};
 use crate::session::analysis::{compute_hr_power_regression, TimeseriesPoint};
 use crate::session::zone_control::controller::ZoneController;
-use crate::session::zone_control::types::{StopReason, ZoneControlStatus, ZoneMode, ZoneTarget};
+use crate::session::zone_control::types::{
+    StopReason, ZoneControlStatus, ZoneMode, ZoneTarget, MAX_HR_BOUND,
+};
 
 /// Validate that a session ID from the frontend is a safe UUID string.
 /// Prevents path traversal via crafted IDs like "../../etc/passwd".
@@ -36,6 +38,32 @@ fn validate_zones_ascending<T: PartialOrd>(zones: &[T], label: &str) -> Result<(
                 label
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate a user config before saving (design ADR-9): FTP range, zone
+/// ordering, and per-value bounds the zone controller relies on.
+pub(crate) fn validate_user_config(config: &SessionConfig) -> Result<(), AppError> {
+    if !(50..=1000).contains(&config.ftp) {
+        return Err(AppError::Session(format!(
+            "FTP must be between 50 and 1000 W, got {}",
+            config.ftp
+        )));
+    }
+    validate_zones_ascending(&config.hr_zones, "HR zones")?;
+    validate_zones_ascending(&config.power_zones, "Power zones")?;
+    if let Some(&hr) = config.hr_zones.iter().find(|&&z| z as u16 > MAX_HR_BOUND) {
+        return Err(AppError::Session(format!(
+            "HR zone boundaries must be at most {} bpm, got {}",
+            MAX_HR_BOUND, hr
+        )));
+    }
+    if let Some(&pct) = config.power_zones.iter().find(|&&z| z == 0 || z > 1000) {
+        return Err(AppError::Session(format!(
+            "Power zone percentages must be between 1 and 1000, got {}",
+            pct
+        )));
     }
     Ok(())
 }
@@ -199,8 +227,7 @@ pub async fn save_user_config(
     state: State<'_, AppState>,
     config: SessionConfig,
 ) -> Result<(), AppError> {
-    validate_zones_ascending(&config.hr_zones, "HR zones")?;
-    validate_zones_ascending(&config.power_zones, "Power zones")?;
+    validate_user_config(&config)?;
     state
         .storage
         .save_user_config(&config)
@@ -412,13 +439,15 @@ pub async fn start_zone_control(
         "Start zone control: {:?} zone {} ({}-{})",
         target.mode, target.zone, target.lower_bound, target.upper_bound
     );
+    target.validate()?;
     let config = state.storage.get_user_config().await?;
     let ftp = Some(config.ftp);
     let max_hr = config.max_hr;
 
     // For HR mode, try to estimate initial power from historical data
     let initial_power_estimate = if target.mode == ZoneMode::HeartRate {
-        let target_hr = ((target.lower_bound + target.upper_bound) / 2) as u8;
+        // validate() caps HR bounds at 250, so the midpoint fits in u8
+        let target_hr = target.midpoint().min(u8::MAX as u16) as u8;
         match estimate_power_from_history(&state.storage, target_hr).await {
             Ok(v) => v,
             Err(e) => {
@@ -630,6 +659,47 @@ mod tests {
     #[test]
     fn rejects_null_bytes() {
         assert!(validate_session_id("abc\0def").is_err());
+    }
+
+    // --- validate_user_config ---
+
+    fn config_with_ftp(ftp: u16) -> SessionConfig {
+        SessionConfig { ftp, ..SessionConfig::default() }
+    }
+
+    #[test]
+    fn ftp_below_50_rejected() {
+        let msg = validate_user_config(&config_with_ftp(49)).unwrap_err().to_string();
+        assert!(msg.contains("FTP must be between 50 and 1000 W, got 49"), "{msg}");
+        assert!(validate_user_config(&config_with_ftp(50)).is_ok());
+    }
+
+    #[test]
+    fn ftp_above_1000_rejected() {
+        assert!(validate_user_config(&config_with_ftp(1001)).is_err());
+        assert!(validate_user_config(&config_with_ftp(1000)).is_ok());
+    }
+
+    #[test]
+    fn non_increasing_hr_zones_rejected() {
+        let mut c = SessionConfig::default();
+        c.hr_zones = [120, 140, 140, 175, 190];
+        assert!(validate_user_config(&c).is_err());
+    }
+
+    #[test]
+    fn hr_zone_above_250_rejected() {
+        let mut c = SessionConfig::default();
+        c.hr_zones = [120, 140, 160, 175, 251];
+        let msg = validate_user_config(&c).unwrap_err().to_string();
+        assert!(msg.contains("at most 250 bpm, got 251"), "{msg}");
+    }
+
+    #[test]
+    fn zero_power_zone_percentage_rejected() {
+        let mut c = SessionConfig::default();
+        c.power_zones = [0, 75, 90, 105, 120, 150];
+        assert!(validate_user_config(&c).is_err());
     }
 
     // --- validate_zones_ascending ---
