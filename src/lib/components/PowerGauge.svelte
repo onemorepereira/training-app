@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import * as echarts from 'echarts';
+  import { createDisposeGuard } from '$lib/utils/disposeGuard';
 
   let { power = null, ftp = 200 }: {
     power?: number | null;
@@ -8,6 +9,7 @@
   } = $props();
 
   let chartEl: HTMLDivElement;
+  const guard = createDisposeGuard();
   let chart = $state<echarts.ECharts | null>(null);
 
   const maxPower = () => Math.max(ftp * 1.5, 500);
@@ -73,24 +75,24 @@
   }
 
   onMount(() => {
-    let observer: ResizeObserver;
     document.fonts.ready.then(() => {
-      chart = echarts.init(chartEl, undefined, { renderer: 'canvas' });
+      // Fonts may resolve after unmount: don't create a chart nobody will dispose.
+      if (guard.disposed) return;
+      const instance = echarts.init(chartEl, undefined, { renderer: 'canvas' });
+      chart = instance;
+      guard.add(() => { instance.dispose(); chart = null; });
       chart.setOption({
         backgroundColor: 'transparent',
         ...getOption(power ?? 0),
       });
 
-      observer = new ResizeObserver(() => chart?.resize());
+      const observer = new ResizeObserver(() => chart?.resize());
       observer.observe(chartEl);
+      guard.add(() => observer.disconnect());
     });
-
-    return () => observer?.disconnect();
   });
 
-  onDestroy(() => {
-    chart?.dispose();
-  });
+  onDestroy(() => guard.dispose());
 
   $effect(() => {
     if (chart) {

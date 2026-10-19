@@ -4,6 +4,7 @@
   import SetupBanner from '$lib/components/SetupBanner.svelte';
   import { listen } from '@tauri-apps/api/event';
   import { onMount, onDestroy } from 'svelte';
+  import { createDisposeGuard } from '$lib/utils/disposeGuard';
   import {
     connectedDevices,
     refreshDevices,
@@ -20,7 +21,7 @@
   let sensorPreview = $state<Record<string, string>>({});
   let primaryDevices = $state<Record<string, string>>({});
   let pedalLabels = $state<Record<string, string>>({});
-  let unlisten: (() => void) | null = null;
+  const guard = createDisposeGuard();
 
   let detailModal = $state<DeviceDetails | null>(null);
   let detailLoading = $state('');
@@ -40,7 +41,8 @@
       primaryDevices = await api.getPrimaryDevices();
     } catch { /* no primaries yet */ }
 
-    unlisten = await listen<SensorReading>('sensor_reading', (event) => {
+    if (guard.disposed) return;
+    const unlisten = await listen<SensorReading>('sensor_reading', (event) => {
       const r = event.payload;
       if (r.Power) {
         sensorPreview['Power'] = `${r.Power.watts}W`;
@@ -61,9 +63,11 @@
       }
       sensorPreview = { ...sensorPreview };
     });
+    // Runs immediately if the page was left while listen() was pending.
+    guard.add(unlisten);
   });
 
-  onDestroy(() => { unlisten?.(); });
+  onDestroy(() => guard.dispose());
 
   async function scan() {
     scanning = true;

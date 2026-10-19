@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import * as echarts from 'echarts';
+  import { createDisposeGuard } from '$lib/utils/disposeGuard';
   import type { PowerCurvePoint } from '$lib/tauri';
 
   interface OverlaySeries {
@@ -18,6 +19,7 @@
   let { powerCurve, ftp = null, overlays = [] }: Props = $props();
 
   let chartEl: HTMLDivElement;
+  const guard = createDisposeGuard();
   let chart = $state<echarts.ECharts | null>(null);
 
   function formatDuration(secs: number): string {
@@ -82,21 +84,21 @@
   }
 
   onMount(() => {
-    let observer: ResizeObserver;
     document.fonts.ready.then(() => {
-      chart = echarts.init(chartEl, undefined, { renderer: 'canvas' });
+      // Fonts may resolve after unmount: don't create a chart nobody will dispose.
+      if (guard.disposed) return;
+      const instance = echarts.init(chartEl, undefined, { renderer: 'canvas' });
+      chart = instance;
+      guard.add(() => { instance.dispose(); chart = null; });
       chart.setOption(getBaseOption());
 
-      observer = new ResizeObserver(() => chart?.resize());
+      const observer = new ResizeObserver(() => chart?.resize());
       observer.observe(chartEl);
+      guard.add(() => observer.disconnect());
     });
-
-    return () => observer?.disconnect();
   });
 
-  onDestroy(() => {
-    chart?.dispose();
-  });
+  onDestroy(() => guard.dispose());
 
   $effect(() => {
     const curve = powerCurve;
