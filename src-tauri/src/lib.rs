@@ -282,25 +282,21 @@ pub fn run() {
                             let report =
                                 DeviceManager::watchdog_tick(&dm, &sensor_tx_clone).await;
 
-                            for id in &report.disconnected {
-                                let _ = handle.emit("device_disconnected", id);
-                            }
-                            for id in &report.reconnected {
-                                let _ = handle.emit("device_reconnected", id);
-                            }
-                            if report.list_changed() {
-                                let all = dm.lock().await.list_current().await;
-                                let _ = handle.emit("device_list_updated", &all);
-                            }
-                            for (info, attempt) in &report.reconnecting {
-                                let _ = handle.emit(
-                                    "device_reconnecting",
-                                    &serde_json::json!({
-                                        "device_id": info.id,
-                                        "device_type": info.device_type.as_str(),
-                                        "attempt": attempt,
-                                    }),
-                                );
+                            use crate::device::manager::DeviceEvent;
+                            for event in DeviceManager::report_events(&dm, report).await {
+                                let _ = match event {
+                                    DeviceEvent::Disconnected(id) => handle.emit("device_disconnected", &id),
+                                    DeviceEvent::Reconnected(id) => handle.emit("device_reconnected", &id),
+                                    DeviceEvent::ListUpdated(all) => handle.emit("device_list_updated", &all),
+                                    DeviceEvent::Reconnecting { device_id, device_type, attempt } => handle.emit(
+                                        "device_reconnecting",
+                                        &serde_json::json!({
+                                            "device_id": device_id,
+                                            "device_type": device_type,
+                                            "attempt": attempt,
+                                        }),
+                                    ),
+                                };
                             }
                         }
                     });

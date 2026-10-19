@@ -100,12 +100,13 @@ pub async fn connect_device(
 ) -> Result<DeviceInfo, AppError> {
     info!("Connecting device: {}", device_id);
     let tx = state.sensor_tx.clone();
-    let info = DeviceManager::connect_shared(&state.device_manager, &device_id, tx).await?;
+    let result = DeviceManager::connect_shared(&state.device_manager, &device_id, tx).await;
 
+    // Emit on success and failure: a failed connect can change the device's status.
     let all = state.device_manager.lock().await.list_current().await;
     let _ = app.emit("device_list_updated", &all);
 
-    Ok(info)
+    result
 }
 
 #[tauri::command]

@@ -619,3 +619,11 @@ Run any group with `cargo test --lib <path>`. Paths below are relative to `devic
 - The 3-octet 0x2AD6 scaling.
 - FE-C ack timing at 4 Hz.
 - BLE CPS crank data from real pedals.
+
+## Verify-review follow-ups (rev 4)
+
+- **Emitted list timing.** `WatchdogReport.list_dirty` replaces "any disconnect/reconnect". It is set by stale, recovery, Lost and reconnect transitions, whose displayed status is final. It is **not** set by a give-up: the give-up teardown task sets it after the channel is closed and the record is removed, so the list is sent on the next tick and shows `Disconnected`. `DeviceManager::report_events` turns a report into the ordered `DeviceEvent`s that `lib.rs` emits 1:1. Tests capture that sequence with real SQLite storage (`ui_event_tests`).
+- **Failed manual connect (ruling supersedes the slice-3 note).** A failed manual connect of a Reconnecting device keeps it Reconnecting and re-registers its auto-reconnect target. `connect_device` emits `device_list_updated` on the error path too. Test: `failed_manual_connect_keeps_reconnect_target_and_reconnecting`. The earlier `manual_connect_failure_drops_reconnecting_record` is removed.
+- **Disconnect of Reconnecting devices** works for searching ANT+ channels (closed) and torn-down BLE devices (reconnect target cleared). Tests: `disconnect_stale_ant_closes_channel_and_clears_state`, `disconnect_reconnecting_ble_clears_reconnect_target`. The UI action is Area D's.
+- **`ant_give_up` is a `DeviceManager` field** (default `ANT_GIVE_UP`), so storage-backed tests can run on the real clock without sleeping.
+- **Accepted, documented.** Trainer commands still hold the DM lock across the FE-C ack wait: ≤ 600 ms per attempt, plus one retry unless the trainer is stale.
