@@ -16,6 +16,10 @@ pub const HR_MAX_WATTS_UP_RECOVERY_PER_TICK: f64 = 20.0;
 pub const HR_MAX_WATTS_DOWN_PER_TICK: f64 = 30.0;
 /// Integral decay factor when HR is above target but already falling
 pub const INTEGRAL_DECAY_ON_FALLING_HR: f64 = 0.7;
+/// Errors within ±this many bpm are treated as zero for P and I, so ±3 bpm
+/// sensor noise (±1–2 bpm after the median filter) doesn't hunt the power
+/// (design ADR-27; tuned against the noisy plant grid).
+pub const HR_ERROR_DEADBAND_BPM: f64 = 1.0;
 
 /// Inclusive power band the controller may command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +60,8 @@ impl HrPid {
         if !(dt_secs > 0.0) || !dt_secs.is_finite() || !measured_hr.is_finite() {
             return self.last_output as u16;
         }
-        let error = target_hr - measured_hr;
+        let raw_error = target_hr - measured_hr;
+        let error = if raw_error.abs() <= HR_ERROR_DEADBAND_BPM { 0.0 } else { raw_error };
         let (kp, ki, kd) = adaptive_gains(error.abs());
 
         // Decay integral when HR is above target and falling tick-over-tick
@@ -208,6 +213,27 @@ mod tests {
             tail.iter().all(|&w| w == tail[0]),
             "power must be constant with zero error, got {tail:?}"
         );
+    }
+
+    #[test]
+    fn hr_pid_ignores_error_within_1bpm_deadband() {
+        // Settle with some integral, then HR 1 bpm off target either way:
+        // P and I see zero error, so power and integral stay put.
+        let mut pid = HrPid::new(150);
+        for _ in 0..3 {
+            pid.update(135.0, 125.0, 5.0, WIDE);
+        }
+        for _ in 0..20 {
+            pid.update(135.0, 135.0, 5.0, WIDE);
+        }
+        let (w, i) = (pid.last_output(), pid.integral());
+        assert_eq!(pid.update(135.0, 136.0, 5.0, WIDE), w); // D = −0.3·1/5 = −0.06 → rounds away
+        assert_eq!(pid.update(135.0, 135.0, 5.0, WIDE), w);
+        assert_eq!(pid.update(135.0, 134.0, 5.0, WIDE), w);
+        assert_approx(pid.integral(), i, 1e-9, "integral unchanged inside deadband");
+        // 2 bpm off is outside the deadband: I moves by 0.0125·2·5 = 0.125
+        pid.update(135.0, 133.0, 5.0, WIDE);
+        assert_approx(pid.integral(), i + 0.125, 1e-9, "integral moves outside deadband");
     }
 
     #[test]

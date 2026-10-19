@@ -347,6 +347,8 @@ impl<B: TrainerBackend> ZoneController<B> {
     }
 
     /// Whether the latest run's final 0 W release was confirmed.
+    /// (Used by tests; the production path reports it in the log.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn last_release_confirmed(&self) -> Option<bool> {
         let run = self.current_run()?;
         let confirmed = run.state.lock().await.release_confirmed;
@@ -1187,11 +1189,12 @@ mod tests {
 
     // --- AC1: deterministic first-order-lag + delay HR plant simulation ---
 
-    struct PlantParams {
-        tau_s: f64,
-        delay_s: f64,
-        gain_bpm_per_w: f64,
-        rest_bpm: f64,
+    #[derive(Clone)]
+    pub(crate) struct PlantParams {
+        pub(crate) tau_s: f64,
+        pub(crate) delay_s: f64,
+        pub(crate) gain_bpm_per_w: f64,
+        pub(crate) rest_bpm: f64,
     }
 
     struct SimResult {
@@ -1203,54 +1206,88 @@ mod tests {
     /// Simulates `minutes` of riding: HR follows a first-order lag of the
     /// commanded power delayed by `delay_s`. HR is sampled at 1 Hz into a
     /// real HrSmoother; the controller ticks every 5 s. No clock involved.
-    fn simulate_hr_plant(p: &PlantParams, start_hr: f64, minutes: u32) -> SimResult {
-        let target = ZoneTarget {
+    /// Deterministic HR plant: first-order lag of power delayed by `delay_s`,
+    /// sampled at 1 Hz with optional seeded ±3 bpm measurement noise.
+    pub(crate) struct Plant {
+        p: PlantParams,
+        hr: f64,
+        delay_line: std::collections::VecDeque<f64>,
+        rng: Option<u64>,
+    }
+
+    impl Plant {
+        /// `hr0` is the starting HR; `prior_power` is what was driving the plant
+        /// before t=0 (steady start when it matches hr0, rising when higher).
+        pub(crate) fn new(p: PlantParams, hr0: f64, prior_power: f64, noise_seed: Option<u64>) -> Self {
+            let steps = (p.delay_s / 0.1).round() as usize;
+            Self {
+                delay_line: std::iter::repeat(prior_power).take(steps + 1).collect(),
+                p,
+                hr: hr0,
+                rng: noise_seed,
+            }
+        }
+
+        fn noise(&mut self) -> f64 {
+            // 64-bit LCG (Knuth MMIX); uniform integer in [-3, 3]
+            let Some(state) = self.rng.as_mut() else { return 0.0 };
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*state >> 33) % 7) as f64 - 3.0
+        }
+
+        /// Advance one second under `power`; returns the 1 Hz HR sample.
+        pub(crate) fn step_second(&mut self, power: u16) -> u8 {
+            for _ in 0..10 {
+                let delayed = self.delay_line.pop_front().unwrap();
+                self.delay_line.push_back(power as f64);
+                self.hr += (self.p.rest_bpm + self.p.gain_bpm_per_w * delayed - self.hr) / self.p.tau_s * 0.1;
+            }
+            let n = self.noise();
+            (self.hr + n).round().clamp(0.0, 255.0) as u8
+        }
+    }
+
+    pub(crate) fn steady_power(p: &PlantParams, hr: f64) -> f64 {
+        (hr - p.rest_bpm) / p.gain_bpm_per_w
+    }
+
+    fn sim_target() -> ZoneTarget {
+        ZoneTarget {
             mode: ZoneMode::HeartRate,
             zone: 0,
             lower_bound: 130,
             upper_bound: 140,
             duration_secs: None,
-        };
-        // Start in steady state at start_hr: P0 = (HR - rest) / gain
-        let p0 = ((start_hr - p.rest_bpm) / p.gain_bpm_per_w).round() as u16;
+        }
+    }
+
+    /// Drives the real `process_hr_tick` every 5 s. No clock involved.
+    fn simulate_hr_plant(plant: &mut Plant, initial_power: u16, minutes: u32) -> SimResult {
+        let target = sim_target();
         let mut s = ControlLoopState::new();
         s.active = true;
-        s.commanded_power = p0;
+        s.commanded_power = initial_power;
         s.ftp = Some(250); // band [50, 375]
         s.power_zones = None;
-        let mut pid = new_hr_pid(p0);
+        let mut pid = new_hr_pid(initial_power);
         let mut smoother = HrSmoother::new(5);
-
-        let dt = 0.1;
-        let delay_steps = (p.delay_s / dt).round() as usize;
-        let mut delay_line: std::collections::VecDeque<f64> =
-            std::iter::repeat(p0 as f64).take(delay_steps + 1).collect();
-        let mut hr = start_hr;
         let mut peak_hr = 0u8;
         let mut ticks = Vec::new();
-        let total_steps = (minutes as usize) * 60 * 10;
-        for step in 1..=total_steps {
-            let delayed = delay_line.pop_front().unwrap();
-            delay_line.push_back(s.commanded_power as f64);
-            hr += (p.rest_bpm + p.gain_bpm_per_w * delayed - hr) / p.tau_s * dt;
-            if step % 10 == 0 {
-                smoother.push(hr.round() as u8);
-            }
-            if step % 50 == 0 {
+        for sec in 1..=(minutes as u64 * 60) {
+            smoother.push(plant.step_second(s.commanded_power));
+            if sec % 5 == 0 {
                 if let Some(w) = process_hr_tick(&mut s, &target, &mut pid, &smoother, 5000) {
                     s.commanded_power = w;
                 }
                 let sm = smoother.smoothed().unwrap();
                 peak_hr = peak_hr.max(sm);
-                ticks.push((step as f64 * dt, sm, s.commanded_power));
+                ticks.push((sec as f64, sm, s.commanded_power));
             }
         }
         SimResult { peak_hr, ticks }
     }
 
-    fn assert_settles_without_overshoot(p: &PlantParams, label: &str) {
-        let minutes = 20;
-        let r = simulate_hr_plant(p, 115.0, minutes);
+    fn assert_sim_passes(r: &SimResult, minutes: u32, label: &str) {
         let end = (minutes * 60) as f64;
         // Overshoot bound: one zone half-width (5 bpm) above the 135 midpoint
         assert!(
@@ -1274,6 +1311,42 @@ mod tests {
             .collect();
         let swing = last.iter().max().unwrap() - last.iter().min().unwrap();
         assert!(swing <= 10, "{label}: power swing {swing} W in last 5 min");
+    }
+
+    fn assert_settles_without_overshoot(p: &PlantParams, label: &str) {
+        // Steady start 20 bpm below the 135 target
+        let p0 = steady_power(p, 115.0);
+        let mut plant = Plant::new(p.clone(), 115.0, p0, None);
+        let r = simulate_hr_plant(&mut plant, p0.round() as u16, 20);
+        assert_sim_passes(&r, 20, label);
+    }
+
+    fn sim_grid() -> Vec<PlantParams> {
+        let mut v = Vec::new();
+        for tau_s in [30.0, 60.0, 90.0] {
+            for delay_s in [5.0, 15.0, 25.0] {
+                for gain in [0.25, 0.35] {
+                    v.push(PlantParams { tau_s, delay_s, gain_bpm_per_w: gain, rest_bpm: 60.0 });
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn hr_plant_noisy_rising_start_settles_across_grid() {
+        // HR 30 bpm below target and already rising (prior power drives toward
+        // 125 bpm), with seeded ±3 bpm measurement noise. Same pass criteria.
+        for (i, p) in sim_grid().into_iter().enumerate() {
+            let prior = steady_power(&p, 125.0);
+            let mut plant = Plant::new(p.clone(), 105.0, prior, Some(0x5eed_0000 + i as u64));
+            let r = simulate_hr_plant(&mut plant, prior.round() as u16, 20);
+            assert_sim_passes(
+                &r,
+                20,
+                &format!("noisy rising tau={} delay={} gain={}", p.tau_s, p.delay_s, p.gain_bpm_per_w),
+            );
+        }
     }
 
     #[test]
@@ -1905,6 +1978,74 @@ pub(crate) mod task_tests {
         assert!(st.active);
         assert_eq!(st.stop_reason, None);
         assert_eq!(st.lower_bound, Some(300));
+    }
+
+    // --- AC1 through the full control-task tick path ---
+
+    #[tokio::test(start_paused = true)]
+    async fn hr_plant_noisy_rising_start_settles_through_on_tick() {
+        use super::tests::{steady_power, Plant, PlantParams};
+        let p = PlantParams { tau_s: 60.0, delay_s: 15.0, gain_bpm_per_w: 0.35, rest_bpm: 60.0 };
+        let prior = steady_power(&p, 125.0);
+        let initial = prior.round() as u16;
+        let mut plant = Plant::new(p, 105.0, prior, Some(0xC0FFEE));
+
+        let fake = FakeTrainer::new();
+        let target = ZoneTarget {
+            mode: ZoneMode::HeartRate,
+            zone: 0,
+            lower_bound: 130,
+            upper_bound: 140,
+            duration_secs: None,
+        };
+        let now = Instant::now();
+        let mut st = ControlLoopState::new();
+        st.active = true;
+        st.target = Some(target.clone());
+        st.commanded_power = initial;
+        st.started_at = Some(now);
+        st.last_tick_at = Some(now);
+        st.last_hr_seen = Some(now);
+        st.ftp = Some(250);
+        let (tx, _) = broadcast::channel(16);
+        let mut lp = ControlLoop::new(
+            1,
+            Arc::new(Mutex::new(st)),
+            target,
+            Arc::new(SerializedSink::new(fake.clone())),
+            tx,
+            initial,
+        );
+        assert_eq!(lp.step(Step::Initial).await, None);
+
+        let minutes = 20u64;
+        let mut ticks: Vec<(u64, u8, u16)> = Vec::new();
+        let mut peak = 0u8;
+        for sec in 1..=minutes * 60 {
+            let delivered = match lp.delivered {
+                Delivered::Watts(w) => w,
+                _ => 0,
+            };
+            let sample = plant.step_second(delivered);
+            lp.on_reading(hr(sample)).await;
+            lp.on_reading(cadence(90.0)).await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+            if sec % 5 == 0 {
+                assert_eq!(lp.on_tick().await, None, "control stopped at t={sec}s");
+                let sm = lp.smoother.smoothed().unwrap();
+                peak = peak.max(sm);
+                ticks.push((sec, sm, lp.state.lock().await.commanded_power));
+            }
+        }
+        assert!(peak <= 140, "overshoot: peak smoothed HR {peak}");
+        for &(t, h, _) in ticks.iter().filter(|x| x.0 > minutes * 60 - 600) {
+            assert!((130..=140).contains(&h), "HR {h} outside band at t={t}s");
+        }
+        let last: Vec<u16> = ticks.iter().filter(|x| x.0 > minutes * 60 - 300).map(|x| x.2).collect();
+        let swing = last.iter().max().unwrap() - last.iter().min().unwrap();
+        assert!(swing <= 10, "power swing {swing} W in last 5 min");
+        // Every tick's command really reached the (fake) trainer
+        assert_eq!(fake.commands().last(), Some(&TrainerCmd::Power(*last.last().unwrap())));
     }
 
     // --- ADR-26: closing flag ---
