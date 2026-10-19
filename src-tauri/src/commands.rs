@@ -13,7 +13,7 @@ use crate::session::analysis::{self, PowerCurvePoint, SessionAnalysis};
 use crate::session::fit_export;
 use crate::session::manager::SessionManager;
 use crate::session::storage::Storage;
-use crate::session::types::{SessionConfig, SessionSummary};
+use crate::session::types::{ActiveSessionStatus, SessionConfig, SessionSummary};
 use crate::session::analysis::{compute_hr_power_regression, TimeseriesPoint};
 use crate::session::zone_control::controller::ZoneController;
 use crate::session::zone_control::lifecycle as zone_lifecycle;
@@ -163,6 +163,15 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSu
     }
 
     Ok(result.map(|(summary, _)| summary))
+}
+
+/// Status of the in-progress session (None if none). Lets the UI recover its
+/// session state after a webview reload.
+#[tauri::command]
+pub async fn get_session_status(
+    state: State<'_, AppState>,
+) -> Result<Option<ActiveSessionStatus>, AppError> {
+    Ok(state.session_manager.status().await)
 }
 
 #[tauri::command]

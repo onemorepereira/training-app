@@ -6,6 +6,7 @@
   import { refreshDevices, connectedDevices, handleDeviceDisconnected, handleDeviceReconnecting, handleDeviceReconnected } from '$lib/stores/devices';
   import type { DeviceInfo } from '$lib/tauri';
   import { initAutoSession, destroyAutoSession } from '$lib/stores/autoSession';
+  import { rehydrateSession } from '$lib/stores/sessionLifecycle';
   import { unitSystem } from '$lib/stores/units';
   import { api } from '$lib/tauri';
   import { listen } from '@tauri-apps/api/event';
@@ -19,6 +20,8 @@
 
   onMount(() => {
     startSensorListening();
+    // Recover a running/paused session after a webview reload.
+    rehydrateSession();
     refreshDevices();
     initAutoSession();
     api.getUserConfig().then((cfg) => {

@@ -1,11 +1,12 @@
 import { writable, get } from 'svelte/store';
 import { api, extractError, type SessionSummary } from '$lib/tauri';
-import { requestStart, requestStop } from '$lib/stores/session';
+import { requestStart, requestStop, sessionActive, sessionId, sessionPaused } from '$lib/stores/session';
 import { metricHistory } from '$lib/stores/sensor';
 import {
   zoneStatus,
   zoneRideResult,
   finishZoneRide,
+  startZonePolling,
   stopZonePolling,
 } from '$lib/stores/zoneRide';
 
@@ -79,4 +80,28 @@ async function doEndSession(): Promise<SessionSummary | null> {
 
   postRideSession.set(summary);
   return summary;
+}
+
+/**
+ * Restore session UI state from the backend (e.g. after a webview reload while a
+ * ride is running), including an active zone ride so it can still be stopped and saved.
+ */
+export async function rehydrateSession(): Promise<void> {
+  try {
+    const status = await api.getSessionStatus();
+    if (!status) return;
+    sessionId.set(status.session_id);
+    sessionPaused.set(status.paused);
+    sessionActive.set(true);
+
+    const zone = await api.getZoneControlStatus();
+    if (zone.active) {
+      zoneStatus.set(zone);
+      startZonePolling();
+    }
+  } catch (e) {
+    const msg = extractError(e);
+    console.error('Session rehydration failed:', msg);
+    lifecycleError.set(`Could not restore session state: ${msg}`);
+  }
 }

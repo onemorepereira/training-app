@@ -67,6 +67,12 @@ export interface SessionSummary {
   zones?: ZoneSnapshot | null;
 }
 
+/** In-progress session as reported by `get_session_status`. */
+export interface ActiveSessionStatus {
+  session_id: string;
+  paused: boolean;
+}
+
 export interface SessionConfig {
   ftp: number;
   weight_kg: number;
@@ -227,6 +233,7 @@ export const api = {
   disconnectDevice: (deviceId: string) => invoke<void>('disconnect_device', { deviceId }),
   startSession: () => invoke<string>('start_session'),
   stopSession: () => invoke<SessionSummary | null>('stop_session'),
+  getSessionStatus: () => invoke<ActiveSessionStatus | null>('get_session_status'),
   pauseSession: () => invoke<void>('pause_session'),
   resumeSession: () => invoke<void>('resume_session'),
   listSessions: () => invoke<SessionSummary[]>('list_sessions'),

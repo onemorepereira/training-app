@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { get } from 'svelte/store';
 import { activeZoneStatus, summary, deferred } from '$lib/test/fixtures';
 
@@ -19,7 +19,7 @@ vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) })
 import { sessionActive, sessionId, sessionPaused } from './session';
 import { metricHistory } from './sensor';
 import { zoneStatus, zoneRideResult, stopZonePolling } from './zoneRide';
-import { endSession, startSession, postRideSession, lifecycleError } from './sessionLifecycle';
+import { endSession, startSession, rehydrateSession, postRideSession, lifecycleError } from './sessionLifecycle';
 
 const ZONE_CONFIG = {
   mode: 'Power' as const,
@@ -198,5 +198,66 @@ describe('startSession', () => {
 
     await expect(startSession()).rejects.toEqual({ message: 'no' });
     expect(get(zoneRideResult)).toEqual(held);
+  });
+});
+
+describe('rehydrateSession', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    api.getZoneControlStatus.mockResolvedValue({ ...activeZoneStatus(), active: false });
+  });
+  afterEach(() => {
+    stopZonePolling();
+    vi.useRealTimers();
+  });
+
+  it('rehydrate_sets_active_paused_and_id', async () => {
+    api.getSessionStatus.mockResolvedValue({ session_id: 'live-7', paused: true });
+
+    await rehydrateSession();
+
+    expect(get(sessionActive)).toBe(true);
+    expect(get(sessionPaused)).toBe(true);
+    expect(get(sessionId)).toBe('live-7');
+  });
+
+  it('rehydrate_with_no_session_leaves_inactive', async () => {
+    api.getSessionStatus.mockResolvedValue(null);
+
+    await rehydrateSession();
+
+    expect(get(sessionActive)).toBe(false);
+    expect(get(sessionId)).toBeNull();
+    expect(api.getZoneControlStatus).not.toHaveBeenCalled();
+  });
+
+  it('rehydrate_starts_zone_polling_when_zone_active', async () => {
+    api.getSessionStatus.mockResolvedValue({ session_id: 'live-7', paused: false });
+    api.getZoneControlStatus.mockResolvedValue(activeZoneStatus());
+
+    await rehydrateSession();
+    expect(get(zoneStatus)?.active).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(api.getZoneControlStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('rehydrate_failure_surfaces_error', async () => {
+    api.getSessionStatus.mockRejectedValue({ message: 'ipc down' });
+
+    await rehydrateSession();
+
+    expect(get(lifecycleError)).toBe('Could not restore session state: ipc down');
+    expect(get(sessionActive)).toBe(false);
+  });
+
+  it('stop_after_rehydrate_calls_stop_session', async () => {
+    api.getSessionStatus.mockResolvedValue({ session_id: 'abc-1', paused: true });
+    await rehydrateSession();
+
+    await endSession();
+
+    expect(api.stopSession).toHaveBeenCalledTimes(1);
+    expect(get(postRideSession)?.id).toBe('abc-1');
   });
 });
