@@ -1,6 +1,10 @@
 use log::debug;
+use std::time::Instant;
 
 use crate::device::types::SensorReading;
+
+/// FE-C page 0x19 instantaneous power sentinel (12 bits all set).
+const FEC_POWER_INVALID: u16 = 0x0FFF;
 
 /// Default wheel circumference in mm (700x25c)
 pub const DEFAULT_WHEEL_CIRCUMFERENCE_MM: u32 = 2105;
@@ -26,15 +30,50 @@ pub struct AntDecoder {
     prev_power_accumulated: u16,
     power_initialized: bool,
 
-    // Cadence profile state
-    prev_cadence_event_time: u16,
-    prev_cadence_revs: u16,
-    cadence_initialized: bool,
+    // Cadence (122, or the cadence half of a combined 121 sensor)
+    cadence: Rev16,
+    // Speed (123, or the speed half of a combined 121 sensor)
+    speed: Rev16,
+}
 
-    // Speed profile state
-    prev_speed_event_time: u16,
-    prev_speed_revs: u16,
-    speed_initialized: bool,
+/// After this long without a new revolution event while pages keep arriving,
+/// cadence/speed read 0 (same rule as the BLE CSC/CPS decoders).
+const ZERO_AFTER: std::time::Duration = crate::device::protocol::ZERO_AFTER;
+
+/// u16 cumulative revolution count + u16 event time (1/1024 s), both rolling over.
+#[derive(Debug, Default)]
+struct Rev16 {
+    prev: Option<(u16, u16)>,
+    last_event_at: Option<Instant>,
+}
+
+enum RevDelta {
+    /// First sample: state initialised, nothing to report.
+    Init,
+    Event { revs: u16, ticks: u16 },
+    /// No new event; `idle` once ZERO_AFTER has passed since the last one.
+    NoEvent { idle: bool },
+}
+
+impl Rev16 {
+    fn update(&mut self, revs: u16, event_time: u16, now: Instant) -> RevDelta {
+        let Some((prev_revs, prev_time)) = self.prev else {
+            self.prev = Some((revs, event_time));
+            self.last_event_at = Some(now);
+            return RevDelta::Init;
+        };
+        let ticks = event_time.wrapping_sub(prev_time);
+        let rev_diff = revs.wrapping_sub(prev_revs);
+        if ticks == 0 || rev_diff == 0 {
+            let idle = self
+                .last_event_at
+                .is_some_and(|t| now.saturating_duration_since(t) >= ZERO_AFTER);
+            return RevDelta::NoEvent { idle };
+        }
+        self.prev = Some((revs, event_time));
+        self.last_event_at = Some(now);
+        RevDelta::Event { revs: rev_diff, ticks }
+    }
 }
 
 impl AntDecoder {
@@ -75,7 +114,8 @@ impl AntDecoder {
 
         // Extract pedal balance from byte 2
         let pedal_power_byte = data[2];
-        let pedal_balance = if pedal_power_byte & 0x80 != 0 {
+        // 0xFF = pedal power not used (Bicycle Power Rev 5.0 Table 8-1)
+        let pedal_balance = if pedal_power_byte != 0xFF && pedal_power_byte & 0x80 != 0 {
             Some(pedal_power_byte & 0x7F) // right pedal contribution %
         } else {
             None
@@ -111,45 +151,111 @@ impl AntDecoder {
         })
     }
 
+    /// Decode a Bicycle Power page: Power, plus Cadence from page 0x10 byte 3
+    /// (instantaneous cadence 0-254 rpm, 0xFF = invalid; Bicycle Power D00001086
+    /// Rev 5.0 Table 8-1), emitted on the same new-event samples as power.
+    pub fn decode_power_page(&mut self, data: &[u8; 8], device_id: &str) -> Vec<SensorReading> {
+        let Some(power) = self.decode_power(data, device_id) else {
+            return vec![];
+        };
+        let mut out = vec![power];
+        let cadence = data[3];
+        if cadence != 0xFF {
+            out.push(SensorReading::Cadence {
+                rpm: cadence as f32,
+                timestamp: Some(std::time::Instant::now()),
+                epoch_ms: now_epoch_ms(),
+                device_id: device_id.to_string(),
+            });
+        }
+        out
+    }
+
     /// Decode ANT+ Cadence sensor data page (page 0 or default)
     /// Byte 4-5: cadence event time (1/1024 s, u16 LE)
     /// Byte 6-7: cumulative cadence revolutions (u16 LE)
     pub fn decode_cadence(&mut self, data: &[u8; 8], device_id: &str) -> Option<SensorReading> {
-        let event_time = u16::from_le_bytes([data[4], data[5]]);
-        let revs = u16::from_le_bytes([data[6], data[7]]);
-
-        if !self.cadence_initialized {
-            self.prev_cadence_event_time = event_time;
-            self.prev_cadence_revs = revs;
-            self.cadence_initialized = true;
-            return None;
-        }
-
-        let time_diff = event_time.wrapping_sub(self.prev_cadence_event_time);
-        let rev_diff = revs.wrapping_sub(self.prev_cadence_revs);
-        self.prev_cadence_event_time = event_time;
-        self.prev_cadence_revs = revs;
-
-        if time_diff == 0 || rev_diff == 0 {
-            return None;
-        }
-
-        let time_secs = time_diff as f32 / 1024.0;
-        let rpm = (rev_diff as f32 / time_secs) * 60.0;
-
-        if rpm > 200.0 || rpm < 0.0 {
-            debug!("ANT+ cadence: out-of-range {:.0} rpm from {}", rpm, device_id);
-            return None;
-        }
-
-        Some(SensorReading::Cadence {
-            rpm,
-            timestamp: Some(std::time::Instant::now()),
-            epoch_ms: now_epoch_ms(),
-            device_id: device_id.to_string(),
-        })
+        self.decode_cadence_at(data, device_id, Instant::now())
     }
 
+    pub fn decode_cadence_at(&mut self, data: &[u8; 8], device_id: &str, now: Instant) -> Option<SensorReading> {
+        let event_time = u16::from_le_bytes([data[4], data[5]]);
+        let revs = u16::from_le_bytes([data[6], data[7]]);
+        let delta = self.cadence.update(revs, event_time, now);
+        cadence_reading(delta, device_id, now)
+    }
+
+    /// Decode a combined Bike Speed & Cadence page (device type 121). The page has
+    /// no page-number byte: bytes 0-1 cadence event time, 2-3 cumulative cadence revs,
+    /// 4-5 speed event time, 6-7 cumulative wheel revs (all u16 LE, 1/1024 s).
+    pub fn decode_combined_sc(&mut self, data: &[u8; 8], device_id: &str, wheel_mm: u32) -> Vec<SensorReading> {
+        self.decode_combined_sc_at(data, device_id, wheel_mm, Instant::now())
+    }
+
+    pub fn decode_combined_sc_at(
+        &mut self,
+        data: &[u8; 8],
+        device_id: &str,
+        wheel_mm: u32,
+        now: Instant,
+    ) -> Vec<SensorReading> {
+        let cad_time = u16::from_le_bytes([data[0], data[1]]);
+        let cad_revs = u16::from_le_bytes([data[2], data[3]]);
+        let spd_time = u16::from_le_bytes([data[4], data[5]]);
+        let spd_revs = u16::from_le_bytes([data[6], data[7]]);
+        let cad = self.cadence.update(cad_revs, cad_time, now);
+        let spd = self.speed.update(spd_revs, spd_time, now);
+        speed_reading(spd, wheel_mm, device_id, now)
+            .into_iter()
+            .chain(cadence_reading(cad, device_id, now))
+            .collect()
+    }
+}
+
+fn cadence_reading(delta: RevDelta, device_id: &str, now: Instant) -> Option<SensorReading> {
+    let rpm = match delta {
+        RevDelta::Init | RevDelta::NoEvent { idle: false } => return None,
+        RevDelta::NoEvent { idle: true } => 0.0,
+        RevDelta::Event { revs, ticks } => {
+            let time_secs = ticks as f32 / 1024.0;
+            (revs as f32 / time_secs) * 60.0
+        }
+    };
+    if rpm > 200.0 || rpm < 0.0 {
+        debug!("ANT+ cadence: out-of-range {:.0} rpm from {}", rpm, device_id);
+        return None;
+    }
+    Some(SensorReading::Cadence {
+        rpm,
+        timestamp: Some(now),
+        epoch_ms: now_epoch_ms(),
+        device_id: device_id.to_string(),
+    })
+}
+
+fn speed_reading(delta: RevDelta, wheel_mm: u32, device_id: &str, now: Instant) -> Option<SensorReading> {
+    let kmh = match delta {
+        RevDelta::Init | RevDelta::NoEvent { idle: false } => return None,
+        RevDelta::NoEvent { idle: true } => 0.0,
+        RevDelta::Event { revs, ticks } => {
+            let time_secs = ticks as f64 / 1024.0;
+            let distance_m = revs as f64 * wheel_mm as f64 / 1000.0;
+            (distance_m / time_secs) * 3.6
+        }
+    };
+    if kmh > 120.0 || kmh < 0.0 {
+        debug!("ANT+ speed: out-of-range {:.1} km/h from {}", kmh, device_id);
+        return None;
+    }
+    Some(SensorReading::Speed {
+        kmh: kmh as f32,
+        timestamp: Some(now),
+        epoch_ms: now_epoch_ms(),
+        device_id: device_id.to_string(),
+    })
+}
+
+impl AntDecoder {
     /// Decode ANT+ Speed sensor data page
     /// Byte 4-5: speed event time (1/1024 s, u16 LE)
     /// Byte 6-7: cumulative wheel revolutions (u16 LE)
@@ -159,40 +265,20 @@ impl AntDecoder {
         device_id: &str,
         wheel_circumference_mm: u32,
     ) -> Option<SensorReading> {
+        self.decode_speed_at(data, device_id, wheel_circumference_mm, Instant::now())
+    }
+
+    pub fn decode_speed_at(
+        &mut self,
+        data: &[u8; 8],
+        device_id: &str,
+        wheel_circumference_mm: u32,
+        now: Instant,
+    ) -> Option<SensorReading> {
         let event_time = u16::from_le_bytes([data[4], data[5]]);
         let revs = u16::from_le_bytes([data[6], data[7]]);
-
-        if !self.speed_initialized {
-            self.prev_speed_event_time = event_time;
-            self.prev_speed_revs = revs;
-            self.speed_initialized = true;
-            return None;
-        }
-
-        let time_diff = event_time.wrapping_sub(self.prev_speed_event_time);
-        let rev_diff = revs.wrapping_sub(self.prev_speed_revs);
-        self.prev_speed_event_time = event_time;
-        self.prev_speed_revs = revs;
-
-        if time_diff == 0 || rev_diff == 0 {
-            return None;
-        }
-
-        let time_secs = time_diff as f64 / 1024.0;
-        let distance_m = rev_diff as f64 * wheel_circumference_mm as f64 / 1000.0;
-        let kmh = (distance_m / time_secs) * 3.6;
-
-        if kmh > 120.0 || kmh < 0.0 {
-            debug!("ANT+ speed: out-of-range {:.1} km/h from {}", kmh, device_id);
-            return None;
-        }
-
-        Some(SensorReading::Speed {
-            kmh: kmh as f32,
-            timestamp: Some(std::time::Instant::now()),
-            epoch_ms: now_epoch_ms(),
-            device_id: device_id.to_string(),
-        })
+        let delta = self.speed.update(revs, event_time, now);
+        speed_reading(delta, wheel_circumference_mm, device_id, now)
     }
 
     /// Decode ANT+ FE-C Specific Trainer Data page (0x19)
@@ -219,14 +305,17 @@ impl AntDecoder {
                 });
             }
 
+            // 12-bit power; 0xFFF = invalid (FE-C Rev 5.0 Table 8-25)
             let instant_power = u16::from_le_bytes([data[5], data[6]]) & 0x0FFF;
-            readings.push(SensorReading::Power {
-                watts: instant_power,
-                timestamp,
-                epoch_ms,
-                device_id: did,
-                pedal_balance: None,
-            });
+            if instant_power != FEC_POWER_INVALID {
+                readings.push(SensorReading::Power {
+                    watts: instant_power,
+                    timestamp,
+                    epoch_ms,
+                    device_id: did,
+                    pedal_balance: None,
+                });
+            }
         } else if page == 0x10 {
             // General FE Data
             let speed_raw = u16::from_le_bytes([data[4], data[5]]);
@@ -364,18 +453,29 @@ mod tests {
         }
     }
 
+    // FE-C D00001231 Rev 5.0 Table 8-25: instantaneous power is 12 bits (byte 5 + byte 6
+    // bits 0-3), range 0-4094 W; 0xFFF means instantaneous and accumulated power are invalid.
+    // Byte 6 bits 4-7 carry trainer status and must be masked off.
+
     #[test]
-    fn decode_fec_trainer_page_0x19_power_12bit_mask() {
+    fn fec_page_0x19_power_0xfff_yields_no_power_reading() {
         let decoder = AntDecoder::new();
-        // Test that upper 4 bits of byte[6] are masked off
-        // bytes [5..6] LE: [0xFF, 0xFF] → 0xFFFF & 0x0FFF = 4095W
+        // power bits 0xFFF; byte 6 upper nibble = trainer status 0xF
         let data: [u8; 8] = [0x19, 5, 80, 0, 0, 0xFF, 0xFF, 0x00];
         let readings = decoder.decode_fec_trainer(&data, "test");
-        assert_eq!(readings.len(), 2);
-        match &readings[1] {
-            SensorReading::Power { watts, .. } => {
-                assert_eq!(*watts, 4095, "12-bit mask should cap at 4095");
-            }
+        assert_eq!(readings.len(), 1, "only cadence should remain");
+        assert!(matches!(readings[0], SensorReading::Cadence { .. }));
+    }
+
+    #[test]
+    fn fec_page_0x19_power_4094_is_valid() {
+        let decoder = AntDecoder::new();
+        // bytes 5..6 = [0xFE, 0x3F]: power bits 0xFFE = 4094 W, status nibble 0x3 masked off
+        let data: [u8; 8] = [0x19, 5, 0xFF, 0, 0, 0xFE, 0x3F, 0x00];
+        let readings = decoder.decode_fec_trainer(&data, "test");
+        assert_eq!(readings.len(), 1);
+        match &readings[0] {
+            SensorReading::Power { watts, .. } => assert_eq!(*watts, 4094),
             other => panic!("expected Power, got {:?}", other),
         }
     }
@@ -513,7 +613,7 @@ mod tests {
         let mut decoder = AntDecoder::new();
         let data: [u8; 8] = [0x00, 0, 0, 0, 0x00, 0x04, 0x01, 0x00];
         assert!(decoder.decode_speed(&data, "test", 2105).is_none());
-        assert!(decoder.speed_initialized);
+        assert!(decoder.speed.prev.is_some(), "first page only initialises");
     }
 
     #[test]
@@ -610,5 +710,116 @@ mod tests {
         let readings2 = decoder.decode_fec_trainer(&data2, "test");
         assert_eq!(readings2.len(), 1); // speed only
         assert!(matches!(&readings2[0], SensorReading::Speed { .. }));
+    }
+
+    // ---- Bicycle Power page 0x10 cadence (D00001086 Rev 5.0 Table 8-1) ----
+
+    #[test]
+    fn ant_power_page_cadence_byte3() {
+        let mut decoder = AntDecoder::new();
+        // byte 3 = 87 rpm, power 0x00F0 = 240 W
+        let data: [u8; 8] = [0x10, 1, 0xFF, 87, 0, 0, 0xF0, 0x00];
+        let r = decoder.decode_power_page(&data, "pm");
+        assert_eq!(r.len(), 2);
+        assert!(matches!(r[0], SensorReading::Power { watts: 240, .. }));
+        match r[1] {
+            SensorReading::Cadence { rpm, .. } => assert!((rpm - 87.0).abs() < 0.01),
+            ref other => panic!("expected Cadence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ant_power_page_cadence_0xff_omitted() {
+        let mut decoder = AntDecoder::new();
+        let data: [u8; 8] = [0x10, 1, 0xFF, 0xFF, 0, 0, 0xF0, 0x00];
+        assert_eq!(decoder.decode_power_page(&data, "pm").len(), 1);
+    }
+
+    #[test]
+    fn ant_power_page_cadence_only_on_new_event() {
+        let mut decoder = AntDecoder::new();
+        let data: [u8; 8] = [0x10, 1, 0xFF, 87, 0, 0, 0xF0, 0x00];
+        decoder.decode_power_page(&data, "pm");
+        assert!(decoder.decode_power_page(&data, "pm").is_empty(), "same event count: nothing new");
+    }
+
+    #[test]
+    fn ant_power_pedal_power_0xff_is_none() {
+        let mut decoder = AntDecoder::new();
+        let data: [u8; 8] = [0x10, 1, 0xFF, 80, 0, 0, 0xC8, 0x00];
+        match decoder.decode_power(&data, "pm").unwrap() {
+            SensorReading::Power { pedal_balance, .. } => assert_eq!(pedal_balance, None),
+            other => panic!("expected Power, got {:?}", other),
+        }
+    }
+
+    // ---- Combined Bike Speed & Cadence (device type 121) ----
+
+    fn combo(ct: u16, cr: u16, st: u16, sr: u16) -> [u8; 8] {
+        let (a, b, c, d) = (ct.to_le_bytes(), cr.to_le_bytes(), st.to_le_bytes(), sr.to_le_bytes());
+        [a[0], a[1], b[0], b[1], c[0], c[1], d[0], d[1]]
+    }
+
+    fn base() -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now)
+    }
+
+    fn at(secs: f64) -> Instant {
+        base() + std::time::Duration::from_secs_f64(secs)
+    }
+
+    #[test]
+    fn combined_sc_first_page_initialises() {
+        let mut d = AntDecoder::new();
+        assert!(d.decode_combined_sc_at(&combo(3072, 3, 3072, 3), "sc", 2105, at(0.0)).is_empty());
+    }
+
+    #[test]
+    fn combined_sc_speed_and_cadence_from_one_page() {
+        let mut d = AntDecoder::new();
+        d.decode_combined_sc_at(&combo(0, 0, 0, 0), "sc", 2105, at(0.0));
+        // 1 crank rev and 1 wheel rev in 1024 ticks (1 s): 60 rpm, 2.105 m/s = 7.578 km/h
+        let r = d.decode_combined_sc_at(&combo(1024, 1, 1024, 1), "sc", 2105, at(1.0));
+        assert_eq!(r.len(), 2);
+        match (&r[0], &r[1]) {
+            (SensorReading::Speed { kmh, .. }, SensorReading::Cadence { rpm, .. }) => {
+                assert!((kmh - 7.578).abs() < 0.01, "speed {}", kmh);
+                assert!((rpm - 60.0).abs() < 0.01, "cadence {}", rpm);
+            }
+            other => panic!("expected Speed + Cadence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn combined_sc_counter_rollover() {
+        let mut d = AntDecoder::new();
+        d.decode_combined_sc_at(&combo(0xFC00, 0xFFFF, 0xFFF0, 0xFFFF), "sc", 2105, at(0.0));
+        // cadence: revs 0xFFFF→0x0001 = 2, time 0xFC00→0x0400 = 2048 ticks → 60 rpm
+        // speed:   revs 0xFFFF→0x0000 = 1, time 0xFFF0→0x03F0 = 1024 ticks → 7.578 km/h
+        let r = d.decode_combined_sc_at(&combo(0x0400, 0x0001, 0x03F0, 0x0000), "sc", 2105, at(2.0));
+        match (&r[0], &r[1]) {
+            (SensorReading::Speed { kmh, .. }, SensorReading::Cadence { rpm, .. }) => {
+                assert!((kmh - 7.578).abs() < 0.01, "speed {}", kmh);
+                assert!((rpm - 60.0).abs() < 0.01, "cadence {}", rpm);
+            }
+            other => panic!("expected Speed + Cadence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ant_cadence_zero_after_3s_without_event() {
+        let mut d = AntDecoder::new();
+        let page = |t: u16, r: u16| {
+            let (a, b) = (t.to_le_bytes(), r.to_le_bytes());
+            [0x00, 0, 0, 0, a[0], a[1], b[0], b[1]]
+        };
+        d.decode_cadence_at(&page(0, 0), "cad", at(0.0));
+        d.decode_cadence_at(&page(1024, 1), "cad", at(1.0));
+        assert!(d.decode_cadence_at(&page(1024, 1), "cad", at(3.5)).is_none());
+        match d.decode_cadence_at(&page(1024, 1), "cad", at(4.0)) {
+            Some(SensorReading::Cadence { rpm, .. }) => assert!(rpm.abs() < 0.01),
+            other => panic!("expected 0 rpm, got {:?}", other),
+        }
     }
 }

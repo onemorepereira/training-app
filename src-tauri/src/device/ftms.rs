@@ -20,19 +20,65 @@ pub(crate) fn encode_target_power(watts: i16) -> Vec<u8> {
     vec![SET_TARGET_POWER, bytes[0], bytes[1]]
 }
 
-/// Encode FTMS Set Target Resistance Level (0x04). Level 0-100% → raw 0-1000 (0.1 resolution).
-pub(crate) fn encode_resistance(level: u8) -> Vec<u8> {
-    let raw = (level.min(100) as i16) * 10;
+/// Supported Resistance Level Range (0x2AD6), in the 0.1-unit raw values that
+/// Set Target Resistance Level uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResistanceRange {
+    pub min: i16,
+    pub max: i16,
+    pub increment: u16,
+}
+
+/// Parse 0x2AD6. FTMS v1.0 §4.13 defers the format to the SIG assigned numbers, and
+/// the official definitions disagree: the 2017 SIG characteristic XML gives 6 octets
+/// (sint16 min, sint16 max, uint16 increment, 0.1 resolution — also what GoldenCheetah
+/// parses), the current GATT Specification Supplement §3.231 gives 3 uint8 octets with
+/// self-contradictory scaling. Only the 6-octet form is used; any other length (or an
+/// empty/inverted range) yields None and resistance keeps the 0-100 % mapping.
+pub(crate) fn parse_resistance_range(data: &[u8]) -> Option<ResistanceRange> {
+    if data.len() != 6 {
+        return None;
+    }
+    let range = ResistanceRange {
+        min: i16::from_le_bytes([data[0], data[1]]),
+        max: i16::from_le_bytes([data[2], data[3]]),
+        increment: u16::from_le_bytes([data[4], data[5]]),
+    };
+    (range.max > range.min).then_some(ResistanceRange { increment: range.increment.max(1), ..range })
+}
+
+/// Encode FTMS Set Target Resistance Level (0x04): sint16, 0.1 resolution (FTMS v1.0
+/// Table 4.15 as amended by Errata Service Release 11, E8991: UINT8 → SINT16).
+/// `level` is 0-100 % of the trainer's supported range, snapped to its increment.
+/// Without a range, 0-100 % maps to raw 0-1000 (previous behaviour).
+pub(crate) fn encode_resistance(level: u8, range: Option<ResistanceRange>) -> Vec<u8> {
+    let pct = level.min(100) as f64 / 100.0;
+    let raw: i16 = match range {
+        None => (level.min(100) as i16) * 10,
+        Some(r) => {
+            let span = (r.max as f64) - (r.min as f64);
+            let inc = r.increment as f64;
+            let steps = (span * pct / inc).round();
+            ((r.min as f64) + steps * inc).clamp(r.min as f64, r.max as f64) as i16
+        }
+    };
     let bytes = raw.to_le_bytes();
     vec![SET_TARGET_RESISTANCE, bytes[0], bytes[1]]
 }
 
+/// Supported Resistance Level Range characteristic (0x2AD6).
+const SUPPORTED_RESISTANCE_RANGE: uuid::Uuid = uuid::Uuid::from_u128(0x00002AD6_0000_1000_8000_00805f9b34fb);
+
 /// Encode FTMS Set Indoor Bike Simulation Parameters (0x11).
+/// FTMS v1.0 §4.16.2.18 Table 4.20: wind speed sint16 (0.001 m/s), grade sint16 (0.01 %),
+/// Crr uint8 (0.0001), Cw uint8 (0.01 kg/m). Values round to nearest; NaN is treated as 0.
 pub(crate) fn encode_simulation(grade: f32, crr: f32, cw: f32) -> Vec<u8> {
+    let finite = |v: f32| if v.is_nan() { 0.0 } else { v };
     let wind_speed: i16 = 0;
-    let grade_raw = (grade.clamp(-100.0, 100.0) * 100.0) as i16;
-    let crr_raw = (crr.clamp(0.0, 0.0255) / 0.0001) as u8;
-    let cw_raw = (cw.clamp(0.0, 2.55) / 0.01) as u8;
+    // Clamped to ±100 % → raw ±10000, well inside sint16.
+    let grade_raw = (finite(grade).clamp(-100.0, 100.0) * 100.0).round() as i16;
+    let crr_raw = (finite(crr).clamp(0.0, 0.0255) / 0.0001).round() as u8;
+    let cw_raw = (finite(cw).clamp(0.0, 2.55) / 0.01).round() as u8;
     let wind_bytes = wind_speed.to_le_bytes();
     let grade_bytes = grade_raw.to_le_bytes();
     vec![
@@ -56,6 +102,7 @@ pub struct TrainerController {
     peripheral: Peripheral,
     control_point: Characteristic,
     indications_enabled: bool,
+    resistance_range: Option<ResistanceRange>,
     control_granted: bool,
 }
 
@@ -72,7 +119,31 @@ impl TrainerController {
             control_point,
             indications_enabled: false,
             control_granted: false,
+            resistance_range: None,
         })
+    }
+
+    /// Read Supported Resistance Level Range (0x2AD6) once at connect. Absent or
+    /// unreadable → resistance keeps the legacy 0-100 % → 0-1000 mapping.
+    pub async fn read_resistance_range(&mut self) {
+        let chars = self.peripheral.characteristics();
+        let Some(c) = chars.iter().find(|c| c.uuid == SUPPORTED_RESISTANCE_RANGE) else {
+            return;
+        };
+        match self.peripheral.read(c).await {
+            Ok(data) => {
+                self.resistance_range = parse_resistance_range(&data);
+                match self.resistance_range {
+                    Some(r) => info!("FTMS: supported resistance range {:?}", r),
+                    // Read once per connect, so this logs once per trainer connection.
+                    None => warn!(
+                        "FTMS: unsupported Supported Resistance Level Range format {:02X?}; using 0-100 %",
+                        data
+                    ),
+                }
+            }
+            Err(e) => warn!("FTMS: reading Supported Resistance Level Range failed: {}", e),
+        }
     }
 
     /// Enable indications and request control from the trainer.
@@ -113,7 +184,7 @@ impl TrainerController {
     /// Parameter is sint16 with 0.1 resolution: level 0-100% maps to raw 0-1000.
     pub async fn set_resistance(&mut self, level: u8) -> Result<(), AppError> {
         self.ensure_control().await?;
-        self.write_control_and_wait(&encode_resistance(level))
+        self.write_control_and_wait(&encode_resistance(level, self.resistance_range))
             .await
     }
 
@@ -235,20 +306,20 @@ mod tests {
     // ---- Resistance (0x04) ----
 
     #[test]
-    fn encode_resistance_50_pct() {
+    fn resistance_without_range_uses_legacy_mapping() {
         // 50 * 10 = 500 → 500i16 LE = [0xF4, 0x01]
-        assert_eq!(encode_resistance(50), vec![0x04, 0xF4, 0x01]);
+        assert_eq!(encode_resistance(50, None), vec![0x04, 0xF4, 0x01]);
     }
 
     #[test]
     fn encode_resistance_clamps_above_100() {
         // 200 → min(100) = 100, 100 * 10 = 1000 → LE = [0xE8, 0x03]
-        assert_eq!(encode_resistance(200), vec![0x04, 0xE8, 0x03]);
+        assert_eq!(encode_resistance(200, None), vec![0x04, 0xE8, 0x03]);
     }
 
     #[test]
     fn encode_resistance_zero() {
-        assert_eq!(encode_resistance(0), vec![0x04, 0x00, 0x00]);
+        assert_eq!(encode_resistance(0, None), vec![0x04, 0x00, 0x00]);
     }
 
     // ---- Indoor Bike Simulation (0x11) ----
@@ -285,5 +356,82 @@ mod tests {
         assert_eq!(data[5], 255);
         // cw clamped to 2.55: 2.55 / 0.01 = 255
         assert_eq!(data[6], 255);
+    }
+
+    // FTMS v1.0 §4.16.2.18 Table 4.20: grade sint16, 0.01 % resolution.
+
+    #[test]
+    fn ftms_grade_2_3_rounds_to_230() {
+        let data = encode_simulation(2.3, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 230);
+        // 2.296 % → 229.6 raw → nearest 0.01 % is 230 (truncation gave 229)
+        let data = encode_simulation(2.296, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 230);
+        // -2.296 % → -230 (truncation toward zero gave -229)
+        let data = encode_simulation(-2.296, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), -230);
+    }
+
+    #[test]
+    fn ftms_grade_clamped_to_plus_minus_100() {
+        let data = encode_simulation(150.0, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 10000);
+    }
+
+    #[test]
+    fn ftms_grade_nan_encodes_zero() {
+        let data = encode_simulation(f32::NAN, 0.0, 0.0);
+        assert_eq!(i16::from_le_bytes([data[3], data[4]]), 0);
+    }
+
+    #[test]
+    fn ftms_crr_rounds_to_nearest() {
+        // 0.00406 / 0.0001 = 40.6 → 41 (truncation gave 40)
+        assert_eq!(encode_simulation(0.0, 0.00406, 0.0)[5], 41);
+    }
+
+    // ---- Supported Resistance Level Range (0x2AD6) ----
+
+    #[test]
+    fn resistance_range_parse_6_octet_layout() {
+        // min 0, max 1000 (100.0), increment 10 (1.0)
+        let r = parse_resistance_range(&[0x00, 0x00, 0xE8, 0x03, 0x0A, 0x00]).unwrap();
+        assert_eq!(r, ResistanceRange { min: 0, max: 1000, increment: 10 });
+        // signed min: -50 = 0xFFCE
+        let r = parse_resistance_range(&[0xCE, 0xFF, 0x32, 0x00, 0x05, 0x00]).unwrap();
+        assert_eq!((r.min, r.max), (-50, 50));
+    }
+
+    #[test]
+    fn resistance_range_3_octet_form_falls_back_to_legacy() {
+        // The 3-octet (uint8) form's scaling is ambiguous across SIG sources: don't guess.
+        assert_eq!(parse_resistance_range(&[1, 40, 1]), None);
+        assert_eq!(encode_resistance(50, parse_resistance_range(&[1, 40, 1])), vec![0x04, 0xF4, 0x01]);
+    }
+
+    #[test]
+    fn resistance_range_parse_bad_length_is_none() {
+        assert_eq!(parse_resistance_range(&[]), None);
+        assert_eq!(parse_resistance_range(&[1, 2, 3, 4]), None);
+        // inverted 6-octet range: max 10 < min 400
+        assert_eq!(parse_resistance_range(&[0x90, 0x01, 0x0A, 0x00, 0x0A, 0x00]), None);
+    }
+
+    #[test]
+    fn resistance_50pct_scaled_into_range_with_increment() {
+        let range = Some(ResistanceRange { min: 10, max: 400, increment: 10 });
+        // 10 + round(390 * 0.5 / 10) * 10 = 10 + 20 * 10 = 210 = 0x00D2
+        assert_eq!(encode_resistance(50, range), vec![0x04, 0xD2, 0x00]);
+        assert_eq!(encode_resistance(0, range), vec![0x04, 10, 0x00]);
+        // 400 = 0x0190
+        assert_eq!(encode_resistance(100, range), vec![0x04, 0x90, 0x01]);
+        assert_eq!(encode_resistance(250, range), vec![0x04, 0x90, 0x01], "clamped to max");
+    }
+
+    #[test]
+    fn resistance_range_with_negative_min() {
+        let range = Some(ResistanceRange { min: -100, max: 100, increment: 5 });
+        // -100 + round(200 * 0.25 / 5) * 5 = -100 + 10 * 5 = -50 = 0xFFCE
+        assert_eq!(encode_resistance(25, range), vec![0x04, 0xCE, 0xFF]);
     }
 }

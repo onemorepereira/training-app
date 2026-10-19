@@ -277,48 +277,26 @@ pub fn run() {
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_secs(config::CONNECTION_CHECK_INTERVAL_SECS)).await;
 
-                            let disconnected = {
-                                let mut dm = dm.lock().await;
-                                dm.check_connections().await
-                            };
+                            // Probe + transitions only; teardowns and reconnect attempts
+                            // are spawned and report through the next tick.
+                            let report =
+                                DeviceManager::watchdog_tick(&dm, &sensor_tx_clone).await;
 
-                            if !disconnected.is_empty() {
-                                // Emit disconnect events to frontend
-                                for info in &disconnected {
-                                    let _ = handle.emit("device_disconnected", &info.id);
-                                }
-
-                                // Push updated device list
-                                {
-                                    let dm = dm.lock().await;
-                                    let all = dm.list_current().await;
-                                    let _ = handle.emit("device_list_updated", &all);
-                                }
-                            }
-
-                            // Attempt reconnects for devices due for retry
-                            let (reconnected, trying) = {
-                                let mut dm = dm.lock().await;
-                                dm.attempt_reconnects(&sensor_tx_clone).await
-                            };
-
-                            for info in &reconnected {
-                                let _ = handle.emit("device_reconnected", &info.id);
-                            }
-
-                            if !reconnected.is_empty() {
-                                let dm = dm.lock().await;
-                                let all = dm.list_current().await;
-                                let _ = handle.emit("device_list_updated", &all);
-                            }
-
-                            for (info, attempt) in &trying {
-                                let _ =
-                                    handle.emit("device_reconnecting", &serde_json::json!({
-                                        "device_id": info.id,
-                                        "device_type": info.device_type.as_str(),
-                                        "attempt": attempt,
-                                    }));
+                            use crate::device::manager::DeviceEvent;
+                            for event in DeviceManager::report_events(&dm, report).await {
+                                let _ = match event {
+                                    DeviceEvent::Disconnected(id) => handle.emit("device_disconnected", &id),
+                                    DeviceEvent::Reconnected(id) => handle.emit("device_reconnected", &id),
+                                    DeviceEvent::ListUpdated(all) => handle.emit("device_list_updated", &all),
+                                    DeviceEvent::Reconnecting { device_id, device_type, attempt } => handle.emit(
+                                        "device_reconnecting",
+                                        &serde_json::json!({
+                                            "device_id": device_id,
+                                            "device_type": device_type,
+                                            "attempt": attempt,
+                                        }),
+                                    ),
+                                };
                             }
                         }
                     });

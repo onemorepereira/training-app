@@ -1,4 +1,5 @@
 use log::debug;
+use std::time::{Duration, Instant};
 use uuid::Uuid as BtUuid;
 
 use super::types::SensorReading;
@@ -43,122 +44,196 @@ pub fn decode_heart_rate(data: &[u8], device_id: &str) -> Option<SensorReading> 
     })
 }
 
-pub fn decode_cycling_power(data: &[u8], device_id: &str) -> Option<SensorReading> {
+/// Emit 0 rpm / 0 km/h once a sensor keeps notifying without a new revolution
+/// event for this long (rider coasting or stopped).
+pub const ZERO_AFTER: Duration = Duration::from_secs(3);
+
+/// Upper plausibility bounds; values above are dropped as glitches.
+const MAX_CADENCE_RPM: f32 = 200.0;
+const MAX_SPEED_KMH: f32 = 120.0;
+
+/// Cumulative crank revolutions + last crank event time (1/1024 s), as used by
+/// CSC Measurement (CSCS v1.0 §3.1) and Cycling Power Measurement (CPS v1.1
+/// §3.2.1.6) and the ANT+ cadence pages. Both counters roll over (u16).
+#[derive(Debug, Default, Clone)]
+pub struct CrankState {
+    prev: Option<(u16, u16)>,
+    last_event_at: Option<Instant>,
+}
+
+impl CrankState {
+    /// The first sample only initialises state (no previous event to diff against).
+    pub fn update(&mut self, revs: u16, event_time: u16, now: Instant) -> Option<f32> {
+        let Some((prev_revs, prev_time)) = self.prev else {
+            self.prev = Some((revs, event_time));
+            self.last_event_at = Some(now);
+            return None;
+        };
+        let time_diff = event_time.wrapping_sub(prev_time);
+        let rev_diff = revs.wrapping_sub(prev_revs);
+        if time_diff == 0 || rev_diff == 0 {
+            // No new crank event in this notification.
+            return self.zero_if_idle(now);
+        }
+        self.prev = Some((revs, event_time));
+        self.last_event_at = Some(now);
+        let rpm = rev_diff as f32 / (time_diff as f32 / 1024.0) * 60.0;
+        (rpm < MAX_CADENCE_RPM).then_some(rpm)
+    }
+
+    fn zero_if_idle(&self, now: Instant) -> Option<f32> {
+        let last = self.last_event_at?;
+        (now.saturating_duration_since(last) >= ZERO_AFTER).then_some(0.0)
+    }
+}
+
+/// Cumulative wheel revolutions (u32, not permitted to roll over) + last wheel event
+/// time in 1/1024 s (CSCS v1.0 §3.1.1.2).
+#[derive(Debug, Default, Clone)]
+pub struct WheelState {
+    prev: Option<(u32, u16)>,
+    last_event_at: Option<Instant>,
+}
+
+impl WheelState {
+    pub fn update(&mut self, revs: u32, event_time: u16, wheel_mm: u32, now: Instant) -> Option<f32> {
+        let Some((prev_revs, prev_time)) = self.prev else {
+            self.prev = Some((revs, event_time));
+            self.last_event_at = Some(now);
+            return None;
+        };
+        let time_diff = event_time.wrapping_sub(prev_time);
+        let rev_diff = revs.wrapping_sub(prev_revs);
+        if time_diff == 0 || rev_diff == 0 {
+            let last = self.last_event_at?;
+            return (now.saturating_duration_since(last) >= ZERO_AFTER).then_some(0.0);
+        }
+        self.prev = Some((revs, event_time));
+        self.last_event_at = Some(now);
+        if rev_diff >= 100 {
+            return None; // counter reset / glitch
+        }
+        let distance_m = rev_diff as f32 * wheel_mm as f32 / 1000.0;
+        let kmh = distance_m / (time_diff as f32 / 1024.0) * 3.6;
+        (kmh < MAX_SPEED_KMH).then_some(kmh)
+    }
+}
+
+/// Per-connection state of a CSC Measurement stream.
+#[derive(Debug, Default, Clone)]
+pub struct CscState {
+    pub wheel: WheelState,
+    pub crank: CrankState,
+}
+
+/// Per-connection state of a Cycling Power Measurement stream.
+#[derive(Debug, Default, Clone)]
+pub struct CpsState {
+    pub crank: CrankState,
+}
+
+/// Decode Cycling Power Measurement (0x2A63), CPS v1.1 §3.2.1 / GATT Specification
+/// Supplement §3.75. Field order after the uint16 flags and sint16 instantaneous power,
+/// each present only when its flag bit is set:
+///   bit 0 Pedal Power Balance uint8 (1/2 %), bit 2 Accumulated Torque uint16,
+///   bit 4 Wheel Revolution Data (uint32 + uint16), bit 5 Crank Revolution Data
+///   (uint16 cumulative revs + uint16 last event time, 1/1024 s), ...
+/// Returns Power and, when crank data yields a new event, Cadence.
+pub fn decode_cycling_power(
+    data: &[u8],
+    state: &mut CpsState,
+    device_id: &str,
+    now: Instant,
+) -> Vec<SensorReading> {
     if data.len() < 4 {
-        return None;
+        return vec![];
     }
     let flags = u16::from_le_bytes([data[0], data[1]]);
     let watts = i16::from_le_bytes([data[2], data[3]]);
-    if watts < 0 {
-        debug!("BLE cycling power: negative watts {} from {}", watts, device_id);
-        return None;
+    let epoch_ms = now_epoch_ms();
+    let timestamp = Some(now);
+    let mut offset = 4;
+    let mut readings = Vec::new();
+
+    // Pedal Power Balance (bit 0). Bit 1 = reference: 0 unknown, 1 left (§3.2.1.3).
+    // With reference Left the value is the left pedal's share; we report the right
+    // pedal's share (matching ANT+). With an unknown reference the side is undefined.
+    let mut pedal_balance = None;
+    if flags & 0x0001 != 0 {
+        if let Some(&raw) = data.get(offset) {
+            if flags & 0x0002 != 0 {
+                let left_pct = ((raw as u16 + 1) / 2).min(100) as u8; // 1/2 % → nearest %
+                pedal_balance = Some(100 - left_pct);
+            }
+        }
+        offset += 1;
+    }
+    if flags & 0x0004 != 0 {
+        offset += 2; // Accumulated Torque
+    }
+    if flags & 0x0010 != 0 {
+        offset += 6; // Wheel Revolution Data
     }
 
-    // Pedal Power Balance: flag bit 0 = present, bit 1 = reference (1 = left pedal)
-    // Field is uint8 at offset 4, resolution 1/2 %
-    let pedal_balance = if flags & 0x01 != 0 && data.len() >= 5 {
-        let raw = data[4]; // percentage in 1/2% resolution
-        let pct = raw / 2; // approximate to whole percent
-        if flags & 0x02 != 0 {
-            // Reference is left pedal — invert to right pedal for consistency with ANT+
-            Some(100u8.saturating_sub(pct))
-        } else {
-            // Reference unknown — report as-is
-            Some(pct)
-        }
+    if watts >= 0 {
+        readings.push(SensorReading::Power {
+            watts: watts as u16,
+            timestamp,
+            epoch_ms,
+            device_id: device_id.to_string(),
+            pedal_balance,
+        });
     } else {
-        None
-    };
+        debug!("BLE cycling power: negative watts {} from {}", watts, device_id);
+    }
 
-    Some(SensorReading::Power {
-        watts: watts as u16,
-        timestamp: Some(std::time::Instant::now()),
-        epoch_ms: now_epoch_ms(),
-        device_id: device_id.to_string(),
-        pedal_balance,
-    })
+    if flags & 0x0020 != 0 && data.len() >= offset + 4 {
+        let revs = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        let time = u16::from_le_bytes([data[offset + 2], data[offset + 3]]);
+        if let Some(rpm) = state.crank.update(revs, time, now) {
+            readings.push(SensorReading::Cadence {
+                rpm,
+                timestamp,
+                epoch_ms,
+                device_id: device_id.to_string(),
+            });
+        }
+    }
+    readings
 }
 
 /// Default wheel circumference in mm (700x25c tire)
 const DEFAULT_WHEEL_CIRCUMFERENCE_MM: u32 = 2105;
 
-pub fn decode_csc(
-    data: &[u8],
-    prev_wheel_revs: &mut u32,
-    prev_wheel_time: &mut u16,
-    prev_crank_revs: &mut u16,
-    prev_crank_time: &mut u16,
-    device_id: &str,
-) -> Vec<SensorReading> {
+/// Decode CSC Measurement (0x2A5B), CSCS v1.0 §3.1: uint8 flags, then wheel data
+/// (bit 0: uint32 revs + uint16 time) and crank data (bit 1: uint16 revs + uint16 time),
+/// both times in 1/1024 s. The first notification after (re)connect only initialises.
+pub fn decode_csc(data: &[u8], state: &mut CscState, device_id: &str, now: Instant) -> Vec<SensorReading> {
     if data.is_empty() {
         return vec![];
     }
     let flags = data[0];
-    let has_wheel = flags & 0x01 != 0;
-    let has_crank = flags & 0x02 != 0;
     let mut offset = 1;
     let mut readings = Vec::new();
     let epoch_ms = now_epoch_ms();
-    let timestamp = Some(std::time::Instant::now());
+    let timestamp = Some(now);
 
-    // Wheel Revolution Data: uint32 cumulative revs + uint16 last event time (1/1024 s)
-    if has_wheel {
+    if flags & 0x01 != 0 {
         if data.len() >= offset + 6 {
-            let wheel_revs = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
-            let wheel_time = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
-            let rev_diff = wheel_revs.wrapping_sub(*prev_wheel_revs);
-            let time_diff = wheel_time.wrapping_sub(*prev_wheel_time);
-            *prev_wheel_revs = wheel_revs;
-            *prev_wheel_time = wheel_time;
-            if time_diff > 0 && rev_diff > 0 && rev_diff < 100 {
-                let time_secs = time_diff as f32 / 1024.0;
-                let distance_m = rev_diff as f32 * DEFAULT_WHEEL_CIRCUMFERENCE_MM as f32 / 1000.0;
-                let kmh = (distance_m / time_secs) * 3.6;
-                if kmh >= 120.0 {
-                    debug!("BLE CSC: out-of-range wheel speed {:.1} km/h from {}", kmh, device_id);
-                }
-                if kmh > 0.0 && kmh < 120.0 {
-                    readings.push(SensorReading::Speed {
-                        kmh,
-                        timestamp,
-                        epoch_ms,
-                        device_id: device_id.to_string(),
-                    });
-                }
+            let revs = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+            let time = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+            if let Some(kmh) = state.wheel.update(revs, time, DEFAULT_WHEEL_CIRCUMFERENCE_MM, now) {
+                readings.push(SensorReading::Speed { kmh, timestamp, epoch_ms, device_id: device_id.to_string() });
             }
         }
         offset += 6;
     }
 
-    // Crank Revolution Data: uint16 cumulative revs + uint16 last event time (1/1024 s)
-    if has_crank {
-        if data.len() >= offset + 4 {
-            let crank_revs = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            let crank_time = u16::from_le_bytes([data[offset + 2], data[offset + 3]]);
-            let rev_diff = crank_revs.wrapping_sub(*prev_crank_revs);
-            let time_diff = crank_time.wrapping_sub(*prev_crank_time);
-            *prev_crank_revs = crank_revs;
-            *prev_crank_time = crank_time;
-            if time_diff > 0 && rev_diff > 0 {
-                let time_secs = time_diff as f32 / 1024.0;
-                let rpm = (rev_diff as f32 / time_secs) * 60.0;
-                if rpm >= 200.0 {
-                    debug!("BLE CSC: out-of-range cadence {:.0} rpm from {}", rpm, device_id);
-                }
-                if rpm > 0.0 && rpm < 200.0 {
-                    readings.push(SensorReading::Cadence {
-                        rpm,
-                        timestamp,
-                        epoch_ms,
-                        device_id: device_id.to_string(),
-                    });
-                }
-            }
+    if flags & 0x02 != 0 && data.len() >= offset + 4 {
+        let revs = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        let time = u16::from_le_bytes([data[offset + 2], data[offset + 3]]);
+        if let Some(rpm) = state.crank.update(revs, time, now) {
+            readings.push(SensorReading::Cadence { rpm, timestamp, epoch_ms, device_id: device_id.to_string() });
         }
     }
 
@@ -284,6 +359,16 @@ mod tests {
 
     const DEV: &str = "test-device";
 
+    /// Fixed base instant so decoder timing is explicit (no real-clock waits).
+    fn t0() -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now)
+    }
+
+    fn at(secs: f64) -> Instant {
+        t0() + Duration::from_secs_f64(secs)
+    }
+
     // ── decode_heart_rate ──────────────────────────────────────────
 
     #[test]
@@ -319,212 +404,280 @@ mod tests {
         assert!(decode_heart_rate(&data, DEV).is_none());
     }
 
-    // ── decode_cycling_power ───────────────────────────────────────
+    // ── decode_cycling_power (CPS v1.1 §3.2.1, GSS §3.75) ───────────
+
+    fn cps(flags: u16, watts: i16, rest: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&flags.to_le_bytes());
+        d.extend_from_slice(&watts.to_le_bytes());
+        d.extend_from_slice(rest);
+        d
+    }
+
+    fn crank(revs: u16, time: u16) -> Vec<u8> {
+        let mut d = revs.to_le_bytes().to_vec();
+        d.extend_from_slice(&time.to_le_bytes());
+        d
+    }
+
+    fn power_of(r: &SensorReading) -> (u16, Option<u8>) {
+        match r {
+            SensorReading::Power { watts, pedal_balance, .. } => (*watts, *pedal_balance),
+            other => panic!("expected Power, got {:?}", other),
+        }
+    }
+
+    fn rpm_of(r: &SensorReading) -> f32 {
+        match r {
+            SensorReading::Cadence { rpm, .. } => *rpm,
+            other => panic!("expected Cadence, got {:?}", other),
+        }
+    }
+
+    fn kmh_of(r: &SensorReading) -> f32 {
+        match r {
+            SensorReading::Speed { kmh, .. } => *kmh,
+            other => panic!("expected Speed, got {:?}", other),
+        }
+    }
 
     #[test]
     fn decode_power_short_data() {
-        assert!(decode_cycling_power(&[0x00, 0x00, 0xFA], DEV).is_none());
+        assert!(decode_cycling_power(&[0x00, 0x00, 0xFA], &mut CpsState::default(), DEV, t0()).is_empty());
     }
 
     #[test]
     fn decode_power_normal_no_balance() {
-        let flags: u16 = 0x0000;
-        let watts: i16 = 250;
-        let mut data = Vec::new();
-        data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&watts.to_le_bytes());
-        let r = decode_cycling_power(&data, DEV).unwrap();
-        match r {
-            SensorReading::Power {
-                watts: w,
-                pedal_balance,
-                ..
-            } => {
-                assert_eq!(w, 250);
-                assert_eq!(pedal_balance, None);
-            }
-            _ => panic!("expected Power"),
-        }
+        let r = decode_cycling_power(&cps(0x0000, 250, &[]), &mut CpsState::default(), DEV, t0());
+        assert_eq!(r.len(), 1);
+        assert_eq!(power_of(&r[0]), (250, None));
     }
 
     #[test]
     fn decode_power_negative_watts_rejected() {
-        let flags: u16 = 0x0000;
-        let watts: i16 = -1;
-        let mut data = Vec::new();
-        data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&watts.to_le_bytes());
-        assert!(decode_cycling_power(&data, DEV).is_none());
+        assert!(decode_cycling_power(&cps(0x0000, -1, &[]), &mut CpsState::default(), DEV, t0()).is_empty());
     }
 
     #[test]
-    fn decode_power_pedal_balance_right_ref() {
-        let flags: u16 = 0x0001; // balance present, bit1=0 (ref unknown)
-        let watts: i16 = 200;
-        let raw_balance: u8 = 100; // 100/2 = 50%
-        let mut data = Vec::new();
-        data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&watts.to_le_bytes());
-        data.push(raw_balance);
-        let r = decode_cycling_power(&data, DEV).unwrap();
-        match r {
-            SensorReading::Power {
-                pedal_balance, ..
-            } => assert_eq!(pedal_balance, Some(50)),
-            _ => panic!("expected Power"),
-        }
+    fn cps_balance_unknown_reference_is_none() {
+        // flags bit0 = balance present, bit1 = 0 → reference unknown (§3.2.1.3): side undefined
+        let r = decode_cycling_power(&cps(0x0001, 200, &[100]), &mut CpsState::default(), DEV, t0());
+        assert_eq!(power_of(&r[0]), (200, None));
     }
 
     #[test]
-    fn decode_power_pedal_balance_left_ref_inverted() {
-        let flags: u16 = 0x0003; // balance present + left pedal ref
-        let watts: i16 = 200;
-        let raw_balance: u8 = 80; // 80/2=40, inverted: 100-40=60
-        let mut data = Vec::new();
-        data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&watts.to_le_bytes());
-        data.push(raw_balance);
-        let r = decode_cycling_power(&data, DEV).unwrap();
-        match r {
-            SensorReading::Power {
-                pedal_balance, ..
-            } => assert_eq!(pedal_balance, Some(60)),
-            _ => panic!("expected Power"),
-        }
+    fn cps_balance_left_reference_inverted_rounded() {
+        // raw 80 = 40.0 % left → 60 % right
+        let r = decode_cycling_power(&cps(0x0003, 200, &[80]), &mut CpsState::default(), DEV, t0());
+        assert_eq!(power_of(&r[0]).1, Some(60));
+        // raw 81 = 40.5 % left → rounds to 41 % → 59 % right (truncation gave 60)
+        let r = decode_cycling_power(&cps(0x0003, 200, &[81]), &mut CpsState::default(), DEV, t0());
+        assert_eq!(power_of(&r[0]).1, Some(59));
     }
 
-    // ── decode_csc ─────────────────────────────────────────────────
+    #[test]
+    fn cps_crank_first_sample_initialises() {
+        let mut st = CpsState::default();
+        let r = decode_cycling_power(&cps(0x0020, 200, &crank(100, 0)), &mut st, DEV, t0());
+        assert_eq!(r.len(), 1, "power only; no previous crank event to diff");
+    }
+
+    #[test]
+    fn cps_crank_only_cadence_90rpm() {
+        // 3 revs in 2048/1024 = 2 s → 1.5 rev/s → 90 rpm
+        let mut st = CpsState::default();
+        decode_cycling_power(&cps(0x0020, 200, &crank(100, 0)), &mut st, DEV, t0());
+        let r = decode_cycling_power(&cps(0x0020, 210, &crank(103, 2048)), &mut st, DEV, at(2.0));
+        assert_eq!(r.len(), 2);
+        assert_eq!(power_of(&r[0]).0, 210);
+        assert_approx(rpm_of(&r[1]), 90.0, 0.01, "crank cadence");
+    }
+
+    #[test]
+    fn cps_crank_offset_after_balance_torque_wheel() {
+        // flags: bit0 balance, bit2 torque, bit4 wheel, bit5 crank → crank at offset 4+1+2+6 = 13
+        let flags = 0x0001 | 0x0004 | 0x0010 | 0x0020;
+        let pre = |revs: u16, time: u16| {
+            let mut rest = vec![0x64]; // balance
+            rest.extend_from_slice(&0x1234u16.to_le_bytes()); // accumulated torque
+            rest.extend_from_slice(&0x0A0B0C0Du32.to_le_bytes()); // wheel revs
+            rest.extend_from_slice(&0x0E0Fu16.to_le_bytes()); // wheel time
+            rest.extend_from_slice(&crank(revs, time));
+            cps(flags, 180, &rest)
+        };
+        let mut st = CpsState::default();
+        decode_cycling_power(&pre(10, 1024), &mut st, DEV, t0());
+        // 2 revs in 2048 ticks = 2 s → 60 rpm
+        let r = decode_cycling_power(&pre(12, 3072), &mut st, DEV, at(2.0));
+        assert_eq!(r.len(), 2);
+        assert_approx(rpm_of(&r[1]), 60.0, 0.01, "crank read from the walked offset");
+    }
+
+    #[test]
+    fn cps_crank_event_time_rollover() {
+        // Last crank event time rolls over every 64 s (§3.2.1.6): 0xFC00 → 0x0000 is 1024 ticks
+        let mut st = CpsState::default();
+        decode_cycling_power(&cps(0x0020, 200, &crank(0xFFFF, 0xFC00)), &mut st, DEV, t0());
+        // revs also roll over: 0xFFFF → 0x0000 is 1 rev
+        let r = decode_cycling_power(&cps(0x0020, 200, &crank(0x0000, 0x0000)), &mut st, DEV, at(1.0));
+        assert_approx(rpm_of(&r[1]), 60.0, 0.01, "rollover cadence");
+    }
+
+    #[test]
+    fn cps_truncated_crank_field_still_yields_power() {
+        // Crank flag set but only 2 of 4 crank bytes present
+        let r = decode_cycling_power(&cps(0x0020, 230, &[0x01, 0x00]), &mut CpsState::default(), DEV, t0());
+        assert_eq!(r.len(), 1);
+        assert_eq!(power_of(&r[0]).0, 230);
+    }
+
+    #[test]
+    fn cps_zero_cadence_after_3s_without_crank_event() {
+        let mut st = CpsState::default();
+        decode_cycling_power(&cps(0x0020, 200, &crank(100, 0)), &mut st, DEV, t0());
+        decode_cycling_power(&cps(0x0020, 200, &crank(101, 1024)), &mut st, DEV, at(1.0));
+        // Same crank data keeps arriving (coasting)
+        let r = decode_cycling_power(&cps(0x0020, 0, &crank(101, 1024)), &mut st, DEV, at(3.9));
+        assert_eq!(r.len(), 1, "2.9 s since last event: no cadence yet");
+        let r = decode_cycling_power(&cps(0x0020, 0, &crank(101, 1024)), &mut st, DEV, at(4.0));
+        assert_approx(rpm_of(&r[1]), 0.0, 0.01, "3 s without a crank event → 0 rpm");
+    }
+
+    // ── decode_csc (CSCS v1.0 §3.1) ─────────────────────────────────
+
+    fn csc_wheel(revs: u32, time: u16) -> Vec<u8> {
+        let mut d = vec![0x01];
+        d.extend_from_slice(&revs.to_le_bytes());
+        d.extend_from_slice(&time.to_le_bytes());
+        d
+    }
+
+    fn csc_crank(revs: u16, time: u16) -> Vec<u8> {
+        let mut d = vec![0x02];
+        d.extend_from_slice(&crank(revs, time));
+        d
+    }
 
     #[test]
     fn decode_csc_empty_data() {
-        let mut wr = 0u32;
-        let mut wt = 0u16;
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        assert!(decode_csc(&[], &mut wr, &mut wt, &mut cr, &mut ct, DEV).is_empty());
+        assert!(decode_csc(&[], &mut CscState::default(), DEV, t0()).is_empty());
+    }
+
+    #[test]
+    fn csc_first_notification_emits_nothing() {
+        // Previously diffed against zero: 3 revs at 3072 ticks looked like 60 rpm.
+        let mut st = CscState::default();
+        assert!(decode_csc(&csc_crank(3, 3072), &mut st, DEV, t0()).is_empty());
+        assert!(decode_csc(&csc_wheel(5000, 2048), &mut st, DEV, t0()).is_empty());
+    }
+
+    #[test]
+    fn csc_second_notification_computes_cadence_60rpm() {
+        let mut st = CscState::default();
+        decode_csc(&csc_crank(10, 1000), &mut st, DEV, t0());
+        // 1 rev in 1024 ticks = 1 s → 60 rpm
+        let r = decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(1.0));
+        assert_eq!(r.len(), 1);
+        assert_approx(rpm_of(&r[0]), 60.0, 0.01, "crank cadence");
+    }
+
+    #[test]
+    fn csc_new_state_after_reconnect_reinitialises() {
+        let mut st = CscState::default();
+        decode_csc(&csc_crank(10, 1000), &mut st, DEV, t0());
+        decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(1.0));
+        // A reconnect starts a new listener with fresh state: first notification is init-only.
+        let mut fresh = CscState::default();
+        assert!(decode_csc(&csc_crank(40, 9000), &mut fresh, DEV, at(30.0)).is_empty());
     }
 
     #[test]
     fn decode_csc_wheel_speed_normal() {
-        // 1 rev × 2105mm / (1024/1024 s) = 2.105 m/s = 7.578 km/h
-        let mut wr = 0u32;
-        let mut wt = 0u16;
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        let wheel_revs: u32 = 1;
-        let wheel_time: u16 = 1024;
-        let mut data = vec![0x01]; // flags: wheel present
-        data.extend_from_slice(&wheel_revs.to_le_bytes());
-        data.extend_from_slice(&wheel_time.to_le_bytes());
-        let readings = decode_csc(&data, &mut wr, &mut wt, &mut cr, &mut ct, DEV);
-        assert_eq!(readings.len(), 1);
-        match &readings[0] {
-            SensorReading::Speed { kmh, .. } => assert_approx(*kmh, 7.578, 0.01, "wheel speed"),
-            _ => panic!("expected Speed"),
-        }
+        // 1 rev × 2105 mm / 1 s = 2.105 m/s = 7.578 km/h
+        let mut st = CscState::default();
+        decode_csc(&csc_wheel(100, 0), &mut st, DEV, t0());
+        let r = decode_csc(&csc_wheel(101, 1024), &mut st, DEV, at(1.0));
+        assert_eq!(r.len(), 1);
+        assert_approx(kmh_of(&r[0]), 7.578, 0.01, "wheel speed");
     }
 
     #[test]
     fn decode_csc_wheel_time_wraparound() {
-        let mut wr = 0u32;
-        let mut wt = 0xFFF0u16; // near max
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        let wheel_revs: u32 = 1;
-        let wheel_time: u16 = 0x03F0; // wraps: 0x03F0 - 0xFFF0 = 0x0400 = 1024
-        let mut data = vec![0x01];
-        data.extend_from_slice(&wheel_revs.to_le_bytes());
-        data.extend_from_slice(&wheel_time.to_le_bytes());
-        let readings = decode_csc(&data, &mut wr, &mut wt, &mut cr, &mut ct, DEV);
-        assert_eq!(readings.len(), 1);
-        match &readings[0] {
-            SensorReading::Speed { kmh, .. } => assert_approx(*kmh, 7.578, 0.01, "wraparound speed"),
-            _ => panic!("expected Speed"),
-        }
+        let mut st = CscState::default();
+        decode_csc(&csc_wheel(5, 0xFFF0), &mut st, DEV, t0());
+        // 0x03F0 - 0xFFF0 wraps to 0x0400 = 1024 ticks
+        let r = decode_csc(&csc_wheel(6, 0x03F0), &mut st, DEV, at(1.0));
+        assert_approx(kmh_of(&r[0]), 7.578, 0.01, "wraparound speed");
     }
 
     #[test]
     fn decode_csc_wheel_above_120kmh_filtered() {
-        let mut wr = 0u32;
-        let mut wt = 0u16;
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        let wheel_revs: u32 = 50;
-        let wheel_time: u16 = 1;
-        let mut data = vec![0x01];
-        data.extend_from_slice(&wheel_revs.to_le_bytes());
-        data.extend_from_slice(&wheel_time.to_le_bytes());
-        let readings = decode_csc(&data, &mut wr, &mut wt, &mut cr, &mut ct, DEV);
-        assert!(readings.is_empty());
+        let mut st = CscState::default();
+        decode_csc(&csc_wheel(0, 0), &mut st, DEV, t0());
+        assert!(decode_csc(&csc_wheel(50, 1), &mut st, DEV, at(0.1)).is_empty());
     }
 
     #[test]
     fn decode_csc_wheel_rev_diff_ge_100_filtered() {
-        let mut wr = 0u32;
-        let mut wt = 0u16;
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        let wheel_revs: u32 = 100; // rev_diff=100, not < 100 → filtered
-        let wheel_time: u16 = 1024;
-        let mut data = vec![0x01];
-        data.extend_from_slice(&wheel_revs.to_le_bytes());
-        data.extend_from_slice(&wheel_time.to_le_bytes());
-        let readings = decode_csc(&data, &mut wr, &mut wt, &mut cr, &mut ct, DEV);
-        assert!(readings.is_empty());
-    }
-
-    #[test]
-    fn decode_csc_crank_cadence_normal() {
-        // 1 rev / (1024/1024 s) × 60 = 60.0 rpm
-        let mut wr = 0u32;
-        let mut wt = 0u16;
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        let crank_revs: u16 = 1;
-        let crank_time: u16 = 1024;
-        let mut data = vec![0x02]; // flags: crank present
-        data.extend_from_slice(&crank_revs.to_le_bytes());
-        data.extend_from_slice(&crank_time.to_le_bytes());
-        let readings = decode_csc(&data, &mut wr, &mut wt, &mut cr, &mut ct, DEV);
-        assert_eq!(readings.len(), 1);
-        match &readings[0] {
-            SensorReading::Cadence { rpm, .. } => assert_approx(*rpm, 60.0, 0.1, "crank cadence"),
-            _ => panic!("expected Cadence"),
-        }
+        let mut st = CscState::default();
+        decode_csc(&csc_wheel(0, 0), &mut st, DEV, t0());
+        assert!(decode_csc(&csc_wheel(100, 1024), &mut st, DEV, at(1.0)).is_empty());
     }
 
     #[test]
     fn decode_csc_crank_above_200rpm_filtered() {
-        let mut wr = 0u32;
-        let mut wt = 0u16;
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        let crank_revs: u16 = 50;
-        let crank_time: u16 = 1; // 50 revs in ~1ms → way above 200 rpm
-        let mut data = vec![0x02];
-        data.extend_from_slice(&crank_revs.to_le_bytes());
-        data.extend_from_slice(&crank_time.to_le_bytes());
-        let readings = decode_csc(&data, &mut wr, &mut wt, &mut cr, &mut ct, DEV);
-        assert!(readings.is_empty());
+        let mut st = CscState::default();
+        decode_csc(&csc_crank(0, 0), &mut st, DEV, t0());
+        assert!(decode_csc(&csc_crank(50, 1), &mut st, DEV, at(0.1)).is_empty());
     }
 
     #[test]
     fn decode_csc_combined_wheel_and_crank() {
-        let mut wr = 0u32;
-        let mut wt = 0u16;
-        let mut cr = 0u16;
-        let mut ct = 0u16;
-        let mut data = vec![0x03]; // flags: wheel + crank
-        // Wheel: 1 rev at 1024 ticks
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&1024u16.to_le_bytes());
-        // Crank: 1 rev at 1024 ticks
-        data.extend_from_slice(&1u16.to_le_bytes());
-        data.extend_from_slice(&1024u16.to_le_bytes());
-        let readings = decode_csc(&data, &mut wr, &mut wt, &mut cr, &mut ct, DEV);
-        assert_eq!(readings.len(), 2);
-        assert!(matches!(&readings[0], SensorReading::Speed { .. }));
-        assert!(matches!(&readings[1], SensorReading::Cadence { .. }));
+        let both = |w: u32, wt: u16, c: u16, ct: u16| {
+            let mut d = vec![0x03];
+            d.extend_from_slice(&w.to_le_bytes());
+            d.extend_from_slice(&wt.to_le_bytes());
+            d.extend_from_slice(&crank(c, ct));
+            d
+        };
+        let mut st = CscState::default();
+        decode_csc(&both(0, 0, 0, 0), &mut st, DEV, t0());
+        let r = decode_csc(&both(1, 1024, 1, 1024), &mut st, DEV, at(1.0));
+        assert_eq!(r.len(), 2);
+        assert_approx(kmh_of(&r[0]), 7.578, 0.01, "speed");
+        assert_approx(rpm_of(&r[1]), 60.0, 0.01, "cadence");
+    }
+
+    #[test]
+    fn csc_zero_cadence_after_3s_without_crank_event() {
+        let mut st = CscState::default();
+        decode_csc(&csc_crank(10, 1000), &mut st, DEV, t0());
+        decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(1.0));
+        assert!(decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(2.5)).is_empty());
+        let r = decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(4.0));
+        assert_approx(rpm_of(&r[0]), 0.0, 0.01, "coasting → 0 rpm");
+        let r = decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(5.0));
+        assert_approx(rpm_of(&r[0]), 0.0, 0.01, "repeats while still notifying");
+    }
+
+    #[test]
+    fn csc_zero_speed_after_3s_without_wheel_event() {
+        let mut st = CscState::default();
+        decode_csc(&csc_wheel(100, 0), &mut st, DEV, t0());
+        decode_csc(&csc_wheel(101, 1024), &mut st, DEV, at(1.0));
+        let r = decode_csc(&csc_wheel(101, 1024), &mut st, DEV, at(4.0));
+        assert_approx(kmh_of(&r[0]), 0.0, 0.01, "stopped → 0 km/h");
+    }
+
+    #[test]
+    fn cadence_resumes_after_zero_on_new_event() {
+        let mut st = CscState::default();
+        decode_csc(&csc_crank(10, 1000), &mut st, DEV, t0());
+        decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(1.0));
+        decode_csc(&csc_crank(11, 2024), &mut st, DEV, at(4.5)); // → 0
+        // Pedalling again: 2 revs in 2048 ticks → 60 rpm
+        let r = decode_csc(&csc_crank(13, 4072), &mut st, DEV, at(5.0));
+        assert_approx(rpm_of(&r[0]), 60.0, 0.01, "normal cadence after coasting");
     }
 
     // ── decode_indoor_bike_data ────────────────────────────────────

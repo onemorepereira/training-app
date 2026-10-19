@@ -1,70 +1,179 @@
-use btleplug::api::Peripheral as _;
+//! Unified device manager.
+//!
+//! Locking (design ADR-1): the `DeviceManager` mutex guards bookkeeping only. Every
+//! transport operation (scan, connect, disconnect, probe) runs through the
+//! associated `*_shared` functions as *prepare (lock) → I/O (no lock) → commit (lock)*.
+//! A per-device gate serialises operations on one device; the DM lock is never held
+//! while awaiting a gate or transport I/O. It is never held while awaiting
+//! `spawn_blocking` either, except for trainer commands, whose blocking task never
+//! touches `AntSlot` or the DM lock.
+
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::broadcast;
+use std::time::Duration;
+use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::time::Instant;
 use tokio::task::JoinHandle;
 
-use super::ant::manager::AntManager;
-use super::ant::usb::AntUsb;
-use super::ble::BleManager;
 use super::dedup::compute_device_groups;
 use super::fec::FecController;
-use super::ftms::TrainerController;
-use super::listener::listen_to_device;
+use super::io::*;
+use super::primary::{DeviceCaps, Metric, PrimaryState};
 use super::reconnect::ReconnectManager;
 use super::types::*;
-use crate::error::{AntError, AppError, BleError};
+use crate::config;
+use crate::error::{AntError, AppError};
 use crate::session::storage::Storage;
 
-enum TrainerBackend {
-    Ftms(TrainerController),
-    Fec { usb: Arc<AntUsb>, channel: u8 },
+/// Maximum concurrently running auto-reconnect attempts.
+const RECONNECT_CONCURRENCY: usize = 2;
+
+/// An ANT+ device silent this long in background search is given up (ADR-2c).
+const ANT_GIVE_UP: Duration = Duration::from_secs(600);
+
+/// How long a manual connect to a Reconnecting ANT+ device waits for data (ADR-2b).
+const ANT_REJOIN_WAIT: Duration = Duration::from_secs(5);
+
+/// Shared handle used by commands and background tasks.
+pub type SharedDeviceManager<Io = RealIo> = Arc<Mutex<DeviceManager<Io>>>;
+
+/// Lifecycle phase of a device the user has connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Delivering data.
+    Connected,
+    /// ANT+: no data, channel still open in background search (ADR-2).
+    Stale { since: Instant, ticks: u32 },
+    /// Link lost; transport teardown not yet performed. The gate holder runs it (NB1).
+    LostPendingTeardown { give_up: bool },
+    /// Transport torn down; waiting for auto-reconnect.
+    TornDown,
 }
 
-use crate::config;
+struct DeviceRecord {
+    info: DeviceInfo,
+    phase: Phase,
+}
 
-/// Unified device manager wrapping BLE and ANT+ transports
-pub struct DeviceManager {
-    ble: Option<BleManager>,
-    ant: Option<AntManager>,
-    /// True if AntManager was ever successfully initialized (for panic recovery)
-    ant_was_available: bool,
-    /// True after a failed ANT+ USB probe; prevents repeated USB enumeration.
-    /// Reset on successful ANT+ init or on user-initiated scan.
-    ant_probe_failed: bool,
-    trainer_backends: HashMap<String, TrainerBackend>,
-    /// Tracks currently connected devices so rescanning doesn't lose them
-    connected_devices: HashMap<String, DeviceInfo>,
+impl DeviceRecord {
+    fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+        self.info.status = match phase {
+            Phase::Connected => ConnectionStatus::Connected,
+            _ => ConnectionStatus::Reconnecting,
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOrigin {
+    Manual,
+    AutoReconnect,
+}
+
+/// Outcome of `connect_shared` that is not an error.
+#[derive(Debug, Clone)]
+pub enum ConnectOutcome {
+    Connected(DeviceInfo),
+    /// Already connected: no-op success.
+    AlreadyConnected(DeviceInfo),
+    /// ANT+ device still in background search after a manual connect (not an error).
+    StillReconnecting(DeviceInfo),
+    /// Auto-reconnect skipped (device busy or no longer a target).
+    Skipped,
+}
+
+/// What a watchdog tick observed; `lib.rs` turns it into frontend events.
+#[derive(Debug, Default)]
+pub struct WatchdogReport {
+    /// `device_disconnected` payloads.
+    pub disconnected: Vec<String>,
+    /// `device_reconnected` payloads.
+    pub reconnected: Vec<String>,
+    /// `device_reconnecting` payloads (info, attempt).
+    pub reconnecting: Vec<(DeviceInfo, u32)>,
+    /// A device's displayed state is final and the list should be re-sent. Not set
+    /// while a teardown is still pending (the list would show a stale status).
+    pub list_dirty: bool,
+}
+
+impl WatchdogReport {
+    pub fn list_changed(&self) -> bool {
+        self.list_dirty
+    }
+
+    fn absorb(&mut self, other: WatchdogReport) {
+        self.disconnected.extend(other.disconnected);
+        self.reconnected.extend(other.reconnected);
+        self.reconnecting.extend(other.reconnecting);
+        self.list_dirty |= other.list_dirty;
+    }
+}
+
+/// Frontend event derived from a watchdog report (lib.rs emits these 1:1).
+#[derive(Debug, Clone)]
+pub enum DeviceEvent {
+    /// `device_disconnected`
+    Disconnected(String),
+    /// `device_reconnected`
+    Reconnected(String),
+    /// `device_list_updated`
+    ListUpdated(Vec<DeviceInfo>),
+    /// `device_reconnecting`
+    Reconnecting { device_id: String, device_type: String, attempt: u32 },
+}
+
+/// Unified device manager wrapping BLE and ANT+ transports.
+pub struct DeviceManager<Io: DeviceIo = RealIo> {
+    io: Arc<Io>,
     storage: Option<Arc<Storage>>,
-    /// Cached ANT+ metadata store (survives take/put-back of AntManager)
-    ant_metadata: Option<Arc<StdMutex<HashMap<String, AntDeviceMetadata>>>>,
-    /// Lock-free ANT+ last-seen timestamps (survives take/put-back of AntManager)
-    ant_last_seen: Option<Arc<StdMutex<HashMap<String, Arc<AtomicI64>>>>>,
-    /// BLE listener task handles (keyed by device_id)
+    /// Devices the user connected (Connected or Reconnecting).
+    records: HashMap<String, DeviceRecord>,
     listener_handles: HashMap<String, JoinHandle<()>>,
-    /// Auto-reconnect engine for dropped devices
+    trainer_backends: HashMap<String, TrainerBackend>,
     reconnect: ReconnectManager,
-    /// Shared primary-device map; listeners check this before sending readings
-    primary_devices: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>,
+    /// Per-device operation gates (never awaited while holding the DM lock).
+    gates: HashMap<String, Arc<Mutex<()>>>,
+    /// Cancel tokens of in-flight connects, owned by the gate holder (NB2).
+    in_flight: HashMap<String, CancelToken>,
+    /// Bumped by every disconnect; a connect that started before it gives up (so a
+    /// connect queued on the gate behind a disconnect never reconnects the device).
+    disconnect_epoch: HashMap<String, u64>,
+    /// Devices with a spawned reconnect attempt not yet finished.
+    attempts_spawned: HashSet<String>,
+    reconnect_permits: Arc<Semaphore>,
+    /// ANT+ give-up delay (ADR-2c); a field so tests can shorten it.
+    ant_give_up: Duration,
+    /// Results of spawned background tasks, drained by the next watchdog tick.
+    pending_report: Arc<StdMutex<WatchdogReport>>,
+    /// Shared primary-device map; listeners check this before sending readings.
+    primary_devices: PrimariesHandle,
 }
 
-impl DeviceManager {
+impl DeviceManager<RealIo> {
     pub fn new() -> Self {
+        Self::with_io(RealIo::new())
+    }
+}
+
+impl<Io: DeviceIo> DeviceManager<Io> {
+    pub fn with_io(io: Io) -> Self {
         Self {
-            ble: None,
-            ant: None,
-            ant_was_available: false,
-            ant_probe_failed: false,
-            trainer_backends: HashMap::new(),
-            connected_devices: HashMap::new(),
+            io: Arc::new(io),
             storage: None,
-            ant_metadata: None,
-            ant_last_seen: None,
+            records: HashMap::new(),
             listener_handles: HashMap::new(),
+            trainer_backends: HashMap::new(),
             reconnect: ReconnectManager::new(),
-            primary_devices: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            gates: HashMap::new(),
+            in_flight: HashMap::new(),
+            disconnect_epoch: HashMap::new(),
+            attempts_spawned: HashSet::new(),
+            reconnect_permits: Arc::new(Semaphore::new(RECONNECT_CONCURRENCY)),
+            ant_give_up: ANT_GIVE_UP,
+            pending_report: Arc::new(StdMutex::new(WatchdogReport::default())),
+            primary_devices: PrimaryState::shared(),
         }
     }
 
@@ -73,85 +182,59 @@ impl DeviceManager {
     }
 
     /// Returns a clone of the shared primary-device Arc for external consumers.
-    pub fn primaries_handle(&self) -> Arc<std::sync::RwLock<HashMap<DeviceType, String>>> {
+    pub fn primaries_handle(&self) -> PrimariesHandle {
         self.primary_devices.clone()
     }
 
-    /// Set device as primary for its type if no primary exists yet.
-    fn auto_set_primary(&self, device_type: DeviceType, device_id: &str) {
-        let mut p = self.primary_devices.write().unwrap_or_else(|e| e.into_inner());
-        p.entry(device_type).or_insert_with(|| device_id.to_owned());
+    #[cfg(test)]
+    pub fn io(&self) -> Arc<Io> {
+        self.io.clone()
     }
 
-    /// Remove all primary entries that reference the given device.
-    fn remove_primary(&self, device_id: &str) {
-        let mut p = self.primary_devices.write().unwrap_or_else(|e| e.into_inner());
-        p.retain(|_, v| v != device_id);
+    fn primary_state(&self) -> std::sync::RwLockWriteGuard<'_, PrimaryState> {
+        self.primary_devices.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Set AntManager and cache its metadata store
-    fn set_ant(&mut self, ant: Option<AntManager>) {
-        if let Some(ref a) = ant {
-            self.ant_metadata = Some(a.metadata_store());
-            self.ant_last_seen = Some(a.last_seen_store());
-            self.ant_was_available = true;
-            self.ant_probe_failed = false;
+    /// Device is (again) delivering: real capabilities; the trainer primary is
+    /// claimed at connect (other metrics are claimed lazily on first reading).
+    fn on_connected(&self, device_type: DeviceType, device_id: &str) {
+        let mut p = self.primary_state();
+        p.register(device_id, DeviceCaps::for_device(device_id, device_type));
+        if device_type == DeviceType::FitnessTrainer {
+            p.claim_if_free(Metric::Trainer, device_id);
         }
-        self.ant = ant;
     }
 
-    /// Ensure ANT+ is available, re-initializing if it was lost due to a panic.
-    /// Skips USB enumeration if a previous probe already found no stick
-    /// (the flag is reset on user-initiated scan via `scan_all()`).
-    async fn ensure_ant(&mut self) {
-        if self.ant.is_some() {
-            return;
-        }
-        if self.ant_probe_failed {
-            return;
-        }
-        if self.ant_was_available {
-            warn!("ANT+ manager was lost (panic?), attempting re-initialization");
-        }
-        let ant = tokio::task::spawn_blocking(|| AntManager::try_new())
-            .await
-            .unwrap_or(None);
-        if ant.is_none() {
-            self.ant_probe_failed = true;
-        }
-        self.set_ant(ant);
+    /// Stale or lost: free primary slots so a backup can take over.
+    fn release_claims(&self, device_id: &str) {
+        self.primary_state().release_claims(device_id);
     }
 
-    /// Run a blocking closure with the AntManager, guaranteeing put-back even on panic.
-    /// Returns Err if no AntManager is available or if spawn_blocking panics.
-    async fn with_ant_blocking<F, R>(&mut self, f: F) -> Result<R, AppError>
-    where
-        F: FnOnce(&mut AntManager) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let mut ant = self
-            .ant
-            .take()
-            .ok_or_else(|| AppError::from(AntError::NoUsbStick))?;
+    /// Disconnected: capabilities first, then claims (ADR-3a).
+    fn unregister_device(&self, device_id: &str) {
+        self.primary_state().unregister(device_id);
+    }
 
-        let result = tokio::task::spawn_blocking(move || {
-            let r = f(&mut ant);
-            (ant, r)
-        })
-        .await;
+    fn gate(&mut self, device_id: &str) -> Arc<Mutex<()>> {
+        self.gates
+            .entry(device_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
 
-        match result {
-            Ok((ant_back, r)) => {
-                self.set_ant(Some(ant_back));
-                Ok(r)
+    /// Live view of a device: records, plus in-flight connects shown as Connecting.
+    fn live_overlay(&self, devices: &mut HashMap<String, DeviceInfo>) {
+        for id in self.in_flight.keys() {
+            if !self.records.contains_key(id) {
+                if let Some(info) = devices.get_mut(id) {
+                    info.status = ConnectionStatus::Connecting;
+                }
             }
-            Err(e) => {
-                // spawn_blocking panicked — AntManager is consumed.
-                // ant is already None from take(); ant_was_available remains true
-                // so ensure_ant() will reinit on next use.
-                log::error!("[ant+] Blocking task panicked: {}", e);
-                Err(AntError::TaskPanicked(format!("{}", e)).into())
-            }
+        }
+        for (id, rec) in &self.records {
+            let mut info = rec.info.clone();
+            info.in_range = true;
+            devices.insert(id.clone(), info);
         }
     }
 
@@ -165,33 +248,17 @@ impl DeviceManager {
                 }
             }
         }
-        for (id, info) in &self.connected_devices {
-            devices.insert(id.clone(), info.clone());
-        }
-        // Annotate ANT+ devices with metadata from common data pages
+        self.live_overlay(&mut devices);
         self.annotate_ant_metadata(&mut devices);
-
-        // Compute cross-transport device groups
-        let device_list: Vec<DeviceInfo> = devices.values().cloned().collect();
-        let groups = compute_device_groups(&device_list);
-        for (id, group_id) in &groups {
-            if let Some(info) = devices.get_mut(id) {
-                info.device_group = Some(group_id.clone());
-            }
-        }
-
+        apply_groups(&mut devices);
         devices.into_values().collect()
     }
 
-    /// Scan for devices on all available transports.
-    /// Always includes currently-connected devices in the results.
-    /// Loads known devices from storage as a base layer.
-    /// BLE and ANT+ scans run concurrently to minimize total scan time.
-    pub async fn scan_all(&mut self) -> Result<Vec<DeviceInfo>, AppError> {
+    /// Merge scan results with known devices and live state.
+    /// Live connection status always wins over a scan result for the same id;
+    /// the scan only contributes `in_range` (and fresh fields for idle devices).
+    async fn merge_scan(&self, found: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
         let mut discovered: HashMap<String, DeviceInfo> = HashMap::new();
-        let mut scan_found: HashSet<String> = HashSet::new();
-
-        // Load known devices from storage as base layer
         if let Some(ref storage) = self.storage {
             if let Ok(known) = storage.list_known_devices().await {
                 for d in known {
@@ -199,410 +266,520 @@ impl DeviceManager {
                 }
             }
         }
-
-        // Initialize BLE on first scan
-        if self.ble.is_none() {
-            match BleManager::new().await {
-                Ok(mgr) => self.ble = Some(mgr),
-                Err(e) => log::warn!("[ble] Not available: {}", e),
-            }
+        let scan_found: HashSet<String> = found.iter().map(|d| d.id.clone()).collect();
+        for d in found {
+            discovered.insert(d.id.clone(), d);
         }
-
-        // Start BLE scan
-        if let Some(ref ble) = self.ble {
-            if let Err(e) = ble.start_scan().await {
-                log::warn!("[ble] Scan start failed: {}", e);
-            }
+        for info in discovered.values_mut() {
+            info.in_range = scan_found.contains(&info.id);
         }
-
-        // Kick off ANT+ probe+scan concurrently while BLE scans.
-        // User-initiated scan always retries ANT+ (reset probe failure cache).
-        self.ant_probe_failed = false;
-        let ant_taken = self.ant.take();
-        let ant_task = tokio::task::spawn_blocking(move || {
-            let ant = ant_taken.or_else(AntManager::try_new);
-            if let Some(mut ant_mgr) = ant {
-                let result = ant_mgr.scan();
-                (Some(ant_mgr), result.ok())
-            } else {
-                (None, None)
-            }
-        });
-
-        // Sleep during BLE scan (ANT+ runs concurrently on blocking thread)
-        tokio::time::sleep(tokio::time::Duration::from_secs(config::BLE_SCAN_DURATION_SECS)).await;
-
-        // Collect BLE results
-        if let Some(ref ble) = self.ble {
-            let _ = ble.stop_scan().await;
-            match ble.get_discovered_devices().await {
-                Ok(devices) => {
-                    for d in devices {
-                        scan_found.insert(d.id.clone());
-                        discovered.insert(d.id.clone(), d);
-                    }
-                }
-                Err(e) => log::warn!("[ble] Discovery failed: {}", e),
-            }
-        }
-
-        // Collect ANT+ results (may already be done if it finished during BLE sleep)
-        match ant_task.await {
-            Ok((ant_back, ant_devices)) => {
-                if let Some(ant) = ant_back {
-                    self.set_ant(Some(ant));
-                } else {
-                    self.ant_probe_failed = true;
-                }
-                if let Some(devices) = ant_devices {
-                    for d in devices {
-                        scan_found.insert(d.id.clone());
-                        discovered.insert(d.id.clone(), d);
-                    }
-                }
-            }
-            Err(e) => {
-                // spawn_blocking panicked — AntManager is lost, will reinit next scan
-                log::error!("[ant+] Scan task panicked: {}", e);
-            }
-        }
-
-        // Connected devices are always considered in range
-        for id in self.connected_devices.keys() {
-            scan_found.insert(id.clone());
-        }
-
-        // Merge: connected devices always appear (with Connected status),
-        // plus any newly discovered devices not already connected
-        for (id, info) in &self.connected_devices {
-            discovered.insert(id.clone(), info.clone());
-        }
-
-        // Mark in_range based on whether the device was found in this scan
-        for (id, info) in &mut discovered {
-            info.in_range = scan_found.contains(id);
-        }
-
-        // Annotate ANT+ devices with metadata from common data pages
+        self.live_overlay(&mut discovered);
         self.annotate_ant_metadata(&mut discovered);
-
-        // Compute cross-transport device groups
-        let device_list: Vec<DeviceInfo> = discovered.values().cloned().collect();
-        let groups = compute_device_groups(&device_list);
-        for (id, group_id) in &groups {
-            if let Some(info) = discovered.get_mut(id) {
-                info.device_group = Some(group_id.clone());
-            }
-        }
+        apply_groups(&mut discovered);
 
         let result: Vec<DeviceInfo> = discovered.into_values().collect();
-
-        // Persist discovered devices to storage (single transaction)
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.upsert_known_devices_batch(&result).await {
-                log::warn!("Failed to batch-persist devices: {}", e);
+                warn!("Failed to batch-persist devices: {}", e);
             }
         }
-
-        Ok(result)
+        result
     }
 
-    /// Connect to a device by ID (routes to BLE or ANT+ based on ID prefix)
-    pub async fn connect(
-        &mut self,
+    /// Scan all transports without holding the DM lock during the scan.
+    pub async fn scan_shared(dm: &SharedDeviceManager<Io>) -> Result<Vec<DeviceInfo>, AppError> {
+        let io = dm.lock().await.io.clone();
+        let found = io.scan().await;
+        let g = dm.lock().await;
+        Ok(g.merge_scan(found).await)
+    }
+
+    /// Manual connect (command path). Already-connected devices are a no-op success.
+    pub async fn connect_shared(
+        dm: &SharedDeviceManager<Io>,
         device_id: &str,
         tx: broadcast::Sender<SensorReading>,
     ) -> Result<DeviceInfo, AppError> {
-        if device_id.starts_with("ant:") {
-            self.connect_ant(device_id, tx).await
-        } else {
-            self.connect_ble(device_id, tx).await
+        match Self::connect_with_origin(dm, device_id, tx, ConnectOrigin::Manual).await? {
+            ConnectOutcome::Connected(i)
+            | ConnectOutcome::AlreadyConnected(i)
+            | ConnectOutcome::StillReconnecting(i) => Ok(i),
+            ConnectOutcome::Skipped => Err(AppError::Cancelled),
         }
     }
 
-    async fn connect_ble(
-        &mut self,
+    pub async fn connect_with_origin(
+        dm: &SharedDeviceManager<Io>,
         device_id: &str,
         tx: broadcast::Sender<SensorReading>,
-    ) -> Result<DeviceInfo, AppError> {
-        if self.ble.is_none() {
-            match BleManager::new().await {
-                Ok(mgr) => self.ble = Some(mgr),
-                Err(e) => return Err(BleError::Btleplug(format!("BLE init failed: {}", e)).into()),
-            }
-        }
-        let ble = self.ble.as_ref().ok_or(BleError::NotInitialized)?;
-        let mut info = ble.connect_device(device_id).await?;
-
-        // Read DIS metadata to populate manufacturer/model/serial
-        if let Ok(details) = ble.get_device_details(device_id).await {
-            info.manufacturer = details.manufacturer;
-            info.model_number = details.model_number;
-            info.serial_number = details.serial_number;
-        }
-
-        // If it's a trainer, create FTMS controller
-        if info.device_type == DeviceType::FitnessTrainer {
-            let connected = ble.get_connected();
-            let connected_lock = connected.lock().await;
-            if let Some(peripheral) = connected_lock.get(device_id) {
-                if let Ok(controller) = TrainerController::new(peripheral.clone()) {
-                    self.trainer_backends.insert(
-                        device_id.to_string(),
-                        TrainerBackend::Ftms(controller),
-                    );
-                    info!("[{}] FTMS trainer controller created", device_id);
+        origin: ConnectOrigin,
+    ) -> Result<ConnectOutcome, AppError> {
+        // Phase 1 (lock): fast no-op path, manual connect clears auto-reconnect.
+        let (gate, io, primaries, epoch) = {
+            let mut g = dm.lock().await;
+            if let Some(rec) = g.records.get(device_id) {
+                if rec.phase == Phase::Connected {
+                    return Ok(ConnectOutcome::AlreadyConnected(rec.info.clone()));
                 }
             }
+            if origin == ConnectOrigin::Manual {
+                g.reconnect.remove(device_id);
+            }
+            let epoch = g.disconnect_epoch.get(device_id).copied().unwrap_or(0);
+            (g.gate(device_id), g.io.clone(), g.primary_devices.clone(), epoch)
+        };
+
+        // Phase 2: own this device. Auto attempts never queue behind a busy device.
+        let _gate = match origin {
+            ConnectOrigin::Manual => gate.lock_owned().await,
+            ConnectOrigin::AutoReconnect => match gate.try_lock_owned() {
+                Ok(g) => g,
+                Err(_) => return Ok(ConnectOutcome::Skipped),
+            },
+        };
+
+        // NB1: the gate holder performs any teardown still pending for a Lost record.
+        Self::run_pending_teardown(dm, device_id).await;
+
+        // Phase 3 (lock): re-check, then register the in-flight token (NB2: post-gate).
+        let (token, stale) = {
+            let mut g = dm.lock().await;
+            if g.disconnect_epoch.get(device_id).copied().unwrap_or(0) != epoch {
+                // A disconnect was requested after this connect started.
+                return Err(AppError::Cancelled);
+            }
+            if let Some(rec) = g.records.get(device_id) {
+                if rec.phase == Phase::Connected {
+                    return Ok(ConnectOutcome::AlreadyConnected(rec.info.clone()));
+                }
+            }
+            if origin == ConnectOrigin::AutoReconnect {
+                if !g.reconnect.contains(device_id) {
+                    return Ok(ConnectOutcome::Skipped);
+                }
+                g.reconnect.record_attempt(device_id);
+            }
+            let stale = g
+                .records
+                .get(device_id)
+                .is_some_and(|r| matches!(r.phase, Phase::Stale { .. }));
+            let token = CancelToken::new();
+            g.in_flight.insert(device_id.to_string(), token.clone());
+            // NB2: registered by the gate holder, before any listener can run.
+            if !g.primary_state().is_registered(device_id) {
+                g.primary_state().register(device_id, DeviceCaps::pending());
+            }
+            (token, stale)
+        };
+
+        // ADR-2b: the channel is still open and searching. Never open a second one;
+        // wait briefly for the device to show up on it.
+        if stale {
+            let got_data = io.await_data(device_id, ANT_REJOIN_WAIT, &token).await;
+            let mut g = dm.lock().await;
+            if g.in_flight.get(device_id).is_some_and(|t| t.same_as(&token)) {
+                g.in_flight.remove(device_id);
+            }
+            if token.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            let Some(rec) = g.records.get_mut(device_id) else {
+                return Err(AppError::Cancelled);
+            };
+            if got_data && matches!(rec.phase, Phase::Stale { .. }) {
+                rec.set_phase(Phase::Connected);
+                let info = rec.info.clone();
+                g.on_connected(info.device_type, device_id);
+                {
+                    let mut r = g.pending_report.lock().unwrap_or_else(|e| e.into_inner());
+                    r.reconnected.push(device_id.to_string());
+                    r.list_dirty = true;
+                }
+                return Ok(ConnectOutcome::Connected(info));
+            }
+            return Ok(ConnectOutcome::StillReconnecting(rec.info.clone()));
         }
 
-        // Spawn BLE notification listener (mirrors ANT+ which spawns in AntManager.connect)
-        {
-            let connected = ble.get_connected();
-            let connected_lock = connected.lock().await;
-            if let Some(peripheral) = connected_lock.get(device_id) {
-                let peripheral = peripheral.clone();
-                let device_type = info.device_type;
-                let did = device_id.to_string();
-                let primaries = Some(self.primary_devices.clone());
-                drop(connected_lock);
+        // Phase 4: transport I/O without the DM lock.
+        let ctx = ListenerCtx { tx, primaries };
+        let result = io.connect(device_id, ctx, token.clone()).await;
 
-                let handle = tokio::spawn(async move {
-                    listen_to_device(peripheral, device_type, tx, did, primaries).await;
-                });
-                self.listener_handles.insert(device_id.to_string(), handle);
-            } else {
-                warn!(
-                    "[{}] Peripheral not found in connected map after connect",
-                    device_id
-                );
+        // Phase 5 (lock): commit, unless cancelled.
+        let mut g = dm.lock().await;
+        let mine = g.in_flight.get(device_id).is_some_and(|t| t.same_as(&token));
+        if mine {
+            g.in_flight.remove(device_id);
+        }
+        // Only the owning attempt may drop the registration it made (NB2).
+        let undo_registration = |g: &DeviceManager<Io>| {
+            if mine && !g.records.contains_key(device_id) {
+                g.unregister_device(device_id);
+            }
+        };
+        if token.is_cancelled() {
+            undo_registration(&g);
+            drop(g);
+            // NB3: undo a connect that completed after the cancel, before releasing the gate.
+            if let Ok(c) = result {
+                if let Some(h) = c.listener {
+                    h.abort();
+                }
+                if let Err(e) = io.disconnect(device_id).await {
+                    warn!("[{}] Disconnect after cancelled connect failed: {}", device_id, e);
+                }
+            }
+            return Err(AppError::Cancelled);
+        }
+
+        match result {
+            Err(e) => {
+                if origin == ConnectOrigin::Manual {
+                    // A failed manual connect of a Reconnecting device leaves it
+                    // Reconnecting and keeps auto-reconnect going.
+                    let torn_down = g
+                        .records
+                        .get(device_id)
+                        .filter(|r| r.phase == Phase::TornDown)
+                        .map(|r| r.info.clone());
+                    if let Some(info) = torn_down {
+                        g.reconnect.register(info);
+                    }
+                }
+                undo_registration(&g);
+                Err(e)
+            }
+            Ok(c) => {
+                let info = g.commit_connect(device_id, c);
+                if origin == ConnectOrigin::AutoReconnect {
+                    g.reconnect.remove(device_id);
+                }
+                Ok(ConnectOutcome::Connected(info))
             }
         }
+    }
 
+    fn commit_connect(&mut self, device_id: &str, c: Connected) -> DeviceInfo {
+        let mut info = c.info;
+        info.status = ConnectionStatus::Connected;
+        if let Some(old) = self.listener_handles.remove(device_id) {
+            old.abort();
+        }
+        if let Some(h) = c.listener {
+            self.listener_handles.insert(device_id.to_string(), h);
+        }
+        match c.trainer {
+            Some(t) => {
+                self.trainer_backends.insert(device_id.to_string(), t);
+            }
+            None => {
+                self.trainer_backends.remove(device_id);
+            }
+        }
         info!(
-            "[{}] Connected via BLE: {:?} ({})",
+            "[{}] Connected via {:?}: {:?} ({})",
             device_id,
+            info.transport,
             info.device_type,
             info.name.as_deref().unwrap_or("unnamed")
         );
-        self.connected_devices
-            .insert(device_id.to_string(), info.clone());
-        self.auto_set_primary(info.device_type, device_id);
-        Ok(info)
-    }
-
-    async fn connect_ant(
-        &mut self,
-        device_id: &str,
-        tx: broadcast::Sender<SensorReading>,
-    ) -> Result<DeviceInfo, AppError> {
-        self.ensure_ant().await;
-        // If device isn't discovered yet, run a scan first
-        {
-            let needs_scan = self
-                .ant
-                .as_ref()
-                .map(|a| !a.is_discovered(device_id))
-                .unwrap_or(true);
-            if needs_scan {
-                self.with_ant_blocking(|ant| {
-                    let _ = ant.scan();
-                })
-                .await?;
-            }
-        }
-
-        let id = device_id.to_string();
-        let primaries = Some(self.primary_devices.clone());
-        let info = self
-            .with_ant_blocking(move |ant| ant.connect(&id, tx, primaries))
-            .await??;
-
-        // If it's a trainer, store FE-C backend
-        if let Some(ref ant) = self.ant {
-            if info.device_type == DeviceType::FitnessTrainer {
-                if let Some((usb, channel)) = ant.get_fec_channel(device_id) {
-                    self.trainer_backends.insert(
-                        device_id.to_string(),
-                        TrainerBackend::Fec { usb, channel },
-                    );
-                    info!("[{}] FE-C trainer controller created", device_id);
-                }
-            }
-        }
-
-        info!(
-            "[{}] Connected via ANT+: {:?} ({})",
-            device_id,
-            info.device_type,
-            info.name.as_deref().unwrap_or("unnamed")
+        self.records.insert(
+            device_id.to_string(),
+            DeviceRecord { info: info.clone(), phase: Phase::Connected },
         );
-        self.connected_devices
-            .insert(device_id.to_string(), info.clone());
-        self.auto_set_primary(info.device_type, device_id);
-        Ok(info)
+        self.on_connected(info.device_type, device_id);
+        info
     }
 
-    /// Disconnect a device
-    pub async fn disconnect(&mut self, device_id: &str) -> Result<(), AppError> {
-        self.remove_primary(device_id);
-        if let Some(handle) = self.listener_handles.remove(device_id) {
-            handle.abort();
-        }
-        self.trainer_backends.remove(device_id);
-        self.connected_devices.remove(device_id);
-
-        if device_id.starts_with("ant:") {
-            if self.ant.is_some() {
-                let id = device_id.to_string();
-                self.with_ant_blocking(move |ant| ant.disconnect(&id))
-                    .await??;
+    /// Disconnect a device: cancels an in-flight connect, stops auto-reconnect,
+    /// releases primaries, then tears down the transport outside the DM lock.
+    pub async fn disconnect_shared(dm: &SharedDeviceManager<Io>, device_id: &str) -> Result<(), AppError> {
+        let gate = {
+            let mut g = dm.lock().await;
+            if let Some(t) = g.in_flight.get(device_id) {
+                t.cancel();
             }
-        } else {
-            let ble = self
-                .ble
-                .as_ref()
-                .ok_or_else(|| BleError::NotInitialized)?;
-            ble.disconnect_device(device_id).await?;
-        }
+            *g.disconnect_epoch.entry(device_id.to_string()).or_insert(0) += 1;
+            g.reconnect.remove(device_id);
+            g.unregister_device(device_id);
+            g.gate(device_id)
+        };
+        let _gate = gate.lock_owned().await;
+        let io = {
+            let mut g = dm.lock().await;
+            g.records.remove(device_id);
+            // A watchdog Lost transition may have re-registered it while we waited.
+            g.reconnect.remove(device_id);
+            g.unregister_device(device_id);
+            if let Some(h) = g.listener_handles.remove(device_id) {
+                h.abort();
+            }
+            g.trainer_backends.remove(device_id);
+            g.io.clone()
+        };
+        io.disconnect(device_id).await?;
         info!("[{}] Disconnected", device_id);
         Ok(())
     }
 
-    /// Check all connected devices and return IDs of any that have disconnected.
-    /// Cleans up internal state (connected_devices, trainer_backends, BLE connected map).
-    pub async fn check_connections(&mut self) -> Vec<DeviceInfo> {
-        let mut disconnected = Vec::new();
-
-        // Check BLE peripherals via is_connected()
-        if let Some(ref ble) = self.ble {
-            let connected_arc = ble.get_connected();
-
-            // Collect peripherals to check, then drop the lock before async I/O
-            let to_check: Vec<(String, btleplug::platform::Peripheral)> = {
-                let connected = connected_arc.lock().await;
-                self.connected_devices
-                    .keys()
-                    .filter(|id| !id.starts_with("ant:"))
-                    .filter_map(|id| connected.get(id).map(|p| (id.clone(), p.clone())))
-                    .collect()
+    /// Must be called while holding the device's gate. Performs a teardown that a
+    /// watchdog Lost transition left pending; no-op otherwise.
+    async fn run_pending_teardown(dm: &SharedDeviceManager<Io>, device_id: &str) {
+        let (io, give_up, report) = {
+            let mut g = dm.lock().await;
+            let Some(rec) = g.records.get_mut(device_id) else {
+                return;
             };
-
-            for (id, peripheral) in to_check {
-                if !peripheral.is_connected().await.unwrap_or(false) {
-                    if let Some(info) = self.connected_devices.get(&id) {
-                        disconnected.push(info.clone());
-                    }
-                }
+            let Phase::LostPendingTeardown { give_up } = rec.phase else {
+                return;
+            };
+            if give_up {
+                g.records.remove(device_id);
+                g.unregister_device(device_id);
+            } else {
+                rec.set_phase(Phase::TornDown);
             }
+            if let Some(h) = g.listener_handles.remove(device_id) {
+                h.abort();
+            }
+            g.trainer_backends.remove(device_id);
+            (g.io.clone(), give_up, g.pending_report.clone())
+        };
+        if let Err(e) = io.disconnect(device_id).await {
+            warn!("[{}] Teardown after link loss failed: {}", device_id, e);
+        }
+        if give_up {
+            // Only now is "Disconnected" the true state; re-send the list next tick.
+            report.lock().unwrap_or_else(|e| e.into_inner()).list_dirty = true;
+        }
+    }
 
-            // Remove from BLE connected map
-            if !disconnected.is_empty() {
-                let mut connected = connected_arc.lock().await;
-                for info in &disconnected {
-                    connected.remove(&info.id);
-                }
+    /// Turn a watchdog report into the frontend events, in emit order. The list is
+    /// built after the transitions it reflects, so it never shows a stale status.
+    pub async fn report_events(dm: &SharedDeviceManager<Io>, report: WatchdogReport) -> Vec<DeviceEvent> {
+        let mut events: Vec<DeviceEvent> = report.disconnected.iter().cloned().map(DeviceEvent::Disconnected).collect();
+        events.extend(report.reconnected.iter().cloned().map(DeviceEvent::Reconnected));
+        if report.list_changed() {
+            events.push(DeviceEvent::ListUpdated(dm.lock().await.list_current().await));
+        }
+        events.extend(report.reconnecting.into_iter().map(|(info, attempt)| DeviceEvent::Reconnecting {
+            device_id: info.id,
+            device_type: info.device_type.as_str().to_string(),
+            attempt,
+        }));
+        events
+    }
+
+    /// Spawned teardown for a Lost device. Takes the gate; if a connect or
+    /// disconnect got there first it already did the work and this is a no-op.
+    async fn teardown_task(dm: SharedDeviceManager<Io>, device_id: String) {
+        let gate = dm.lock().await.gate(&device_id);
+        let _g = gate.lock_owned().await;
+        Self::run_pending_teardown(&dm, &device_id).await;
+    }
+
+    /// Spawned auto-reconnect attempt (bounded concurrency).
+    async fn reconnect_task(
+        dm: SharedDeviceManager<Io>,
+        info: DeviceInfo,
+        tx: broadcast::Sender<SensorReading>,
+    ) {
+        let (permits, report) = {
+            let g = dm.lock().await;
+            (g.reconnect_permits.clone(), g.pending_report.clone())
+        };
+        let outcome = match permits.acquire_owned().await {
+            Ok(_permit) => {
+                Self::connect_with_origin(&dm, &info.id, tx, ConnectOrigin::AutoReconnect).await
+            }
+            Err(_) => Ok(ConnectOutcome::Skipped),
+        };
+        let mut g = dm.lock().await;
+        g.attempts_spawned.remove(&info.id);
+        let attempt = g.reconnect.attempt_count(&info.id);
+        let mut r = report.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(ConnectOutcome::Connected(new_info)) => {
+                info!("[{}] Reconnected", new_info.id);
+                r.reconnected.push(new_info.id);
+                r.list_dirty = true;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::debug!("[{}] Reconnect attempt {} failed: {}", info.id, attempt, e);
+                r.reconnecting.push((info, attempt));
             }
         }
+    }
 
-        // Check ANT+ staleness via lock-free last-seen timestamps
-        if let Some(ref last_seen_store) = self.ant_last_seen {
-            let last_seen = last_seen_store.lock().unwrap_or_else(|e| e.into_inner());
-            let ant_ids: Vec<String> = self
-                .connected_devices
-                .keys()
-                .filter(|id| id.starts_with("ant:"))
-                .cloned()
+    /// One watchdog pass: probe links, apply transitions, spawn teardowns and due
+    /// reconnects. Never awaits transport work while holding the DM lock, and never
+    /// waits for a reconnect attempt to finish.
+    pub async fn watchdog_tick(
+        dm: &SharedDeviceManager<Io>,
+        tx: &broadcast::Sender<SensorReading>,
+    ) -> WatchdogReport {
+        let (io, ids) = {
+            let g = dm.lock().await;
+            let ids: Vec<String> = g
+                .records
+                .iter()
+                .filter(|(_, r)| matches!(r.phase, Phase::Connected | Phase::Stale { .. }))
+                .map(|(id, _)| id.clone())
                 .collect();
-            for id in ant_ids {
-                if let Some(ts) = last_seen.get(&id) {
-                    if let Some(elapsed) = super::ant::listener::atomic_elapsed(ts) {
-                        if elapsed > std::time::Duration::from_secs(config::DEVICE_DISCONNECT_TIMEOUT_SECS) {
-                            if let Some(info) = self.connected_devices.get(&id) {
-                                disconnected.push(info.clone());
-                            }
+            (g.io.clone(), ids)
+        };
+        let states = io.probe(ids).await;
+
+        let mut report = WatchdogReport::default();
+        let (teardowns, due) = {
+            let mut g = dm.lock().await;
+            let now = Instant::now();
+            let give_up_after = g.ant_give_up;
+            let mut teardowns = Vec::new();
+            for (id, state) in states {
+                let Some(rec) = g.records.get_mut(&id) else { continue };
+                match (rec.phase, state) {
+                    (Phase::Connected, LinkState::Alive) => {}
+                    (Phase::Connected, LinkState::Stale) => {
+                        // ADR-2: keep the channel searching; only the status changes.
+                        warn!("[{}] Connection watchdog: no ANT+ data, searching", id);
+                        rec.set_phase(Phase::Stale { since: now, ticks: 0 });
+                        g.release_claims(&id);
+                        report.disconnected.push(id);
+                        report.list_dirty = true;
+                    }
+                    (Phase::Stale { .. }, LinkState::Alive) => {
+                        info!("[{}] ANT+ data resumed on the same channel", id);
+                        rec.set_phase(Phase::Connected);
+                        let device_type = rec.info.device_type;
+                        g.on_connected(device_type, &id);
+                        report.reconnected.push(id);
+                        report.list_dirty = true;
+                    }
+                    (Phase::Stale { since, ticks }, LinkState::Stale) => {
+                        if now.duration_since(since) >= give_up_after {
+                            warn!("[{}] ANT+ device silent for {:?}; giving up", id, give_up_after);
+                            rec.set_phase(Phase::LostPendingTeardown { give_up: true });
+                            g.trainer_backends.remove(&id);
+                            report.disconnected.push(id.clone());
+                            teardowns.push(id);
+                        } else {
+                            rec.set_phase(Phase::Stale { since, ticks: ticks + 1 });
+                            report.reconnecting.push((rec.info.clone(), ticks + 1));
                         }
                     }
-                    // No timestamp yet (0) → just connected, give it time
+                    (Phase::Connected | Phase::Stale { .. }, LinkState::Lost) => {
+                        warn!("[{}] Connection watchdog: {:?} link lost", id, rec.info.device_type);
+                        rec.set_phase(Phase::LostPendingTeardown { give_up: false });
+                        let info = rec.info.clone();
+                        g.release_claims(&id);
+                        g.trainer_backends.remove(&id);
+                        g.reconnect.register(info);
+                        if !report.disconnected.contains(&id) {
+                            report.disconnected.push(id.clone());
+                        }
+                        report.list_dirty = true;
+                        teardowns.push(id);
+                    }
+                    _ => {}
                 }
             }
-        }
-
-        // Clean up internal state for all disconnected devices
-        for info in &disconnected {
-            warn!("[{}] Connection watchdog: {:?} disconnected", info.id, info.device_type);
-            self.remove_primary(&info.id);
-            self.connected_devices.remove(&info.id);
-            self.trainer_backends.remove(&info.id);
-            if let Some(handle) = self.listener_handles.remove(&info.id) {
-                handle.abort();
+            let due: Vec<DeviceInfo> = g
+                .reconnect
+                .peek_due()
+                .into_iter()
+                .filter(|i| !g.attempts_spawned.contains(&i.id))
+                .collect();
+            for i in &due {
+                g.attempts_spawned.insert(i.id.clone());
             }
+            let pending = std::mem::take(&mut *g.pending_report.lock().unwrap_or_else(|e| e.into_inner()));
+            report.absorb(pending);
+            (teardowns, due)
+        };
+
+        for id in teardowns {
+            tokio::spawn(Self::teardown_task(dm.clone(), id));
         }
-
-        // Register disconnected devices for auto-reconnect
-        for info in &disconnected {
-            self.reconnect.register(info.clone());
-        }
-
-        disconnected
-    }
-
-    /// Attempt reconnects for devices due for retry.
-    /// Returns (reconnected, still_trying) device infos.
-    pub async fn attempt_reconnects(
-        &mut self,
-        tx: &broadcast::Sender<SensorReading>,
-    ) -> (Vec<DeviceInfo>, Vec<(DeviceInfo, u32)>) {
-        let due = self.reconnect.due_for_retry();
-        let mut reconnected = Vec::new();
-        let mut still_trying = Vec::new();
-
         for info in due {
-            let attempt = self.reconnect.attempt_count(&info.id);
-            match self.connect(&info.id, tx.clone()).await {
-                Ok(new_info) => {
-                    log::info!("[{}] Reconnected on attempt {}", info.id, attempt);
-                    self.reconnect.remove(&info.id);
-                    self.auto_set_primary(new_info.device_type, &new_info.id);
-                    reconnected.push(new_info);
-                }
-                Err(e) => {
-                    log::debug!(
-                        "[{}] Reconnect attempt {} failed: {}",
-                        info.id,
-                        attempt,
-                        e
-                    );
-                    still_trying.push((info, attempt));
-                }
-            }
+            tokio::spawn(Self::reconnect_task(dm.clone(), info, tx.clone()));
         }
-
-        (reconnected, still_trying)
+        report
     }
 
-    pub fn clear_reconnect_target(&mut self, device_id: &str) {
-        self.reconnect.remove(device_id);
+    /// Device details without holding the DM lock across BLE GATT reads.
+    pub async fn device_details_shared(
+        dm: &SharedDeviceManager<Io>,
+        device_id: &str,
+    ) -> Result<DeviceDetails, AppError> {
+        let io = {
+            let g = dm.lock().await;
+            if device_id.starts_with("ant:") {
+                return g.ant_device_details(device_id);
+            }
+            g.io.clone()
+        };
+        io.ble_details(device_id).await
     }
 
-    // Trainer control methods -- C2: FE-C calls wrapped in spawn_blocking
+    fn ant_device_details(&self, device_id: &str) -> Result<DeviceDetails, AppError> {
+        let info = &self
+            .records
+            .get(device_id)
+            .ok_or_else(|| AppError::DeviceNotFound(device_id.to_string()))?
+            .info;
+        let meta = self.io.ant_metadata().remove(device_id);
+        let (manufacturer, model_number, serial_number, hw_revision, sw_revision, battery_level) =
+            if let Some(m) = meta {
+                (
+                    m.manufacturer_id.map(ant_manufacturer_name),
+                    m.model_number.map(|n| n.to_string()),
+                    m.serial_number.map(|n| n.to_string()),
+                    m.hw_revision.map(|r| r.to_string()),
+                    m.sw_revision.clone(),
+                    m.battery_level.or(info.battery_level),
+                )
+            } else {
+                (None, None, None, None, None, info.battery_level)
+            };
+        Ok(DeviceDetails {
+            id: info.id.clone(),
+            name: info.name.clone(),
+            device_type: info.device_type,
+            transport: Transport::AntPlus,
+            rssi: info.rssi,
+            battery_level,
+            manufacturer,
+            model_number,
+            serial_number,
+            firmware_revision: sw_revision,
+            hardware_revision: hw_revision,
+            software_revision: None,
+            services: vec![],
+        })
+    }
+
+    // Trainer control. FE-C sends run in spawn_blocking; their task touches only the
+    // AntUsb handle (never AntSlot or the DM lock).
 
     pub async fn set_target_power(&mut self, device_id: &str, watts: i16) -> Result<(), AppError> {
         let watts = config::clamp_trainer_watts(watts as i32);
         let result = match self.trainer_backends.get_mut(device_id) {
-            Some(TrainerBackend::Ftms(controller)) => {
-                controller.set_target_power(watts).await
-            }
-            Some(TrainerBackend::Fec { usb, channel }) => {
-                let usb = usb.clone();
-                let ch = *channel;
+            Some(TrainerBackend::Ftms(controller)) => controller.set_target_power(watts).await,
+            Some(TrainerBackend::Fec { link, .. }) => {
+                let link = link.clone();
                 let w = watts.max(0) as u16;
                 tokio::task::spawn_blocking(move || {
-                    let fec = FecController::new(&usb, ch);
+                    let fec = FecController::new(&link);
                     fec.set_target_power(w)
                 })
                 .await
                 .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?
+            }
+            #[cfg(test)]
+            Some(TrainerBackend::Fake(count)) => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
             }
             None => Err(AppError::Session("No trainer connected".into())),
         };
@@ -614,19 +791,20 @@ impl DeviceManager {
 
     pub async fn set_resistance(&mut self, device_id: &str, level: u8) -> Result<(), AppError> {
         let result = match self.trainer_backends.get_mut(device_id) {
-            Some(TrainerBackend::Ftms(controller)) => {
-                controller.set_resistance(level).await
-            }
-            Some(TrainerBackend::Fec { usb, channel }) => {
-                let usb = usb.clone();
-                let ch = *channel;
-                let lvl = level;
+            Some(TrainerBackend::Ftms(controller)) => controller.set_resistance(level).await,
+            Some(TrainerBackend::Fec { link, .. }) => {
+                let link = link.clone();
                 tokio::task::spawn_blocking(move || {
-                    let fec = FecController::new(&usb, ch);
-                    fec.set_resistance(lvl)
+                    let fec = FecController::new(&link);
+                    fec.set_resistance(level)
                 })
                 .await
                 .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?
+            }
+            #[cfg(test)]
+            Some(TrainerBackend::Fake(count)) => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
             }
             None => Err(AppError::Session("No trainer connected".into())),
         };
@@ -644,18 +822,22 @@ impl DeviceManager {
         cw: f32,
     ) -> Result<(), AppError> {
         let result = match self.trainer_backends.get_mut(device_id) {
-            Some(TrainerBackend::Ftms(controller)) => {
-                controller.set_simulation(grade, crr, cw).await
-            }
-            Some(TrainerBackend::Fec { usb, channel }) => {
-                let usb = usb.clone();
-                let ch = *channel;
-                tokio::task::spawn_blocking(move || {
-                    let fec = FecController::new(&usb, ch);
-                    fec.set_simulation(grade, crr, cw)
+            Some(TrainerBackend::Ftms(controller)) => controller.set_simulation(grade, crr, cw).await,
+            Some(TrainerBackend::Fec { link, last_cw_raw }) => {
+                let link = link.clone();
+                let last = *last_cw_raw;
+                let sent = tokio::task::spawn_blocking(move || {
+                    let fec = FecController::new(&link);
+                    fec.set_simulation(grade, crr, cw, last)
                 })
                 .await
-                .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?
+                .map_err(|e| AppError::from(AntError::TaskPanicked(format!("FEC: {}", e))))?;
+                sent.map(|raw| *last_cw_raw = Some(raw))
+            }
+            #[cfg(test)]
+            Some(TrainerBackend::Fake(count)) => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
             }
             None => Err(AppError::Session("No trainer connected".into())),
         };
@@ -671,6 +853,8 @@ impl DeviceManager {
             Some(TrainerBackend::Fec { .. }) => {
                 Err(AntError::NotSupported("start/stop for ANT+ trainers".into()).into())
             }
+            #[cfg(test)]
+            Some(TrainerBackend::Fake(_)) => Ok(()),
             None => Err(AppError::Session("No trainer connected".into())),
         }
     }
@@ -681,91 +865,51 @@ impl DeviceManager {
             Some(TrainerBackend::Fec { .. }) => {
                 Err(AntError::NotSupported("start/stop for ANT+ trainers".into()).into())
             }
+            #[cfg(test)]
+            Some(TrainerBackend::Fake(_)) => Ok(()),
             None => Err(AppError::Session("No trainer connected".into())),
-        }
-    }
-
-    /// Get detailed information about a connected device
-    pub async fn get_device_details(&self, device_id: &str) -> Result<DeviceDetails, AppError> {
-        if device_id.starts_with("ant:") {
-            let info = self.connected_devices.get(device_id)
-                .ok_or_else(|| AppError::DeviceNotFound(device_id.to_string()))?;
-
-            // Get metadata from ANT+ Common Data Pages if available
-            let meta = self.ant.as_ref().and_then(|ant| ant.get_metadata(device_id));
-
-            let (manufacturer, model_number, serial_number, hw_revision, sw_revision, battery_level) =
-                if let Some(m) = meta {
-                    (
-                        m.manufacturer_id.map(ant_manufacturer_name),
-                        m.model_number.map(|n| n.to_string()),
-                        m.serial_number.map(|n| n.to_string()),
-                        m.hw_revision.map(|r| r.to_string()),
-                        m.sw_revision.clone(),
-                        m.battery_level.or(info.battery_level),
-                    )
-                } else {
-                    (None, None, None, None, None, info.battery_level)
-                };
-
-            Ok(DeviceDetails {
-                id: info.id.clone(),
-                name: info.name.clone(),
-                device_type: info.device_type,
-                transport: Transport::AntPlus,
-                rssi: info.rssi,
-                battery_level,
-                manufacturer,
-                model_number,
-                serial_number,
-                firmware_revision: sw_revision,
-                hardware_revision: hw_revision,
-                software_revision: None,
-                services: vec![],
-            })
-        } else {
-            let ble = self.ble.as_ref()
-                .ok_or_else(|| BleError::NotInitialized)?;
-            ble.get_device_details(device_id).await
         }
     }
 
     /// Annotate ANT+ devices with metadata from common data pages.
     fn annotate_ant_metadata(&self, devices: &mut HashMap<String, DeviceInfo>) {
-        if let Some(ref meta_store) = self.ant_metadata {
-            let meta = meta_store.lock().unwrap_or_else(|e| e.into_inner());
-            for (id, info) in devices.iter_mut() {
-                if id.starts_with("ant:") {
-                    if let Some(m) = meta.get(id) {
-                        if info.manufacturer.is_none() {
-                            info.manufacturer = m.manufacturer_id.map(ant_manufacturer_name);
-                        }
-                        if info.model_number.is_none() {
-                            info.model_number = m.model_number.map(|n| n.to_string());
-                        }
-                        if info.serial_number.is_none() {
-                            info.serial_number =
-                                m.serial_number.filter(|&s| s != 0).map(|n| n.to_string());
-                        }
-                    }
+        let meta = self.io.ant_metadata();
+        for (id, info) in devices.iter_mut() {
+            if !id.starts_with("ant:") {
+                continue;
+            }
+            if let Some(m) = meta.get(id) {
+                if info.manufacturer.is_none() {
+                    info.manufacturer = m.manufacturer_id.map(ant_manufacturer_name);
+                }
+                if info.model_number.is_none() {
+                    info.model_number = m.model_number.map(|n| n.to_string());
+                }
+                if info.serial_number.is_none() {
+                    info.serial_number = m.serial_number.filter(|&s| s != 0).map(|n| n.to_string());
                 }
             }
         }
     }
 
     /// Get the connected trainer device ID (for command routing).
-    /// Cross-references trainer_backends with connected_devices to return
-    /// only a trainer that is actually Connected, avoiding stale entries
-    /// left behind during reconnect.
+    /// Only a trainer that is actually Connected is returned, avoiding stale
+    /// entries left behind during reconnect.
     pub fn connected_trainer_id(&self) -> Option<String> {
         self.trainer_backends
             .keys()
-            .find(|id| {
-                self.connected_devices
-                    .get(*id)
-                    .is_some_and(|info| info.status == ConnectionStatus::Connected)
-            })
+            .find(|id| self.records.get(*id).is_some_and(|r| r.phase == Phase::Connected))
             .cloned()
+    }
+}
+
+/// Compute cross-transport device groups in place.
+fn apply_groups(devices: &mut HashMap<String, DeviceInfo>) {
+    let device_list: Vec<DeviceInfo> = devices.values().cloned().collect();
+    for (id, group_id) in compute_device_groups(&device_list) {
+        if let Some(info) = devices.get_mut(&id) {
+            info.device_group = Some(group_id);
+        }
     }
 }
 
@@ -907,5 +1051,852 @@ mod tests {
     #[test]
     fn manufacturer_coospo() {
         assert_eq!(ant_manufacturer_name(135), "Coospo");
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    //! Device lifecycle and lock-scope tests against `FakeIo` with a paused clock.
+    use super::*;
+    use crate::config;
+    use crate::device::io::fake::{FakeIo, IoEvent};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    type Dm = SharedDeviceManager<FakeIo>;
+
+    fn dm() -> Dm {
+        Arc::new(Mutex::new(DeviceManager::with_io(FakeIo::default())))
+    }
+
+    fn tx() -> broadcast::Sender<SensorReading> {
+        broadcast::channel(16).0
+    }
+
+    async fn io(dm: &Dm) -> Arc<FakeIo> {
+        dm.lock().await.io()
+    }
+
+    /// Let spawned tasks (aborts, teardowns, attempts) run to quiescence.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn connects(events: &[IoEvent], id: &str) -> usize {
+        events.iter().filter(|e| **e == IoEvent::Connect(id.to_string())).count()
+    }
+
+    async fn status(dm: &Dm, id: &str) -> Option<ConnectionStatus> {
+        dm.lock().await.records.get(id).map(|r| r.info.status)
+    }
+
+    fn fake_info(id: &str) -> DeviceInfo {
+        crate::device::io::fake::info(id, ConnectionStatus::Disconnected)
+    }
+
+    async fn lose_and_wait_for_retry(dm: &Dm, id: &str, tx: &broadcast::Sender<SensorReading>) {
+        io(dm).await.set_link(id, LinkState::Lost);
+        DeviceManager::watchdog_tick(dm, tx).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(config::RECONNECT_INITIAL_BACKOFF_MS + 1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_twice_spawns_one_listener() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        let again = DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        settle().await;
+        let io = io(&dm).await;
+        assert_eq!(again.status, ConnectionStatus::Connected);
+        assert_eq!(connects(&io.events(), "ble-hr"), 1, "second connect must be a no-op");
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_connects_same_device_one_io_connect() {
+        let dm = dm();
+        io(&dm).await.set_connect_delay("ble-hr", Duration::from_secs(2));
+        let (a, b) = tokio::join!(
+            DeviceManager::connect_shared(&dm, "ble-hr", tx()),
+            DeviceManager::connect_shared(&dm, "ble-hr", tx()),
+        );
+        a.unwrap();
+        b.unwrap();
+        settle().await;
+        let io = io(&dm).await;
+        assert_eq!(connects(&io.events(), "ble-hr"), 1);
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_connect_clears_pending_reconnect() {
+        let dm = dm();
+        dm.lock().await.reconnect.register(fake_info("ble-hr"));
+        DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        assert!(!dm.lock().await.reconnect.contains("ble-hr"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_aborts_existing_listener_handle() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        // A second transport result reaching commit for the same id.
+        let io = io(&dm).await;
+        let ctx = ListenerCtx { tx: tx(), primaries: dm.lock().await.primaries_handle() };
+        let c = io.connect("ble-hr", ctx, CancelToken::new()).await.unwrap();
+        dm.lock().await.commit_connect("ble-hr", c);
+        settle().await;
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1, "old listener must be aborted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trainer_command_during_scan_completes_within_500ms() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-trainer", tx()).await.unwrap();
+        *io(&dm).await.scan_delay.lock().unwrap() = Duration::from_secs(4);
+        let scan = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::scan_shared(&dm).await }
+        });
+        settle().await; // the scan is now sleeping inside io.scan()
+        let start = Instant::now();
+        {
+            let mut g = dm.lock().await;
+            let id = g.connected_trainer_id().unwrap();
+            g.set_target_power(&id, 200).await.unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+        assert_eq!(io(&dm).await.trainer_commands.load(Ordering::SeqCst), 1);
+        scan.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trainer_command_during_reconnect_completes_within_500ms() {
+        let dm = dm();
+        let tx = tx();
+        DeviceManager::connect_shared(&dm, "ble-trainer", tx.clone()).await.unwrap();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx.clone()).await.unwrap();
+        let io = io(&dm).await;
+        lose_and_wait_for_retry(&dm, "ble-hr", &tx).await;
+        io.set_connect_delay("ble-hr", Duration::from_secs(4));
+        DeviceManager::watchdog_tick(&dm, &tx).await; // spawns the slow attempt
+        settle().await;
+        assert_eq!(connects(&io.events(), "ble-hr"), 2, "reconnect attempt in flight");
+        let start = Instant::now();
+        {
+            let mut g = dm.lock().await;
+            let id = g.connected_trainer_id().unwrap();
+            g.set_target_power(&id, 150).await.unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_merge_keeps_connecting_status() {
+        let dm = dm();
+        let io = io(&dm).await;
+        io.set_connect_delay("ble-hr", Duration::from_secs(3));
+        *io.scan_result.lock().unwrap() = vec![fake_info("ble-hr")];
+        let connecting = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-hr", tx()).await }
+        });
+        settle().await;
+        let list = DeviceManager::scan_shared(&dm).await.unwrap();
+        let hr = list.iter().find(|d| d.id == "ble-hr").unwrap();
+        assert_eq!(hr.status, ConnectionStatus::Connecting);
+        connecting.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_merge_keeps_reconnecting_status() {
+        let dm = dm();
+        let tx = tx();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx.clone()).await.unwrap();
+        let io = io(&dm).await;
+        io.set_link("ble-hr", LinkState::Lost);
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        *io.scan_result.lock().unwrap() = vec![fake_info("ble-hr")];
+        let list = DeviceManager::scan_shared(&dm).await.unwrap();
+        let hr = list.iter().find(|d| d.id == "ble-hr").unwrap();
+        assert_eq!(hr.status, ConnectionStatus::Reconnecting);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_merge_updates_in_range_only() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        // The scan does not see the connected strap, but sees another device.
+        *io(&dm).await.scan_result.lock().unwrap() = vec![fake_info("ble-pm")];
+        let list = DeviceManager::scan_shared(&dm).await.unwrap();
+        let hr = list.iter().find(|d| d.id == "ble-hr").unwrap();
+        assert_eq!(hr.status, ConnectionStatus::Connected);
+        assert!(hr.in_range, "connected devices are always in range");
+        let pm = list.iter().find(|d| d.id == "ble-pm").unwrap();
+        assert_eq!(pm.status, ConnectionStatus::Disconnected);
+        assert!(pm.in_range);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_cancels_in_flight_connect_promptly() {
+        let dm = dm();
+        io(&dm).await.set_connect_delay("ble-hr", Duration::from_secs(9));
+        let connecting = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-hr", tx()).await }
+        });
+        settle().await;
+        let start = Instant::now();
+        DeviceManager::disconnect_shared(&dm, "ble-hr").await.unwrap();
+        assert!(start.elapsed() < Duration::from_millis(100), "took {:?}", start.elapsed());
+        assert!(matches!(connecting.await.unwrap(), Err(AppError::Cancelled)));
+        assert_eq!(status(&dm, "ble-hr").await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_connect_does_not_commit_listener() {
+        let dm = dm();
+        let io = io(&dm).await;
+        io.set_connect_delay("ble-hr", Duration::from_secs(2));
+        io.ignore_cancel.lock().unwrap().insert("ble-hr".into());
+        let connecting = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-hr", tx()).await }
+        });
+        settle().await;
+        DeviceManager::disconnect_shared(&dm, "ble-hr").await.unwrap();
+        assert!(matches!(connecting.await.unwrap(), Err(AppError::Cancelled)));
+        settle().await;
+        let events = io.events();
+        let connect_at = events.iter().position(|e| *e == IoEvent::Connect("ble-hr".into())).unwrap();
+        assert!(
+            events[connect_at..].contains(&IoEvent::Disconnect("ble-hr".into())),
+            "a connect that completed after cancel must be undone: {:?}",
+            events
+        );
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 0);
+        assert_eq!(status(&dm, "ble-hr").await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_connects_disconnect_cancels_owner_attempt() {
+        let dm = dm();
+        io(&dm).await.set_connect_delay("ble-hr", Duration::from_secs(3));
+        let a = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-hr", tx()).await }
+        });
+        settle().await;
+        let b = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-hr", tx()).await }
+        });
+        settle().await;
+        DeviceManager::disconnect_shared(&dm, "ble-hr").await.unwrap();
+        assert!(matches!(a.await.unwrap(), Err(AppError::Cancelled)));
+        assert!(
+            matches!(b.await.unwrap(), Err(AppError::Cancelled)),
+            "a connect queued behind the disconnect must not reconnect"
+        );
+        assert_eq!(connects(&io(&dm).await.events(), "ble-hr"), 1);
+        assert_eq!(status(&dm, "ble-hr").await, None);
+        assert!(dm.lock().await.in_flight.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn losing_attempt_cannot_remove_winner_token() {
+        let dm = dm();
+        io(&dm).await.set_connect_delay("ble-hr", Duration::from_secs(3));
+        let winner = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-hr", tx()).await }
+        });
+        settle().await;
+        let winner_token = dm.lock().await.in_flight.get("ble-hr").cloned().unwrap();
+        let loser =
+            DeviceManager::connect_with_origin(&dm, "ble-hr", tx(), ConnectOrigin::AutoReconnect).await;
+        assert!(matches!(loser, Ok(ConnectOutcome::Skipped)));
+        let still = dm.lock().await.in_flight.get("ble-hr").cloned().unwrap();
+        assert!(still.same_as(&winner_token));
+        winner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_teardown_runs_under_gate_and_keeps_reconnect_target() {
+        let dm = dm();
+        let tx = tx();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx.clone()).await.unwrap();
+        let io = io(&dm).await;
+        io.set_link("ble-hr", LinkState::Lost);
+        let report = DeviceManager::watchdog_tick(&dm, &tx).await;
+        assert_eq!(report.disconnected, vec!["ble-hr".to_string()]);
+        settle().await;
+        assert!(io.events().contains(&IoEvent::Disconnect("ble-hr".into())));
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 0);
+        let g = dm.lock().await;
+        assert!(g.reconnect.contains("ble-hr"));
+        assert_eq!(g.records["ble-hr"].phase, Phase::TornDown);
+        assert_eq!(g.records["ble-hr"].info.status, ConnectionStatus::Reconnecting);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_teardown_noop_after_concurrent_manual_disconnect() {
+        let dm = dm();
+        let tx = tx();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx.clone()).await.unwrap();
+        let io = io(&dm).await;
+        io.set_link("ble-hr", LinkState::Lost);
+        // Hold the gate: the manual disconnect queues first, the spawned teardown second.
+        let gate = dm.lock().await.gate("ble-hr");
+        let held = gate.clone().lock_owned().await;
+        let disconnect = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::disconnect_shared(&dm, "ble-hr").await }
+        });
+        settle().await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        drop(held);
+        disconnect.await.unwrap().unwrap();
+        settle().await;
+        let disconnects =
+            io.events().iter().filter(|e| **e == IoEvent::Disconnect("ble-hr".into())).count();
+        assert_eq!(disconnects, 1, "the late teardown must be a no-op: {:?}", io.events());
+        let g = dm.lock().await;
+        assert!(!g.records.contains_key("ble-hr"));
+        assert!(!g.reconnect.contains("ble-hr"), "manual disconnect stops reconnects");
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_wins_gate_before_spawned_teardown_reopens_cleanly() {
+        let dm = dm();
+        let tx = tx();
+        let id = "ant:120:1";
+        DeviceManager::connect_shared(&dm, id, tx.clone()).await.unwrap();
+        let io = io(&dm).await;
+        io.set_link(id, LinkState::Lost);
+        // A manual connect queues on the gate before the spawned teardown task runs.
+        let gate = dm.lock().await.gate(id);
+        let held = gate.clone().lock_owned().await;
+        DeviceManager::watchdog_tick(&dm, &tx).await; // marks Lost, spawns teardown (not yet run)
+        let (connected, _) = tokio::join!(DeviceManager::connect_shared(&dm, id, tx.clone()), async {
+            settle().await; // connect is first in the gate queue, teardown second
+            drop(held);
+        });
+        let info = connected.unwrap();
+        settle().await;
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert_eq!(
+            io.events(),
+            vec![
+                IoEvent::Connect(id.into()),
+                IoEvent::Disconnect(id.into()),
+                IoEvent::Connect(id.into()),
+            ],
+            "the gate holder tears down before reopening; the late teardown is a no-op"
+        );
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1);
+        assert_eq!(status(&dm, id).await, Some(ConnectionStatus::Connected));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_reconnect_does_not_delay_next_tick() {
+        let dm = dm();
+        let tx = tx();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx.clone()).await.unwrap();
+        DeviceManager::connect_shared(&dm, "ble-pm", tx.clone()).await.unwrap();
+        let io = io(&dm).await;
+        lose_and_wait_for_retry(&dm, "ble-hr", &tx).await;
+        io.set_connect_delay("ble-hr", Duration::from_secs(30));
+        DeviceManager::watchdog_tick(&dm, &tx).await; // spawns the 30 s attempt
+        settle().await;
+        io.set_link("ble-pm", LinkState::Lost);
+        let start = Instant::now();
+        let report = DeviceManager::watchdog_tick(&dm, &tx).await;
+        assert!(start.elapsed() < Duration::from_millis(50));
+        assert_eq!(report.disconnected, vec!["ble-pm".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnects_bounded_to_two_concurrent() {
+        let dm = dm();
+        let tx = tx();
+        let ids = ["ble-a", "ble-b", "ble-c"];
+        for id in ids {
+            DeviceManager::connect_shared(&dm, id, tx.clone()).await.unwrap();
+        }
+        let io = io(&dm).await;
+        for id in ids {
+            io.set_link(id, LinkState::Lost);
+            io.set_connect_delay(id, Duration::from_secs(10));
+        }
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(config::RECONNECT_INITIAL_BACKOFF_MS + 1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        assert_eq!(dm.lock().await.in_flight.len(), 2, "the third attempt waits for a permit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_gate_skips_reconnect_round() {
+        let dm = dm();
+        let tx = tx();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx.clone()).await.unwrap();
+        lose_and_wait_for_retry(&dm, "ble-hr", &tx).await;
+        let gate = dm.lock().await.gate("ble-hr");
+        let held = gate.clone().lock_owned().await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        assert_eq!(connects(&io(&dm).await.events(), "ble-hr"), 1, "busy device: no attempt");
+        assert_eq!(dm.lock().await.reconnect.attempt_count("ble-hr"), 0, "backoff not consumed");
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_success_reported_next_tick() {
+        let dm = dm();
+        let tx = tx();
+        DeviceManager::connect_shared(&dm, "ble-hr", tx.clone()).await.unwrap();
+        lose_and_wait_for_retry(&dm, "ble-hr", &tx).await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        let report = DeviceManager::watchdog_tick(&dm, &tx).await;
+        assert_eq!(report.reconnected, vec!["ble-hr".to_string()]);
+        assert_eq!(status(&dm, "ble-hr").await, Some(ConnectionStatus::Connected));
+        assert_eq!(io(&dm).await.listeners_alive.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn watchdog_tick_completes_within_250ms_during_scan() {
+        use crate::device::io::{AntLink, RealIo};
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        let io = RealIo::new();
+        let id = "ant:120:7";
+        let last_seen = Arc::new(AtomicI64::new(0));
+        crate::device::ant::listener::atomic_set_age(&last_seen, Duration::from_secs(1));
+        io.insert_link(id, AntLink { last_seen, closed: Arc::new(AtomicBool::new(false)) });
+        let locked = io.hold_ant_slot_for(Duration::from_secs(2));
+        let mut manager = DeviceManager::with_io(io);
+        manager.records.insert(
+            id.to_string(),
+            DeviceRecord { info: fake_info(id), phase: Phase::Connected },
+        );
+        let dm = Arc::new(Mutex::new(manager));
+        locked.recv().unwrap();
+        let report = tokio::time::timeout(Duration::from_millis(250), DeviceManager::watchdog_tick(&dm, &tx()))
+            .await
+            .expect("watchdog must not wait for a scan holding the AntSlot");
+        assert!(report.disconnected.is_empty(), "fresh link stays connected");
+    }
+
+}
+
+#[cfg(test)]
+mod ant_lifecycle_tests {
+    //! ANT+ persistent-channel lifecycle (design ADR-2, 2a-2c) against FakeIo.
+    use super::*;
+    use crate::device::io::fake::{FakeIo, IoEvent};
+    use std::sync::atomic::Ordering;
+
+    type Dm = SharedDeviceManager<FakeIo>;
+    const ID: &str = "ant:120:4242";
+
+    fn dm() -> Dm {
+        Arc::new(Mutex::new(DeviceManager::with_io(FakeIo::default())))
+    }
+
+    fn tx() -> broadcast::Sender<SensorReading> {
+        broadcast::channel(16).0
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn connected(dm: &Dm) -> Arc<FakeIo> {
+        DeviceManager::connect_shared(dm, ID, tx()).await.unwrap();
+        dm.lock().await.io()
+    }
+
+    async fn phase(dm: &Dm) -> Option<Phase> {
+        dm.lock().await.records.get(ID).map(|r| r.phase)
+    }
+
+    fn count(io: &FakeIo, e: IoEvent) -> usize {
+        io.events().iter().filter(|x| **x == e).count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stale_ant_marked_reconnecting_not_connected() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        let report = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        assert_eq!(report.disconnected, vec![ID.to_string()]);
+        let g = dm.lock().await;
+        assert_eq!(g.records[ID].info.status, ConnectionStatus::Reconnecting);
+        assert!(g.connected_trainer_id().is_none());
+        assert!(!g.reconnect.contains(ID), "a searching channel needs no reconnect");
+        assert!(g.primaries_handle().read().unwrap().legacy_map().is_empty(), "claims released");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stale_ant_reports_reconnecting_each_tick() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        let r2 = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        let r3 = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        assert!(r2.disconnected.is_empty(), "device_disconnected only once");
+        assert_eq!(r2.reconnecting.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(r3.reconnecting.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stale_ant_recovers_without_new_channel() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        io.set_link(ID, LinkState::Alive);
+        let report = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        settle().await;
+        assert_eq!(report.reconnected, vec![ID.to_string()]);
+        assert_eq!(phase(&dm).await, Some(Phase::Connected));
+        assert_eq!(count(&io, IoEvent::Connect(ID.into())), 1, "no second channel");
+        assert_eq!(count(&io, IoEvent::Disconnect(ID.into())), 0);
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1, "single listener, no duplicates");
+        assert!(dm.lock().await.primaries_handle().read().unwrap().is_registered(ID), "still registered; re-claims lazily");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_lost_ant_tears_down_before_reconnect() {
+        let dm = dm();
+        let tx = tx();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Lost); // channel closed by the radio
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(crate::config::RECONNECT_INITIAL_BACKOFF_MS + 1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        assert_eq!(
+            io.events(),
+            vec![IoEvent::Connect(ID.into()), IoEvent::Disconnect(ID.into()), IoEvent::Connect(ID.into())],
+        );
+        assert_eq!(phase(&dm).await, Some(Phase::Connected));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_teardown_then_manual_connect_opens_single_channel() {
+        let dm = dm();
+        let tx = tx();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Lost);
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await; // spawned teardown has run
+        let info = DeviceManager::connect_shared(&dm, ID, tx.clone()).await.unwrap();
+        settle().await;
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert_eq!(
+            io.events(),
+            vec![IoEvent::Connect(ID.into()), IoEvent::Disconnect(ID.into()), IoEvent::Connect(ID.into())],
+        );
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1);
+        assert!(!dm.lock().await.reconnect.contains(ID), "manual connect cleared the target");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ant_reconnect_yields_single_listener() {
+        let dm = dm();
+        let tx = tx();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Lost);
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(crate::config::RECONNECT_INITIAL_BACKOFF_MS + 1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await;
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_connect_reconnecting_ant_reuses_channel_and_connects_on_data() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        io.data_after.lock().unwrap().insert(ID.into(), Duration::from_secs(2));
+        let info = DeviceManager::connect_shared(&dm, ID, tx()).await.unwrap();
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert_eq!(count(&io, IoEvent::Connect(ID.into())), 1, "existing channel reused");
+        assert_eq!(phase(&dm).await, Some(Phase::Connected));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_connect_reconnecting_ant_without_data_returns_ok_reconnecting() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        let start = Instant::now();
+        let info = DeviceManager::connect_shared(&dm, ID, tx()).await.unwrap();
+        assert_eq!(info.status, ConnectionStatus::Reconnecting, "never reported Connected without data");
+        assert!(start.elapsed() >= ANT_REJOIN_WAIT);
+        assert_eq!(count(&io, IoEvent::Connect(ID.into())), 1);
+        assert!(matches!(phase(&dm).await, Some(Phase::Stale { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ant_stale_ten_minutes_gives_up_to_disconnected() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        tokio::time::advance(ANT_GIVE_UP - Duration::from_secs(1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        assert!(matches!(phase(&dm).await, Some(Phase::Stale { .. })), "not yet");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let report = DeviceManager::watchdog_tick(&dm, &tx()).await;
+        settle().await;
+        assert_eq!(report.disconnected, vec![ID.to_string()], "device_disconnected re-emitted");
+        assert_eq!(phase(&dm).await, None, "shown as Disconnected (known device only)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ant_give_up_frees_channel_and_registers_no_reconnect() {
+        let dm = dm();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Stale);
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        tokio::time::advance(ANT_GIVE_UP + Duration::from_secs(1)).await;
+        DeviceManager::watchdog_tick(&dm, &tx()).await;
+        settle().await;
+        assert_eq!(count(&io, IoEvent::Disconnect(ID.into())), 1, "channel freed");
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 0);
+        assert!(!dm.lock().await.reconnect.contains(ID));
+    }
+}
+
+#[cfg(test)]
+mod primary_lifecycle_tests {
+    //! Primary-state bookkeeping across connect/disconnect (ADR-3a, NB2).
+    use super::*;
+    use crate::device::io::fake::FakeIo;
+
+    type Dm = SharedDeviceManager<FakeIo>;
+
+    fn dm() -> Dm {
+        Arc::new(Mutex::new(DeviceManager::with_io(FakeIo::default())))
+    }
+
+    fn tx() -> broadcast::Sender<SensorReading> {
+        broadcast::channel(16).0
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trainer_primary_claimed_at_connect_commit() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-trainer", tx()).await.unwrap();
+        let map = dm.lock().await.primaries_handle().read().unwrap().legacy_map();
+        assert_eq!(map.get("FitnessTrainer").map(String::as_str), Some("ble-trainer"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_trainer_primary_not_claimed_until_first_reading() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-pm", tx()).await.unwrap();
+        let handle = dm.lock().await.primaries_handle();
+        assert!(handle.read().unwrap().legacy_map().is_empty());
+        assert!(handle.read().unwrap().is_registered("ble-pm"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn losing_attempt_cannot_remove_winner_caps() {
+        let dm = dm();
+        dm.lock().await.io().set_connect_delay("ble-pm", Duration::from_secs(3));
+        let winner = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-pm", tx()).await }
+        });
+        settle().await;
+        // The winner registered (pending) caps post-gate; a losing auto attempt is skipped.
+        let loser =
+            DeviceManager::connect_with_origin(&dm, "ble-pm", tx(), ConnectOrigin::AutoReconnect).await;
+        assert!(matches!(loser, Ok(ConnectOutcome::Skipped)));
+        let handle = dm.lock().await.primaries_handle();
+        assert!(handle.read().unwrap().is_registered("ble-pm"));
+        winner.await.unwrap().unwrap();
+        assert!(handle.read().unwrap().is_registered("ble-pm"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_connect_unregisters_pending_caps() {
+        let dm = dm();
+        dm.lock().await.io().set_connect_fail("ble-pm", "gone");
+        assert!(DeviceManager::connect_shared(&dm, "ble-pm", tx()).await.is_err());
+        let handle = dm.lock().await.primaries_handle();
+        assert!(!handle.read().unwrap().is_registered("ble-pm"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_unregisters_device_so_late_readings_drop() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-pm", tx()).await.unwrap();
+        let handle = dm.lock().await.primaries_handle();
+        let reading = SensorReading::Power {
+            watts: 250,
+            timestamp: None,
+            epoch_ms: 0,
+            device_id: "ble-pm".into(),
+            pedal_balance: None,
+        };
+        assert!(crate::device::primary::admit_reading(&handle, &reading, std::time::Instant::now()));
+        DeviceManager::disconnect_shared(&dm, "ble-pm").await.unwrap();
+        assert!(!crate::device::primary::admit_reading(&handle, &reading, std::time::Instant::now()));
+        assert!(handle.read().unwrap().legacy_map().is_empty(), "no re-claim after disconnect");
+    }
+}
+
+#[cfg(test)]
+mod ui_event_tests {
+    //! What the frontend is sent: the emitted event sequence, captured from
+    //! `report_events` (the same path lib.rs emits), with real storage.
+    use super::*;
+    use crate::device::io::fake::{info as fake_info, FakeIo, IoEvent};
+    use std::sync::atomic::Ordering;
+
+    const ANT: &str = "ant:120:777";
+
+    fn tx() -> broadcast::Sender<SensorReading> {
+        broadcast::channel(16).0
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// DM backed by a real (temporary) SQLite store that knows `ids`.
+    async fn dm_with_storage(ids: &[&str]) -> (SharedDeviceManager<FakeIo>, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(Storage::new(&tmp.path().to_string_lossy()).await.unwrap());
+        for id in ids {
+            storage.upsert_known_device(&fake_info(id, ConnectionStatus::Disconnected)).await.unwrap();
+        }
+        let mut manager = DeviceManager::with_io(FakeIo::default());
+        manager.set_storage(storage);
+        (Arc::new(Mutex::new(manager)), tmp)
+    }
+
+    async fn tick_events(dm: &SharedDeviceManager<FakeIo>) -> Vec<DeviceEvent> {
+        let report = DeviceManager::watchdog_tick(dm, &tx()).await;
+        DeviceManager::report_events(dm, report).await
+    }
+
+    fn listed_status(events: &[DeviceEvent], id: &str) -> Vec<ConnectionStatus> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DeviceEvent::ListUpdated(list) => list.iter().find(|d| d.id == id).map(|d| d.status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn give_up_emits_list_only_after_teardown_and_final_status_disconnected() {
+        let (dm, _tmp) = dm_with_storage(&[ANT]).await;
+        dm.lock().await.ant_give_up = Duration::ZERO;
+        DeviceManager::connect_shared(&dm, ANT, tx()).await.unwrap();
+        let io = dm.lock().await.io();
+        io.set_link(ANT, LinkState::Stale);
+
+        let stale = tick_events(&dm).await;
+        assert_eq!(listed_status(&stale, ANT), vec![ConnectionStatus::Reconnecting]);
+
+        let give_up = tick_events(&dm).await;
+        assert!(matches!(give_up.as_slice(), [DeviceEvent::Disconnected(id)] if id == ANT),
+            "no list while the teardown is pending: {:?}", give_up);
+
+        settle().await; // teardown task completes
+        let after = tick_events(&dm).await;
+        assert_eq!(listed_status(&after, ANT), vec![ConnectionStatus::Disconnected]);
+        assert!(io.events().contains(&IoEvent::Disconnect(ANT.into())));
+    }
+
+    #[tokio::test]
+    async fn lost_transition_emits_reconnecting_list() {
+        let (dm, _tmp) = dm_with_storage(&["ble-hr"]).await;
+        DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        dm.lock().await.io().set_link("ble-hr", LinkState::Lost);
+        let events = tick_events(&dm).await;
+        assert!(matches!(&events[0], DeviceEvent::Disconnected(id) if id == "ble-hr"));
+        assert_eq!(listed_status(&events, "ble-hr"), vec![ConnectionStatus::Reconnecting]);
+    }
+
+    #[tokio::test]
+    async fn failed_manual_connect_keeps_reconnect_target_and_reconnecting() {
+        let (dm, _tmp) = dm_with_storage(&["ble-hr"]).await;
+        DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        let io = dm.lock().await.io();
+        io.set_link("ble-hr", LinkState::Lost);
+        tick_events(&dm).await;
+        settle().await; // torn down, waiting for auto-reconnect
+        io.set_connect_fail("ble-hr", "out of range");
+        assert!(DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.is_err());
+        let g = dm.lock().await;
+        assert!(g.reconnect.contains("ble-hr"), "auto-reconnect continues");
+        let listed = g.list_current().await;
+        let hr = listed.iter().find(|d| d.id == "ble-hr").unwrap();
+        assert_eq!(hr.status, ConnectionStatus::Reconnecting);
+    }
+
+    #[tokio::test]
+    async fn disconnect_stale_ant_closes_channel_and_clears_state() {
+        let (dm, _tmp) = dm_with_storage(&[ANT]).await;
+        DeviceManager::connect_shared(&dm, ANT, tx()).await.unwrap();
+        let io = dm.lock().await.io();
+        io.set_link(ANT, LinkState::Stale);
+        tick_events(&dm).await; // Reconnecting, channel still searching
+        DeviceManager::disconnect_shared(&dm, ANT).await.unwrap();
+        settle().await;
+        assert!(io.events().contains(&IoEvent::Disconnect(ANT.into())), "searching channel closed");
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 0);
+        let g = dm.lock().await;
+        assert!(!g.records.contains_key(ANT));
+        assert!(!g.reconnect.contains(ANT));
+        let listed = g.list_current().await;
+        assert_eq!(listed.iter().find(|d| d.id == ANT).unwrap().status, ConnectionStatus::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn disconnect_reconnecting_ble_clears_reconnect_target() {
+        let (dm, _tmp) = dm_with_storage(&["ble-hr"]).await;
+        DeviceManager::connect_shared(&dm, "ble-hr", tx()).await.unwrap();
+        dm.lock().await.io().set_link("ble-hr", LinkState::Lost);
+        tick_events(&dm).await;
+        settle().await;
+        assert!(dm.lock().await.reconnect.contains("ble-hr"));
+        DeviceManager::disconnect_shared(&dm, "ble-hr").await.unwrap();
+        let g = dm.lock().await;
+        assert!(!g.reconnect.contains("ble-hr"));
+        assert!(!g.records.contains_key("ble-hr"));
     }
 }

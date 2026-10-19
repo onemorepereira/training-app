@@ -87,7 +87,7 @@ fn name_number_match(ble: &DeviceInfo, ant: &DeviceInfo) -> bool {
         None => return false,
     };
 
-    if !ble_name.contains(&ant_number) {
+    if !name_has_number_token(ble_name, &ant_number) {
         return false;
     }
 
@@ -99,6 +99,18 @@ fn name_number_match(ble: &DeviceInfo, ant: &DeviceInfo) -> bool {
     }
 
     true
+}
+
+/// True if the BLE name contains the ANT+ device number as a whole token: the name is
+/// split on non-alphanumeric characters and an all-digit token must equal the number
+/// (leading zeros allowed). "KICKR 51234" or "TICKR 4A3B" do not match 1234 / 4.
+fn name_has_number_token(name: &str, number: &str) -> bool {
+    let Ok(number) = number.parse::<u32>() else {
+        return false;
+    };
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+        .any(|t| t.parse::<u32>() == Ok(number))
 }
 
 /// Extract the device number from an ANT+ device ID like "ant:power:12345".
@@ -237,5 +249,30 @@ mod tests {
 
         let groups = compute_device_groups(&[ble, ant]);
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn name_number_requires_whole_token() {
+        let ble = ble_device("ble-abc", Some("KICKR 51234"), DeviceType::FitnessTrainer);
+        let ant = ant_device("ant:17:1234", None, DeviceType::FitnessTrainer);
+        assert!(compute_device_groups(&[ble, ant]).is_empty(), "1234 is not a token of 51234");
+
+        let ble = ble_device("ble-hr", Some("TICKR 4A3B"), DeviceType::HeartRate);
+        let ant = ant_device("ant:120:4", None, DeviceType::HeartRate);
+        assert!(compute_device_groups(&[ble, ant]).is_empty(), "4 inside an alphanumeric token");
+    }
+
+    #[test]
+    fn name_number_matches_token_after_separator() {
+        let ble = ble_device("ble-hr", Some("HRM-Dual:23456"), DeviceType::HeartRate);
+        let ant = ant_device("ant:120:23456", None, DeviceType::HeartRate);
+        assert_eq!(compute_device_groups(&[ble, ant]).len(), 2);
+    }
+
+    #[test]
+    fn name_number_leading_zero_token_matches() {
+        let ble = ble_device("ble-pm", Some("Stages 01234"), DeviceType::Power);
+        let ant = ant_device("ant:11:1234", None, DeviceType::Power);
+        assert_eq!(compute_device_groups(&[ble, ant]).len(), 2);
     }
 }

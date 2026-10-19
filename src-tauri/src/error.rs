@@ -44,6 +44,9 @@ pub enum AppError {
     Serialization(String),
     #[error("Session error: {0}")]
     Session(String),
+    /// A device connect was cancelled by a concurrent disconnect.
+    #[error("Connect cancelled")]
+    Cancelled,
 }
 
 impl serde::Serialize for AppError {
@@ -59,6 +62,7 @@ impl serde::Serialize for AppError {
             AppError::Database(_) => "database_error",
             AppError::Serialization(_) => "serialization_error",
             AppError::Session(_) => "session_error",
+            AppError::Cancelled => "connect_cancelled",
         };
         let mut map = serializer.serialize_map(Some(2))?;
         map.serialize_entry("code", code)?;

@@ -135,32 +135,27 @@ impl BleManager {
                 .connect()
                 .await
                 .map_err(|e| BleError::Btleplug(format!("Failed to connect: {}", e)))?;
-            peripheral
-                .discover_services()
-                .await
-                .map_err(|e| BleError::Btleplug(format!("Failed to discover services: {}", e)))?;
-
-            let properties = peripheral.properties().await
-                .map_err(|e| BleError::Btleplug(format!("Failed to get properties: {}", e)))?;
-            let props = properties.unwrap_or_default();
-
-            // Classify from actual GATT services (post-connection), not advertisement data
-            let gatt_services: Vec<BtUuid> = peripheral.services().iter().map(|s| s.uuid).collect();
-            let device_type = classify_device(&gatt_services)
-                .or_else(|| classify_device(&props.services))
-                .ok_or_else(|| BleError::UnrecognizedDevice(device_id.to_string()))?;
-
-            let battery_level = {
-                let chars = peripheral.characteristics();
-                if let Some(battery_char) = chars.iter().find(|c| c.uuid == BATTERY_LEVEL_CHAR) {
-                    match peripheral.read(battery_char).await {
-                        Ok(data) if !data.is_empty() => Some(data[0]),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            };
+            let (props, device_type, battery_level) = disconnect_on_err(
+                async {
+                    peripheral.discover_services().await.map_err(|e| {
+                        BleError::Btleplug(format!("Failed to discover services: {}", e))
+                    })?;
+                    let properties = peripheral.properties().await.map_err(|e| {
+                        BleError::Btleplug(format!("Failed to get properties: {}", e))
+                    })?;
+                    let props = properties.unwrap_or_default();
+                    // Classify from actual GATT services (post-connection), not advertisement data
+                    let gatt_services: Vec<BtUuid> =
+                        peripheral.services().iter().map(|s| s.uuid).collect();
+                    let device_type = classify_device(&gatt_services)
+                        .or_else(|| classify_device(&props.services))
+                        .ok_or_else(|| BleError::UnrecognizedDevice(device_id.to_string()))?;
+                    let battery_level = read_battery(&peripheral).await;
+                    Ok((props, device_type, battery_level))
+                },
+                || disconnect_peripheral(&peripheral),
+            )
+            .await?;
 
             let info = DeviceInfo {
                 id: device_id.to_string(),
@@ -202,22 +197,16 @@ impl BleManager {
                     .connect()
                     .await
                     .map_err(|e2| BleError::Btleplug(format!("Failed to connect after rescan: {}", e2)))?;
-                fresh
-                    .discover_services()
-                    .await
-                    .map_err(|e2| BleError::Btleplug(format!("Failed to discover services: {}", e2)))?;
-
-                let battery_level = {
-                    let chars = fresh.characteristics();
-                    if let Some(battery_char) = chars.iter().find(|c| c.uuid == BATTERY_LEVEL_CHAR) {
-                        match fresh.read(battery_char).await {
-                            Ok(data) if !data.is_empty() => Some(data[0]),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                };
+                let battery_level = disconnect_on_err(
+                    async {
+                        fresh.discover_services().await.map_err(|e2| {
+                            BleError::Btleplug(format!("Failed to discover services: {}", e2))
+                        })?;
+                        Ok(read_battery(&fresh).await)
+                    },
+                    || disconnect_peripheral(&fresh),
+                )
+                .await?;
 
                 info.status = ConnectionStatus::Connected;
                 info.battery_level = battery_level;
@@ -234,22 +223,16 @@ impl BleManager {
             }
             return Err(BleError::Btleplug(format!("Failed to connect: {}", e)).into());
         }
-        peripheral
-            .discover_services()
-            .await
-            .map_err(|e| BleError::Btleplug(format!("Failed to discover services: {}", e)))?;
-
-        let battery_level = {
-            let chars = peripheral.characteristics();
-            if let Some(battery_char) = chars.iter().find(|c| c.uuid == BATTERY_LEVEL_CHAR) {
-                match peripheral.read(battery_char).await {
-                    Ok(data) if !data.is_empty() => Some(data[0]),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        };
+        let battery_level = disconnect_on_err(
+            async {
+                peripheral.discover_services().await.map_err(|e| {
+                    BleError::Btleplug(format!("Failed to discover services: {}", e))
+                })?;
+                Ok(read_battery(&peripheral).await)
+            },
+            || disconnect_peripheral(&peripheral),
+        )
+        .await?;
 
         info.status = ConnectionStatus::Connected;
         info.battery_level = battery_level;
@@ -297,14 +280,12 @@ impl BleManager {
     }
 
     pub async fn disconnect_device(&self, device_id: &str) -> Result<(), AppError> {
-        let mut connected = self.connected.lock().await;
-        if let Some(peripheral) = connected.remove(device_id) {
-            peripheral
-                .disconnect()
-                .await
-                .map_err(|e| BleError::Btleplug(format!("Failed to disconnect: {}", e)))?;
-        }
-        Ok(())
+        // The map lock is released before the (possibly slow) disconnect so the
+        // watchdog probe and other connects are never blocked behind it.
+        take_then(&self.connected, device_id, |peripheral| async move {
+            disconnect_peripheral(&peripheral).await
+        })
+        .await
     }
 
     pub fn get_connected(&self) -> Arc<Mutex<HashMap<String, Peripheral>>> {
@@ -407,6 +388,56 @@ impl BleManager {
     }
 }
 
+/// Run the post-`connect()` steps; if any fails, disconnect the peripheral before
+/// returning the original error so a half-set-up link is never leaked (C8).
+/// A failing cleanup is logged and does not mask the original error.
+pub(crate) async fn disconnect_on_err<T, W, C, CF>(work: W, cleanup: C) -> Result<T, AppError>
+where
+    W: std::future::Future<Output = Result<T, AppError>>,
+    C: FnOnce() -> CF,
+    CF: std::future::Future<Output = Result<(), AppError>>,
+{
+    match work.await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if let Err(cleanup_err) = cleanup().await {
+                log::warn!("Disconnect after failed BLE setup also failed: {}", cleanup_err);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Remove `key` from `map` (holding the lock only for the removal), then run `f`
+/// on the removed value with the lock released. Missing key → Ok.
+pub(crate) async fn take_then<V, F, Fut>(map: &Mutex<HashMap<String, V>>, key: &str, f: F) -> Result<(), AppError>
+where
+    F: FnOnce(V) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    let value = map.lock().await.remove(key);
+    match value {
+        Some(v) => f(v).await,
+        None => Ok(()),
+    }
+}
+
+async fn disconnect_peripheral(peripheral: &Peripheral) -> Result<(), AppError> {
+    peripheral
+        .disconnect()
+        .await
+        .map_err(|e| BleError::Btleplug(format!("Failed to disconnect: {}", e)).into())
+}
+
+async fn read_battery(peripheral: &Peripheral) -> Option<u8> {
+    let chars = peripheral.characteristics();
+    let battery_char = chars.iter().find(|c| c.uuid == BATTERY_LEVEL_CHAR)?;
+    match peripheral.read(battery_char).await {
+        Ok(data) if !data.is_empty() => Some(data[0]),
+        _ => None,
+    }
+}
+
 fn classify_device(services: &[BtUuid]) -> Option<DeviceType> {
     if services.contains(&FTMS_SERVICE) {
         Some(DeviceType::FitnessTrainer)
@@ -472,4 +503,85 @@ fn well_known_char_name(uuid: BtUuid) -> Option<String> {
         _ => return None,
     };
     Some(name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn disconnect_on_err_runs_cleanup_on_failure() {
+        let cleanups = AtomicUsize::new(0);
+        let r: Result<(), AppError> = disconnect_on_err(
+            async { Err(BleError::UnrecognizedDevice("dev".into()).into()) },
+            || async {
+                cleanups.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(r, Err(AppError::Ble(BleError::UnrecognizedDevice(_)))));
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1, "peripheral must be disconnected");
+    }
+
+    #[tokio::test]
+    async fn disconnect_on_err_skips_cleanup_on_success() {
+        let cleanups = AtomicUsize::new(0);
+        let r = disconnect_on_err(async { Ok::<u8, AppError>(7) }, || async {
+            cleanups.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn disconnect_on_err_returns_original_error_when_cleanup_fails() {
+        let r: Result<(), AppError> = disconnect_on_err(
+            async { Err(BleError::Btleplug("Failed to discover services: x".into()).into()) },
+            || async { Err(BleError::Btleplug("Failed to disconnect: y".into()).into()) },
+        )
+        .await;
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("discover services"), "original error kept: {msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_disconnect_does_not_hold_connected_map() {
+        let map: Arc<Mutex<HashMap<String, u8>>> =
+            Arc::new(Mutex::new(HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)])));
+        let slow = tokio::spawn({
+            let map = map.clone();
+            async move {
+                take_then(&map, "a", |_| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await; // slow disconnect
+                    Ok(())
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        // A probe-like access gets the map while the disconnect is still in progress.
+        let guard = tokio::time::timeout(std::time::Duration::from_millis(100), map.lock())
+            .await
+            .expect("connected map must not be held across disconnect()");
+        assert!(!guard.contains_key("a") && guard.contains_key("b"));
+        drop(guard);
+        slow.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn take_then_missing_key_is_ok() {
+        let map: Mutex<HashMap<String, u8>> = Mutex::new(HashMap::new());
+        let called = AtomicUsize::new(0);
+        take_then(&map, "x", |_| async {
+            called.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+    }
 }

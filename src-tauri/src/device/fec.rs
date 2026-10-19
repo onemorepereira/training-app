@@ -1,6 +1,26 @@
-use super::ant::channel::send_acknowledged;
-use super::ant::usb::AntUsb;
+use std::sync::atomic::AtomicI64;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use super::ant::channel::{send_acknowledged_and_wait, ACK_ATTEMPT_TIMEOUT};
+use super::ant::listener::atomic_elapsed;
+use super::ant::usb::{AntMessage, AntUsb};
 use crate::error::AppError;
+
+/// Skip the ack retry when the trainer's last page is older than this (design ADR-5).
+const FEC_RETRY_FRESH: Duration = Duration::from_secs(3);
+
+/// Everything needed to send FE-C control pages to one trainer channel.
+#[derive(Clone)]
+pub struct FecLink {
+    pub usb: Arc<AntUsb>,
+    pub channel: u8,
+    pub response_queue: Arc<Mutex<Vec<AntMessage>>>,
+    /// Trainer's last-page timestamp (shared with its listener).
+    pub last_seen: Arc<AtomicI64>,
+    /// Serialises acknowledged sends so a second one never hits TRANSFER_IN_PROGRESS.
+    pub send_lock: Arc<Mutex<()>>,
+}
 
 /// Encode target power page (0x31). Power in 0.25W resolution: watts * 4.
 fn encode_target_power(watts: u16) -> [u8; 8] {
@@ -24,61 +44,100 @@ fn encode_resistance(level: u8) -> [u8; 8] {
     ]
 }
 
-/// Encode simulation parameters page (0x33).
-/// grade: -200.0 to +200.0 (0.01% resolution, offset binary with +20000)
-/// crr: coefficient of rolling resistance (5e-5 resolution)
-/// cw: wind resistance coefficient (0.01 kg/m resolution)
-fn encode_simulation(grade: f32, crr: f32, cw: f32) -> [u8; 8] {
-    let grade_clamped = grade.clamp(-200.0, 200.0);
-    let crr_clamped = crr.clamp(0.0, 0.012_750); // u8 max (255) * 5e-5
-    let cw_clamped = cw.clamp(0.0, 2.55); // u8 max (255) * 0.01
-    let grade_raw = ((grade_clamped * 100.0) as i16 + 20000) as u16; // offset binary
-    let grade_bytes = grade_raw.to_le_bytes();
-    let crr_raw = (crr_clamped / 5e-5) as u8;
-    let cw_raw = (cw_clamped / 0.01) as u8;
-    [
-        0x33,
-        0xFF,
-        0xFF,
-        0xFF,
-        grade_bytes[0],
-        grade_bytes[1],
-        crr_raw,
-        cw_raw,
-    ]
+/// Profile limits (ANT+ FE-C D00001231 Rev 5.0, Tables 8-38 and 8-42).
+const GRADE_MIN_PCT: f32 = -200.0;
+const GRADE_MAX_PCT: f32 = 200.0;
+const CRR_MAX: f32 = 0.0127;
+const CW_MAX_KG_PER_M: f32 = 1.86;
+
+/// Encode Track Resistance page (0x33), FE-C Rev 5.0 Table 8-42:
+/// `[0x33, 0xFF x4 (reserved), grade_lo, grade_hi, crr]`.
+/// Grade: 0.01 % units with a -200 % offset (0x4E20 = 0 %), rounded to nearest.
+/// Crr: 5e-5 units. A NaN grade is treated as 0 %.
+fn encode_track_resistance(grade: f32, crr: f32) -> [u8; 8] {
+    let grade = if grade.is_nan() { 0.0 } else { grade };
+    let grade_clamped = grade.clamp(GRADE_MIN_PCT, GRADE_MAX_PCT);
+    // Max (200 + 200) * 100 = 40000, fits u16.
+    let grade_raw = ((grade_clamped - GRADE_MIN_PCT) * 100.0).round() as u16;
+    let crr = if crr.is_nan() { 0.0 } else { crr };
+    let crr_raw = (crr.clamp(0.0, CRR_MAX) / 5e-5).round() as u8;
+    let g = grade_raw.to_le_bytes();
+    [0x33, 0xFF, 0xFF, 0xFF, 0xFF, g[0], g[1], crr_raw]
 }
 
-/// FE-C trainer control via ANT+ acknowledged messages
+/// Encode Wind Resistance page (0x32), FE-C Rev 5.0 Table 8-38:
+/// `[0x32, 0xFF x4 (reserved), cw (0.01 kg/m), wind speed, drafting factor]`.
+/// Wind speed and drafting factor are sent as 0xFF ("use default": 0 km/h, 1.00).
+fn encode_wind_resistance(cw: f32) -> [u8; 8] {
+    [0x32, 0xFF, 0xFF, 0xFF, 0xFF, cw_raw(cw), 0xFF, 0xFF]
+}
+
+fn cw_raw(cw: f32) -> u8 {
+    let cw = if cw.is_nan() { 0.0 } else { cw };
+    (cw.clamp(0.0, CW_MAX_KG_PER_M) / 0.01).round() as u8
+}
+
+/// Pages to send for a simulation update. The wind page is only included when the
+/// encoded wind coefficient differs from the last one the trainer acknowledged.
+/// Returns the pages (wind first) and the encoded cw to remember on success.
+fn simulation_pages(grade: f32, crr: f32, cw: f32, last_cw_raw: Option<u8>) -> (Vec<[u8; 8]>, u8) {
+    let raw = cw_raw(cw);
+    let mut pages = Vec::with_capacity(2);
+    if last_cw_raw != Some(raw) {
+        pages.push(encode_wind_resistance(cw));
+    }
+    pages.push(encode_track_resistance(grade, crr));
+    (pages, raw)
+}
+
+/// FE-C trainer control via ANT+ acknowledged messages (blocking; call from spawn_blocking)
 pub struct FecController<'a> {
-    usb: &'a AntUsb,
-    channel_number: u8,
+    link: &'a FecLink,
 }
 
 impl<'a> FecController<'a> {
-    pub fn new(usb: &'a AntUsb, channel_number: u8) -> Self {
-        Self {
-            usb,
-            channel_number,
-        }
+    pub fn new(link: &'a FecLink) -> Self {
+        Self { link }
+    }
+
+    fn send(&self, page: &[u8; 8]) -> Result<(), AppError> {
+        let _serial = self.link.send_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let last_seen = &self.link.last_seen;
+        let fresh = || atomic_elapsed(last_seen).is_some_and(|age| age <= FEC_RETRY_FRESH);
+        send_acknowledged_and_wait(
+            &*self.link.usb,
+            &self.link.response_queue,
+            self.link.channel,
+            page,
+            ACK_ATTEMPT_TIMEOUT,
+            &fresh,
+        )
     }
 
     /// Set target power (Page 0x31)
     pub fn set_target_power(&self, watts: u16) -> Result<(), AppError> {
-        send_acknowledged(self.usb, self.channel_number, &encode_target_power(watts))
+        self.send(&encode_target_power(watts))
     }
 
     /// Set basic resistance (Page 0x30)
     pub fn set_resistance(&self, level: u8) -> Result<(), AppError> {
-        send_acknowledged(self.usb, self.channel_number, &encode_resistance(level))
+        self.send(&encode_resistance(level))
     }
 
-    /// Set track/simulation parameters (Page 0x33)
-    pub fn set_simulation(&self, grade: f32, crr: f32, cw: f32) -> Result<(), AppError> {
-        send_acknowledged(
-            self.usb,
-            self.channel_number,
-            &encode_simulation(grade, crr, cw),
-        )
+    /// Set simulation parameters: Wind Resistance (0x32, only when cw changed) then
+    /// Track Resistance (0x33). Returns the encoded cw the trainer now has.
+    pub fn set_simulation(
+        &self,
+        grade: f32,
+        crr: f32,
+        cw: f32,
+        last_cw_raw: Option<u8>,
+    ) -> Result<u8, AppError> {
+        let (pages, raw) = simulation_pages(grade, crr, cw, last_cw_raw);
+        for page in &pages {
+            self.send(page)?;
+        }
+        Ok(raw)
     }
 }
 
@@ -129,32 +188,95 @@ mod tests {
         assert_eq!(data[7], 200);
     }
 
-    // ---- Simulation (Page 0x33) ----
+    // ---- Track Resistance (Page 0x33) ----
+    // ANT+ FE-C D00001231 Rev 5.0 Table 8-42: [0x33, FF, FF, FF, FF, grade_lo, grade_hi, crr]
+    // grade: 0.01 % units, offset -200 % (0x4E20 = 0 %); Crr: 5e-5 units.
 
     #[test]
-    fn encode_simulation_zero_grade() {
-        let data = encode_simulation(0.0, 0.0, 0.0);
-        assert_eq!(data[0], 0x33);
-        // grade=0 → raw = (0*100 + 20000) = 20000 = 0x4E20 LE = [0x20, 0x4E]
-        assert_eq!(data[4], 0x20);
-        assert_eq!(data[5], 0x4E);
+    fn fec_track_resistance_zero_grade_layout() {
+        // (0 + 200) * 100 = 20000 = 0x4E20; crr 0.004 / 5e-5 = 80
+        assert_eq!(
+            encode_track_resistance(0.0, 0.004),
+            [0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0x20, 0x4E, 80]
+        );
     }
 
     #[test]
-    fn encode_simulation_negative_grade() {
-        let data = encode_simulation(-10.0, 0.0, 0.0);
-        // grade=-10.0 → raw = (-10*100 + 20000) = (-1000 + 20000) = 19000 = 0x4A38
-        // LE = [0x38, 0x4A]
-        assert_eq!(data[4], 0x38);
-        assert_eq!(data[5], 0x4A);
+    fn fec_track_resistance_minus_3_percent() {
+        // (-3 + 200) * 100 = 19700 = 0x4CF4
+        let d = encode_track_resistance(-3.0, 0.004);
+        assert_eq!(&d[5..7], &[0xF4, 0x4C]);
     }
 
     #[test]
-    fn encode_simulation_crr_and_cw() {
-        let data = encode_simulation(0.0, 0.005, 0.5);
-        // crr=0.005 → raw = 0.005 / 5e-5 = 100
-        assert_eq!(data[6], 100);
-        // cw=0.5 → raw = 0.5 / 0.01 = 50
-        assert_eq!(data[7], 50);
+    fn fec_track_resistance_plus_5_percent() {
+        // (5 + 200) * 100 = 20500 = 0x5014
+        let d = encode_track_resistance(5.0, 0.004);
+        assert_eq!(&d[5..7], &[0x14, 0x50]);
+    }
+
+    #[test]
+    fn fec_track_resistance_crr_0_004_is_raw_80() {
+        assert_eq!(encode_track_resistance(0.0, 0.004)[7], 80);
+        // 0.005 / 5e-5 = 100 (rounded, not truncated to 99)
+        assert_eq!(encode_track_resistance(0.0, 0.005)[7], 100);
+        // clamp to profile max 0.0127 → 254
+        assert_eq!(encode_track_resistance(0.0, 1.0)[7], 254);
+    }
+
+    #[test]
+    fn fec_grade_2_3_rounds_to_raw_20230() {
+        // (2.3 + 200) * 100 = 20230 = 0x4F06 (truncation would give 20229)
+        let d = encode_track_resistance(2.3, 0.004);
+        assert_eq!(u16::from_le_bytes([d[5], d[6]]), 20230);
+        // 2.296 % → 20229.6 → 20230 (sub-resolution input rounds to nearest)
+        let d = encode_track_resistance(2.296, 0.004);
+        assert_eq!(u16::from_le_bytes([d[5], d[6]]), 20230);
+    }
+
+    #[test]
+    fn fec_grade_extremes_do_not_overflow() {
+        let lo = encode_track_resistance(-1000.0, 0.0);
+        assert_eq!(u16::from_le_bytes([lo[5], lo[6]]), 0); // clamped to -200 %
+        let hi = encode_track_resistance(1000.0, 0.0);
+        assert_eq!(u16::from_le_bytes([hi[5], hi[6]]), 40000); // +200 % = 0x9C40
+    }
+
+    #[test]
+    fn fec_grade_nan_encodes_zero_percent() {
+        let d = encode_track_resistance(f32::NAN, 0.004);
+        assert_eq!(u16::from_le_bytes([d[5], d[6]]), 20000);
+    }
+
+    // ---- Wind Resistance (Page 0x32) ----
+    // FE-C Rev 5.0 Table 8-38: [0x32, FF, FF, FF, FF, cw (0.01 kg/m), wind speed, drafting]
+
+    #[test]
+    fn fec_wind_resistance_page_layout_cw_0_51() {
+        // 0.51 / 0.01 = 51; wind speed and drafting factor left at 0xFF (profile defaults)
+        assert_eq!(
+            encode_wind_resistance(0.51),
+            [0x32, 0xFF, 0xFF, 0xFF, 0xFF, 51, 0xFF, 0xFF]
+        );
+        // clamp to profile max 1.86 kg/m → 186
+        assert_eq!(encode_wind_resistance(5.0)[5], 186);
+    }
+
+    #[test]
+    fn fec_wind_page_sent_only_when_cw_changes() {
+        // First call: no cw sent yet → wind page (0x32) then track page (0x33)
+        let (first, cw_raw) = simulation_pages(1.0, 0.004, 0.51, None);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0][0], 0x32);
+        assert_eq!(first[1][0], 0x33);
+        assert_eq!(cw_raw, 51);
+        // Same cw already acknowledged → only the track page
+        let (second, _) = simulation_pages(2.0, 0.004, 0.51, Some(51));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0][0], 0x33);
+        // Changed cw → wind page again
+        let (third, cw_raw) = simulation_pages(2.0, 0.004, 0.40, Some(51));
+        assert_eq!(third.len(), 2);
+        assert_eq!(cw_raw, 40);
     }
 }

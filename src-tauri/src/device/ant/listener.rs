@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+use super::channel::PROFILE_SPEED_CADENCE;
 use super::protocol::{AntDecoder, DEFAULT_WHEEL_CIRCUMFERENCE_MM};
-use crate::device::types::{is_dominated, AntDeviceMetadata, DeviceType, SensorReading};
+use crate::device::primary::{admit_reading, SharedPrimaryState};
+use crate::device::types::{AntDeviceMetadata, DeviceType, SensorReading};
 
 /// Monotonic reference epoch for lock-free timestamps.
 /// All `last_seen` values are stored as nanos elapsed since this instant.
@@ -27,6 +29,14 @@ pub fn atomic_elapsed(ts: &AtomicI64) -> Option<std::time::Duration> {
     let now_nanos = EPOCH.elapsed().as_nanos() as i64;
     let elapsed_nanos = (now_nanos - nanos).max(0) as u64;
     Some(std::time::Duration::from_nanos(elapsed_nanos))
+}
+
+/// Test helper: make `ts` read as having been set `age` ago.
+#[cfg(test)]
+pub fn atomic_set_age(ts: &AtomicI64, age: std::time::Duration) {
+    let nanos = EPOCH.elapsed().as_nanos() as i64 - age.as_nanos() as i64;
+    // 0 means "never set"; nudge an exact zero so the value stays meaningful.
+    ts.store(if nanos == 0 { -1 } else { nanos }, Ordering::Relaxed);
 }
 
 /// Decode ANT+ Common Data Page 80: Manufacturer's Information
@@ -74,12 +84,63 @@ fn decode_common_page_82(data: &[u8; 8], meta: &mut AntDeviceMetadata) {
     }
 }
 
+/// Background pages 2 (manufacturer) and 3 (product) of the paged ANT+ profiles:
+/// Heart Rate (HRM D00000693 Rev 1.13 §5.3, Tables 6-7) and the separate speed /
+/// cadence sensors (same layout per ANT's nRF Connect SDK `ant_bsc` page encoders).
+/// Byte 0 bit 7 is the page-change toggle; bytes 1-3 must not be interpreted until
+/// the toggle has been seen both set and clear (legacy devices never toggle).
+#[derive(Debug, Default)]
+pub struct BackgroundPages {
+    seen_toggle_clear: bool,
+    seen_toggle_set: bool,
+}
+
+impl BackgroundPages {
+    /// Record the toggle bit; returns the page number if it is a background page
+    /// worth decoding (2 or 3) and the device is known to use paged data.
+    pub fn observe(&mut self, page_byte: u8) -> Option<u8> {
+        if page_byte & 0x80 != 0 {
+            self.seen_toggle_set = true;
+        } else {
+            self.seen_toggle_clear = true;
+        }
+        let page = page_byte & 0x7F;
+        (self.seen_toggle_set && self.seen_toggle_clear && (page == 2 || page == 3)).then_some(page)
+    }
+}
+
+/// Decode background page 2 or 3 into `meta`.
+/// Page 2: byte 1 manufacturer ID, bytes 2-3 serial number upper 16 bits (the lower
+/// 16 bits are the device number). Page 3: byte 1 HW version, byte 2 SW version,
+/// byte 3 model number.
+pub fn decode_background_page(page: u8, data: &[u8; 8], device_number: u16, meta: &mut AntDeviceMetadata) {
+    match page {
+        2 => {
+            meta.manufacturer_id = Some(data[1] as u16);
+            let upper = u16::from_le_bytes([data[2], data[3]]) as u32;
+            meta.serial_number = Some((upper << 16) | device_number as u32);
+        }
+        3 => {
+            meta.hw_revision = Some(data[1]);
+            meta.sw_revision = Some(data[2].to_string());
+            meta.model_number = Some(data[3] as u16);
+        }
+        _ => {}
+    }
+}
+
+/// Device number from an `ant:<type>:<number>` id.
+fn device_number_of(device_id: &str) -> Option<u16> {
+    device_id.rsplit(':').next()?.parse().ok()
+}
+
 /// Listen for ANT+ data pages on a per-channel mpsc receiver and broadcast SensorReadings.
 /// The router thread extracts 8-byte data pages from USB broadcast messages and sends them
 /// via the mpsc channel, so this function never touches USB directly.
 /// This runs in a blocking thread (call from tokio::task::spawn_blocking).
 pub fn listen_ant_channel(
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    initial: Option<[u8; 8]>,
     device_type: DeviceType,
     tx: broadcast::Sender<SensorReading>,
     stop: Arc<AtomicBool>,
@@ -87,15 +148,26 @@ pub fn listen_ant_channel(
     metadata_store: Arc<Mutex<HashMap<String, AntDeviceMetadata>>>,
     device_type_id: u8,
     last_seen: Arc<AtomicI64>,
-    primaries: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
+    primaries: Option<SharedPrimaryState>,
 ) {
     let mut decoder = AntDecoder::new();
+    // HR and the separate speed/cadence sensors use toggled background pages.
+    let paged_profile = matches!(device_type_id, 120 | 122 | 123);
+    let device_number = device_number_of(&device_id);
+    let mut background = BackgroundPages::default();
 
     info!("[{}] ANT+ channel listener started for {:?}", device_id, device_type);
 
+    // The page that proved the device is present (consumed by connect) is decoded first.
+    let mut pending = initial.map(|p| p.to_vec());
+
     while !stop.load(Ordering::Relaxed) {
         // recv_timeout so we periodically check the stop flag
-        let page_data = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+        let next = match pending.take() {
+            Some(p) => Ok(p),
+            None => rx.recv_timeout(std::time::Duration::from_millis(200)),
+        };
+        let page_data = match next {
             Ok(data) => data,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -118,7 +190,9 @@ pub fn listen_ant_channel(
         atomic_now(&last_seen);
 
         // Decode ANT+ Common Data Pages — only lock metadata for these rare pages
-        if page_num == 0x50 || page_num == 0x51 || page_num == 0x52 {
+        // The combined S&C page (121) has no page byte: byte 0 is cadence time data.
+        let has_pages = device_type_id != PROFILE_SPEED_CADENCE.device_type_id;
+        if has_pages && (page_num == 0x50 || page_num == 0x51 || page_num == 0x52) {
             let mut store = metadata_store.lock().unwrap_or_else(|e| e.into_inner());
             let meta = store.entry(device_id.clone()).or_default();
             match page_num {
@@ -130,29 +204,30 @@ pub fn listen_ant_channel(
             continue;
         }
 
+        if paged_profile {
+            if let (Some(page), Some(dn)) = (background.observe(data[0]), device_number) {
+                let mut store = metadata_store.lock().unwrap_or_else(|e| e.into_inner());
+                decode_background_page(page, &data, dn, store.entry(device_id.clone()).or_default());
+            }
+        }
+
         let readings: Vec<SensorReading> = match device_type {
             DeviceType::HeartRate => decoder.decode_hr(&data, &device_id).into_iter().collect(),
-            DeviceType::Power => decoder.decode_power(&data, &device_id).into_iter().collect(),
-            DeviceType::CadenceSpeed => {
-                if device_type_id == 123 {
-                    decoder
-                        .decode_speed(&data, &device_id, DEFAULT_WHEEL_CIRCUMFERENCE_MM)
-                        .into_iter()
-                        .collect()
-                } else {
-                    decoder.decode_cadence(&data, &device_id).into_iter().collect()
-                }
-            }
+            DeviceType::Power => decoder.decode_power_page(&data, &device_id),
+            DeviceType::CadenceSpeed => match device_type_id {
+                123 => decoder
+                    .decode_speed(&data, &device_id, DEFAULT_WHEEL_CIRCUMFERENCE_MM)
+                    .into_iter()
+                    .collect(),
+                121 => decoder.decode_combined_sc(&data, &device_id, DEFAULT_WHEEL_CIRCUMFERENCE_MM),
+                _ => decoder.decode_cadence(&data, &device_id).into_iter().collect(),
+            },
             DeviceType::FitnessTrainer => decoder.decode_fec_trainer(&data, &device_id),
         };
 
         for reading in readings {
             if let Some(ref p) = primaries {
-                let dominated = {
-                    let guard = p.read().unwrap_or_else(|e| e.into_inner());
-                    is_dominated(&guard, &reading)
-                };
-                if dominated {
+                if !admit_reading(p, &reading, std::time::Instant::now()) {
                     continue;
                 }
             }
@@ -259,5 +334,60 @@ mod tests {
         decode_common_page_82(&data2, &mut meta2);
         assert_eq!(meta2.battery_level, Some(85));
         assert_eq!(meta2.battery_voltage, None);
+    }
+
+    // ---- HR / S&C background pages 2-3 (HRM Rev 1.13 §5.3) ----
+
+    #[test]
+    fn hr_page2_ignored_before_toggle_seen() {
+        let mut bg = BackgroundPages::default();
+        // Legacy device: toggle bit never changes → bytes 1-3 are not page data
+        assert_eq!(bg.observe(0x02), None);
+        assert_eq!(bg.observe(0x02), None);
+    }
+
+    #[test]
+    fn page_toggle_gate_opens_after_both_states() {
+        let mut bg = BackgroundPages::default();
+        assert_eq!(bg.observe(0x84), None); // page 4, toggle set
+        assert_eq!(bg.observe(0x04), None); // page 4, toggle clear → gate open, not a bg page
+        assert_eq!(bg.observe(0x82), Some(2), "toggle bit masked off the page number");
+        assert_eq!(bg.observe(0x03), Some(3));
+    }
+
+    #[test]
+    fn hr_page2_manufacturer_and_serial_with_toggle_bit_set() {
+        let mut meta = AntDeviceMetadata::default();
+        // page 2 (0x82 with toggle), mfr 32 (Wahoo), serial upper 0x1234; HR fields after
+        let data: [u8; 8] = [0x82, 32, 0x34, 0x12, 0x00, 0x04, 9, 142];
+        decode_background_page(2, &data, 0xABCD, &mut meta);
+        assert_eq!(meta.manufacturer_id, Some(32));
+        assert_eq!(meta.serial_number, Some(0x1234_ABCD));
+    }
+
+    #[test]
+    fn hr_page3_hw_sw_model() {
+        let mut meta = AntDeviceMetadata::default();
+        let data: [u8; 8] = [0x03, 5, 7, 42, 0x00, 0x04, 9, 142];
+        decode_background_page(3, &data, 1, &mut meta);
+        assert_eq!(meta.hw_revision, Some(5));
+        assert_eq!(meta.sw_revision.as_deref(), Some("7"));
+        assert_eq!(meta.model_number, Some(42));
+    }
+
+    #[test]
+    fn sc_page2_serial_combines_device_number() {
+        let mut meta = AntDeviceMetadata::default();
+        // speed sensor page 2: mfr 69 (Stages), serial upper 0x0001; device number 23456
+        let data: [u8; 8] = [0x02, 69, 0x01, 0x00, 0x00, 0x04, 0x10, 0x00];
+        decode_background_page(2, &data, 23456, &mut meta);
+        assert_eq!(meta.manufacturer_id, Some(69));
+        assert_eq!(meta.serial_number, Some((1 << 16) | 23456));
+    }
+
+    #[test]
+    fn device_number_parsed_from_ant_id() {
+        assert_eq!(device_number_of("ant:120:4242"), Some(4242));
+        assert_eq!(device_number_of("not-ant"), None);
     }
 }
