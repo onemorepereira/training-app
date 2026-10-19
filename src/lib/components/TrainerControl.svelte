@@ -3,6 +3,7 @@
   import { trainerState, trainerError, type TrainerMode, type TrainerState } from '$lib/stores/trainer';
   import { currentPower } from '$lib/stores/sensor';
   import { api, extractError } from '$lib/tauri';
+  import { createLatestWinsSender } from '$lib/utils/latestWins';
 
   let local: TrainerState = $state({
     mode: 'erg',
@@ -12,14 +13,11 @@
     simCrr: 0.004,
     simCw: 0.51,
   });
-  let sending = $state(false);
-  let sendTimer: ReturnType<typeof setTimeout> | null = null;
   let errorTimer: ReturnType<typeof setTimeout> | null = null;
 
   const unsubscribe = trainerState.subscribe((v) => { local = { ...v }; });
   onDestroy(() => {
     unsubscribe();
-    if (sendTimer) clearTimeout(sendTimer);
     if (errorTimer) clearTimeout(errorTimer);
   });
 
@@ -41,50 +39,33 @@
     else sendSimulation();
   }
 
-  async function sendErg() {
-    if (sending) return;
-    sending = true;
-    trainerError.set('');
-    try {
-      await api.setTrainerPower(local.ergTarget);
-    } catch (e) {
-      setError(extractError(e));
-    } finally {
-      sending = false;
-    }
+  type TrainerCommand =
+    | { kind: 'erg'; watts: number }
+    | { kind: 'resistance'; level: number }
+    | { kind: 'sim'; grade: number; crr: number; cw: number };
+
+  // Rapid changes while a command is in flight collapse to the latest one,
+  // which is sent as soon as the in-flight command settles.
+  const sender = createLatestWinsSender<TrainerCommand>(
+    (cmd) => {
+      trainerError.set('');
+      if (cmd.kind === 'erg') return api.setTrainerPower(cmd.watts);
+      if (cmd.kind === 'resistance') return api.setTrainerResistance(cmd.level);
+      return api.setTrainerSimulation(cmd.grade, cmd.crr, cmd.cw);
+    },
+    (e) => setError(extractError(e)),
+  );
+
+  function sendErg() {
+    sender.submit({ kind: 'erg', watts: local.ergTarget });
   }
 
-  async function sendResistance() {
-    if (sending) return;
-    sending = true;
-    trainerError.set('');
-    try {
-      await api.setTrainerResistance(local.resistanceLevel);
-    } catch (e) {
-      setError(extractError(e));
-    } finally {
-      sending = false;
-    }
+  function sendResistance() {
+    sender.submit({ kind: 'resistance', level: local.resistanceLevel });
   }
 
-  async function sendSimulation() {
-    if (sending) return;
-    sending = true;
-    trainerError.set('');
-    try {
-      await api.setTrainerSimulation(local.simGrade, local.simCrr, local.simCw);
-    } catch (e) {
-      setError(extractError(e));
-    } finally {
-      sending = false;
-    }
-  }
-
-  function throttledSend(fn: () => void) {
-    save();
-    if (sendTimer) return;
-    fn();
-    sendTimer = setTimeout(() => { sendTimer = null; }, 150);
+  function sendSimulation() {
+    sender.submit({ kind: 'sim', grade: local.simGrade, crr: local.simCrr, cw: local.simCw });
   }
 
   function adjustErg(delta: number) {
