@@ -21,7 +21,9 @@ import {
   completionSnapshot,
   buildZoneRideConfig,
   describeZoneStop,
+  resolveZoneBounds,
 } from './zoneRide';
+import type { SessionConfig } from '$lib/tauri';
 
 /** Advance one poll tick and let the async poll callback (and anything it awaits) settle. */
 async function pollTick() {
@@ -208,5 +210,85 @@ describe('describeZoneStop', () => {
     [null, 'Zone ride stopped'],
   ] as const)('describe_zone_stop_%s', (reason, text) => {
     expect(describeZoneStop({ reason, safetyNote: null })).toBe(text);
+  });
+});
+
+function config(overrides: Partial<SessionConfig> = {}): SessionConfig {
+  return {
+    ftp: 200,
+    weight_kg: 75,
+    hr_zones: [120, 140, 160, 175, 190],
+    units: 'metric',
+    power_zones: [55, 75, 90, 105, 120, 150],
+    date_of_birth: null,
+    sex: null,
+    resting_hr: null,
+    max_hr: 195,
+    ...overrides,
+  };
+}
+
+describe('resolveZoneBounds power', () => {
+  // FTP 200, default %: boundaries 110, 150, 180, 210, 240, 300
+  it.each([
+    [1, 0, 110],
+    [2, 110, 150],
+    [3, 150, 180],
+    [4, 180, 210],
+    [5, 210, 240],
+    [6, 240, 300],
+    [7, 300, 400], // upper = max(lower + 1, 2·FTP) = 400
+  ])('power_zone_%i_default_bounds', (zone, lower, upper) => {
+    expect(resolveZoneBounds('Power', zone, config())).toEqual({ lower, upper });
+  });
+
+  // FTP 250, % [50,70,85,100,115,210]: 125, 175, 212.5→213, 250, 287.5→288, 525
+  it.each([
+    [1, 0, 125],
+    [2, 125, 175],
+    [3, 175, 213],
+    [4, 213, 250],
+    [5, 250, 288],
+    [6, 288, 525],
+  ])('power_zone_%i_custom_bounds', (zone, lower, upper) => {
+    const cfg = config({ ftp: 250, power_zones: [50, 70, 85, 100, 115, 210] });
+    expect(resolveZoneBounds('Power', zone, cfg)).toEqual({ lower, upper });
+  });
+
+  it('power_zone7_upper_exceeds_lower_when_z6_above_two_ftp', () => {
+    // Z7 lower 525 W > 2·FTP (500 W) → upper = lower + 1
+    const cfg = config({ ftp: 250, power_zones: [50, 70, 85, 100, 115, 210] });
+    expect(resolveZoneBounds('Power', 7, cfg)).toEqual({ lower: 525, upper: 526 });
+  });
+
+  it('power_zone_above_7_clamps_to_7', () => {
+    expect(resolveZoneBounds('Power', 9, config())).toEqual({ lower: 300, upper: 400 });
+  });
+});
+
+describe('resolveZoneBounds heart rate', () => {
+  it.each([
+    [1, 0, 120],
+    [2, 120, 140],
+    [3, 140, 160],
+    [4, 160, 175],
+    [5, 175, 190], // Z4 upper → Z5 upper, not Z5 upper → max HR
+  ])('hr_zone_%i_default_bounds', (zone, lower, upper) => {
+    expect(resolveZoneBounds('HeartRate', zone, config())).toEqual({ lower, upper });
+  });
+
+  it.each([
+    [1, 0, 110],
+    [2, 110, 130],
+    [3, 130, 150],
+    [4, 150, 165],
+    [5, 165, 182],
+  ])('hr_zone_%i_custom_bounds', (zone, lower, upper) => {
+    const cfg = config({ hr_zones: [110, 130, 150, 165, 182], max_hr: null });
+    expect(resolveZoneBounds('HeartRate', zone, cfg)).toEqual({ lower, upper });
+  });
+
+  it('hr_zone_above_5_clamps_to_5', () => {
+    expect(resolveZoneBounds('HeartRate', 6, config())).toEqual({ lower: 175, upper: 190 });
   });
 });

@@ -173,8 +173,10 @@ export async function resumeZoneRide(): Promise<void> {
 
 /**
  * Resolve zone number to watts/bpm bounds from user config.
- * Power zones are stored as %FTP boundaries (zone 1 < power_zone_1% < zone 2 < ... < zone 7).
- * HR zones are absolute bpm boundaries (zone 1 < hr_zone_1 < zone 2 < ... < zone 5).
+ * Power zones are stored as %FTP upper boundaries of zones 1–6; zone 7 is open-ended,
+ * so its target upper bound is max(lower + 1, 2·FTP) to keep the range non-empty.
+ * HR zones are absolute bpm upper boundaries of zones 1–5.
+ * Zone k ≥ 2 spans [upper(k−1), upper(k)]. Out-of-range zone numbers are clamped.
  */
 export function resolveZoneBounds(
   mode: ZoneMode,
@@ -182,19 +184,15 @@ export function resolveZoneBounds(
   config: SessionConfig,
 ): { lower: number; upper: number } {
   if (mode === 'Power') {
-    // power_zones = [z1_upper%, z2_upper%, z3_upper%, z4_upper%, z5_upper%, z6_upper%]
-    // zone 1: 0 - pz[0]%, zone 2: pz[0] - pz[1]%, ... zone 7: pz[5]% +
-    const pz = config.power_zones;
     const ftp = config.ftp;
-    const boundaries = pz.map((p) => Math.round((p / 100) * ftp));
-    if (zone <= 1) return { lower: 0, upper: boundaries[0] };
-    if (zone >= 7) return { lower: boundaries[5], upper: Math.round(ftp * 1.5) };
-    return { lower: boundaries[zone - 2], upper: boundaries[zone - 1] };
-  } else {
-    // hr_zones = [z1_upper, z2_upper, z3_upper, z4_upper, z5_upper]
-    const hz = config.hr_zones;
-    if (zone <= 1) return { lower: 0, upper: hz[0] };
-    if (zone >= 5) return { lower: hz[4], upper: config.max_hr ?? 220 };
-    return { lower: hz[zone - 2], upper: hz[zone - 1] };
+    const b = config.power_zones.map((p) => Math.round((p / 100) * ftp));
+    const z = Math.min(7, Math.max(1, zone));
+    if (z === 1) return { lower: 0, upper: b[0] };
+    if (z === 7) return { lower: b[5], upper: Math.max(b[5] + 1, Math.round(2 * ftp)) };
+    return { lower: b[z - 2], upper: b[z - 1] };
   }
+  const hz = config.hr_zones;
+  const z = Math.min(5, Math.max(1, zone));
+  if (z === 1) return { lower: 0, upper: hz[0] };
+  return { lower: hz[z - 2], upper: hz[z - 1] };
 }
