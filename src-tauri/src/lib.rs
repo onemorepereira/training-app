@@ -16,9 +16,11 @@ use log::Record;
 use session::manager::SessionManager;
 use session::storage::Storage;
 use session::zone_control::controller::ZoneController;
+use std::any::Any;
 use std::io::Write;
-use std::sync::Arc;
-use tauri::{Emitter, Manager, WindowEvent};
+use std::panic::Location;
+use std::sync::{Arc, OnceLock};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tokio::sync::broadcast;
 
 /// Stderr: colored, time-only, shortened module path
@@ -63,6 +65,42 @@ fn file_format(
     )
 }
 
+/// Kept for the whole process. Tauri's `App::run` ends with `std::process::exit`,
+/// so nothing is dropped at exit; flexi_logger 0.29 docs: with any WriteMode but
+/// Direct, the handle must stay alive and buffered lines are only written out on
+/// flush/drop. We flush explicitly on `RunEvent::Exit` and in the panic hook.
+static LOGGER: OnceLock<flexi_logger::LoggerHandle> = OnceLock::new();
+
+fn flush_logger() {
+    if let Some(handle) = LOGGER.get() {
+        handle.flush();
+    }
+}
+
+/// "<message> at <file>:<line>:<col>" for a panic payload.
+fn format_panic(payload: &(dyn Any + Send), location: Option<&Location<'_>>) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    match location {
+        Some(loc) => format!("panic: {} at {}:{}:{}", message, loc.file(), loc.line(), loc.column()),
+        None => format!("panic: {} at <unknown location>", message),
+    }
+}
+
+/// Log every panic (any thread) at error level and flush, then run the default
+/// hook so stderr output and backtraces are unchanged.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("{}", format_panic(info.payload(), info.location()));
+        flush_logger();
+        default_hook(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Work around WebKitGTK EGL crashes in AppImage bundles on certain
@@ -98,7 +136,7 @@ pub fn run() {
             #[cfg(not(feature = "production"))]
             let stderr_dup = Duplicate::All;
 
-            let _logger = Logger::try_with_env_or_str(log_spec)
+            let logger = Logger::try_with_env_or_str(log_spec)
             .expect("Failed to parse log spec")
             .log_to_file(
                 FileSpec::default()
@@ -117,9 +155,10 @@ pub fn run() {
             .start()
             .expect("Failed to start logger");
 
-            // Leak the handle — logger must live for the process lifetime.
-            // Dropping it deregisters the logger and stops all logging.
-            Box::leak(Box::new(_logger));
+            if LOGGER.set(logger).is_err() {
+                log::warn!("Logger handle already initialized");
+            }
+            install_panic_hook();
 
             log::info!("Logging to {}", log_dir.display());
 
@@ -384,6 +423,50 @@ pub fn run() {
         ]);
 
         builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let RunEvent::Exit = event {
+                log::info!("Application exiting");
+                flush_logger();
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_panic_str_payload_includes_location() {
+        let loc = Location::caller();
+        let msg = format_panic(&"index out of bounds", Some(loc));
+        assert_eq!(
+            msg,
+            format!("panic: index out of bounds at {}:{}:{}", loc.file(), loc.line(), loc.column())
+        );
+    }
+
+    #[test]
+    fn format_panic_string_payload() {
+        let payload: String = format!("bad value {}", 42);
+        assert_eq!(
+            format_panic(&payload, None),
+            "panic: bad value 42 at <unknown location>"
+        );
+    }
+
+    #[test]
+    fn format_panic_non_string_payload() {
+        assert_eq!(
+            format_panic(&17_u32, None),
+            "panic: <non-string panic payload> at <unknown location>"
+        );
+    }
+
+    #[test]
+    fn format_panic_on_real_panic_payload() {
+        let err = std::panic::catch_unwind(|| panic!("boom {}", 7)).unwrap_err();
+        assert_eq!(format_panic(err.as_ref(), None), "panic: boom 7 at <unknown location>");
+    }
 }
