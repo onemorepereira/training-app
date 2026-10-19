@@ -362,6 +362,10 @@ impl Storage {
         })
     }
 
+    /// Replace a session's user metadata. Full-replace contract: every call
+    /// writes all four fields, so `None` clears a field. Strings that are empty
+    /// after trimming are stored as NULL (the UI then shows its default title).
+    /// Callers must pass the complete current form state, not a partial update.
     pub async fn update_session_metadata(
         &self,
         session_id: &str,
@@ -370,13 +374,14 @@ impl Storage {
         rpe: Option<u8>,
         notes: Option<String>,
     ) -> Result<(), AppError> {
+        fn non_empty(v: Option<String>) -> Option<String> {
+            v.filter(|s| !s.trim().is_empty())
+        }
+        let title = non_empty(title);
+        let activity_type = non_empty(activity_type);
+        let notes = non_empty(notes);
         let result = sqlx::query(
-            "UPDATE sessions SET \
-               title = COALESCE(?, title), \
-               activity_type = COALESCE(?, activity_type), \
-               rpe = COALESCE(?, rpe), \
-               notes = COALESCE(?, notes) \
-             WHERE id = ?",
+            "UPDATE sessions SET title = ?, activity_type = ?, rpe = ?, notes = ? WHERE id = ?",
         )
         .bind(&title)
         .bind(&activity_type)

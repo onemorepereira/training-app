@@ -507,26 +507,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_session_metadata_coalesce() {
+    async fn update_session_metadata_none_clears_field() {
         let (storage, _tmp) = test_storage().await;
         let summary = make_summary("meta-2");
         storage.save_session(&summary, b"raw").await.unwrap();
+        storage
+            .update_session_metadata("meta-2", Some("Evening Ride".into()), Some("tempo".into()), Some(7), Some("Windy".into()))
+            .await
+            .unwrap();
 
-        // First update: set title only
+        // Full-replace: None clears activity type, RPE and notes
         storage
             .update_session_metadata("meta-2", Some("Evening Ride".into()), None, None, None)
             .await
             .unwrap();
 
-        // Second update: set rpe only — title should be preserved
+        let loaded = storage.get_session("meta-2").await.unwrap();
+        assert_eq!(loaded.title, Some("Evening Ride".to_string()));
+        assert_eq!(loaded.activity_type, None);
+        assert_eq!(loaded.rpe, None);
+        assert_eq!(loaded.notes, None);
+    }
+
+    #[tokio::test]
+    async fn update_session_metadata_empty_string_stored_as_null() {
+        let (storage, _tmp) = test_storage().await;
+        let summary = make_summary("meta-3");
+        storage.save_session(&summary, b"raw").await.unwrap();
         storage
-            .update_session_metadata("meta-2", None, None, Some(8), None)
+            .update_session_metadata("meta-3", Some("Ride".into()), Some("tempo".into()), None, Some("Notes".into()))
             .await
             .unwrap();
 
-        let loaded = storage.get_session("meta-2").await.unwrap();
-        assert_eq!(loaded.title, Some("Evening Ride".to_string()));
-        assert_eq!(loaded.rpe, Some(8));
+        storage
+            .update_session_metadata("meta-3", Some("   ".into()), Some("".into()), None, Some("".into()))
+            .await
+            .unwrap();
+
+        let loaded = storage.get_session("meta-3").await.unwrap();
+        assert_eq!(loaded.title, None);
+        assert_eq!(loaded.activity_type, None);
+        assert_eq!(loaded.notes, None);
     }
 
     #[tokio::test]

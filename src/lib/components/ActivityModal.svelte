@@ -28,7 +28,7 @@
     mode = 'post-ride',
   }: {
     session: SessionSummary;
-    onSave: (title: string, activityType: string | null, rpe: number | null, notes: string | null) => void;
+    onSave: (title: string | null, activityType: string | null, rpe: number | null, notes: string | null) => void;
     onClose: () => void;
     onDelete?: () => void;
     mode?: 'post-ride' | 'edit';
@@ -49,7 +49,7 @@
 
   // Modal is freshly mounted each time — snapshot initial values (one-time read)
   const init = untrack(() => ({
-    title: session.title ?? autoTitle(session.start_time),
+    title: session.title?.trim() ? session.title : autoTitle(session.start_time),
     type: session.activity_type ?? null,
     rpe: session.rpe ?? null,
     notes: session.notes ?? '',
@@ -62,7 +62,8 @@
   let confirmingDelete = $state(false);
 
   function handleSave() {
-    onSave(title, selectedType, selectedRpe, notes || null);
+    // Full-replace contract: every field is sent; null clears it.
+    onSave(title.trim() || null, selectedType, selectedRpe, notes.trim() || null);
   }
 
   function handleDelete() {

@@ -96,7 +96,7 @@
     }
   }
 
-  async function handleSave(title: string, activityType: string | null, rpe: number | null, notes: string | null) {
+  async function handleSave(title: string | null, activityType: string | null, rpe: number | null, notes: string | null) {
     if (!session) return;
     try {
       await api.updateSessionMetadata(session.id, title, activityType, rpe, notes);

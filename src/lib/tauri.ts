@@ -259,6 +259,7 @@ export const api = {
     invoke<void>('set_primary_device', { deviceType, deviceId }),
   getPrimaryDevices: () => invoke<Record<string, string>>('get_primary_devices'),
   unlinkDevices: (deviceId: string) => invoke<void>('unlink_devices', { deviceId }),
+  /** Full-replace: all fields are written; null clears a field. */
   updateSessionMetadata: (
     sessionId: string,
     title: string | null,
