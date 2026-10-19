@@ -1,6 +1,41 @@
 use std::collections::VecDeque;
 
 use super::gap;
+use crate::device::types::SensorReading;
+
+/// Stored per-session summary metrics. Built only by
+/// `MetricsCalculator::summary_metrics`, so the live session stop path and the
+/// one-time repair (which replays the raw log) produce identical numbers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryMetrics {
+    pub avg_power: Option<u16>,
+    pub max_power: Option<u16>,
+    pub normalized_power: Option<u16>,
+    pub tss: Option<f32>,
+    pub intensity_factor: Option<f32>,
+    pub variability_index: Option<f32>,
+    pub work_kj: Option<f32>,
+    pub distance_km: Option<f32>,
+    pub avg_hr: Option<u8>,
+    pub max_hr: Option<u8>,
+    pub avg_cadence: Option<f32>,
+    pub avg_speed: Option<f32>,
+}
+
+/// Round to the nearest watt (199.5 → 200, 199.4 → 199) for integer storage.
+fn round_watts(w: f32) -> u16 {
+    w.round() as u16
+}
+
+/// Replay a raw sensor log through a fresh calculator, exactly as the live
+/// session fed it, and return the summary metrics.
+pub fn summarize_readings(readings: &[SensorReading], ftp: u16, active_secs: u64) -> SummaryMetrics {
+    let mut calc = MetricsCalculator::new(ftp);
+    for r in readings {
+        calc.record(r);
+    }
+    calc.summary_metrics(active_secs)
+}
 
 pub struct MetricsCalculator {
     ftp: u16,
@@ -36,6 +71,35 @@ impl MetricsCalculator {
             cadence_readings: Vec::new(),
             speed_history: Vec::new(),
             last_speed_ms: None,
+        }
+    }
+
+    /// Feed one sensor reading (the single entry point for live and replay).
+    pub fn record(&mut self, reading: &SensorReading) {
+        match reading {
+            SensorReading::Power { watts, epoch_ms, .. } => self.record_power(*watts, *epoch_ms),
+            SensorReading::HeartRate { bpm, .. } => self.record_hr(*bpm),
+            SensorReading::Cadence { rpm, .. } => self.record_cadence(*rpm),
+            SensorReading::Speed { kmh, epoch_ms, .. } => self.record_speed(*kmh, *epoch_ms),
+            SensorReading::TrainerCommand { .. } => {}
+        }
+    }
+
+    /// Summary metrics for storage, given the session's active duration (for TSS).
+    pub fn summary_metrics(&self, active_secs: u64) -> SummaryMetrics {
+        SummaryMetrics {
+            avg_power: self.avg_power(usize::MAX).map(round_watts),
+            max_power: self.max_power(),
+            normalized_power: self.normalized_power().map(round_watts),
+            tss: self.tss(active_secs),
+            intensity_factor: self.intensity_factor(),
+            variability_index: self.variability_index(),
+            work_kj: self.work_kj(),
+            distance_km: self.distance_km(),
+            avg_hr: self.avg_hr(),
+            max_hr: self.max_hr(),
+            avg_cadence: self.avg_cadence(),
+            avg_speed: self.avg_speed(),
         }
     }
 

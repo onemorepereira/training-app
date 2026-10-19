@@ -99,29 +99,7 @@ impl SessionManager {
         let mut lock = self.current_session.lock().await;
         let session = lock.take()?;
         info!("Session stopped: {}", session.id);
-        let active_secs = session.active_elapsed_ms / 1000;
-        let summary = SessionSummary {
-            id: session.id,
-            start_time: session.start_time,
-            duration_secs: active_secs,
-            ftp: Some(session.config.ftp),
-            avg_power: session.metrics.avg_power(usize::MAX).map(|v| v as u16),
-            max_power: session.metrics.max_power(),
-            normalized_power: session.metrics.normalized_power().map(|v| v as u16),
-            tss: session.metrics.tss(active_secs),
-            intensity_factor: session.metrics.intensity_factor(),
-            avg_hr: session.metrics.avg_hr(),
-            max_hr: session.metrics.max_hr(),
-            avg_cadence: session.metrics.avg_cadence(),
-            avg_speed: session.metrics.avg_speed(),
-            work_kj: session.metrics.work_kj(),
-            variability_index: session.metrics.variability_index(),
-            distance_km: session.metrics.distance_km(),
-            title: None,
-            activity_type: None,
-            rpe: None,
-            notes: None,
-        };
+        let summary = build_summary(&session);
         Some((summary, session.sensor_log))
     }
 
@@ -160,28 +138,14 @@ impl SessionManager {
         }
         session.last_reading_time = Some(now);
 
+        // Same entry point the one-time repair uses when replaying the raw log.
+        session.metrics.record(&reading);
         match &reading {
-            SensorReading::Power {
-                watts, epoch_ms, ..
-            } => {
-                session.metrics.record_power(*watts, *epoch_ms);
-                session.last_power = Some(now);
-            }
-            SensorReading::HeartRate { bpm, .. } => {
-                session.metrics.record_hr(*bpm);
-                session.last_hr = Some(now);
-            }
-            SensorReading::Cadence { rpm, .. } => {
-                session.metrics.record_cadence(*rpm);
-                session.last_cadence = Some(now);
-            }
-            SensorReading::Speed { kmh, epoch_ms, .. } => {
-                session.metrics.record_speed(*kmh, *epoch_ms);
-                session.last_speed = Some(now);
-            }
-            SensorReading::TrainerCommand { .. } => {
-                // No metrics to record — logged to sensor_log below
-            }
+            SensorReading::Power { .. } => session.last_power = Some(now),
+            SensorReading::HeartRate { .. } => session.last_hr = Some(now),
+            SensorReading::Cadence { .. } => session.last_cadence = Some(now),
+            SensorReading::Speed { .. } => session.last_speed = Some(now),
+            SensorReading::TrainerCommand { .. } => {} // logged to sensor_log below
         }
         session.sensor_log.push(reading);
     }
@@ -221,29 +185,7 @@ impl SessionManager {
     pub async fn snapshot_for_autosave(&self) -> Option<(String, SessionSummary, Vec<SensorReading>)> {
         let mut lock = self.current_session.lock().await;
         let session = lock.as_mut()?;
-        let active_secs = session.active_elapsed_ms / 1000;
-        let summary = SessionSummary {
-            id: session.id.clone(),
-            start_time: session.start_time,
-            duration_secs: active_secs,
-            ftp: Some(session.config.ftp),
-            avg_power: session.metrics.avg_power(usize::MAX).map(|v| v as u16),
-            max_power: session.metrics.max_power(),
-            normalized_power: session.metrics.normalized_power().map(|v| v as u16),
-            tss: session.metrics.tss(active_secs),
-            intensity_factor: session.metrics.intensity_factor(),
-            avg_hr: session.metrics.avg_hr(),
-            max_hr: session.metrics.max_hr(),
-            avg_cadence: session.metrics.avg_cadence(),
-            avg_speed: session.metrics.avg_speed(),
-            work_kj: session.metrics.work_kj(),
-            variability_index: session.metrics.variability_index(),
-            distance_km: session.metrics.distance_km(),
-            title: None,
-            activity_type: None,
-            rpe: None,
-            notes: None,
-        };
+        let summary = build_summary(session);
         let delta = session.sensor_log[session.autosave_cursor..].to_vec();
         session.autosave_cursor = session.sensor_log.len();
         Some((session.id.clone(), summary, delta))
@@ -275,6 +217,35 @@ impl SessionManager {
             .as_ref()
             .map(|s| s.sensor_log.clone())
             .unwrap_or_default()
+    }
+}
+
+/// Build the stored summary for a session (used by stop and autosave alike).
+/// Metric fields come only from `MetricsCalculator::summary_metrics`.
+fn build_summary(session: &ActiveSession) -> SessionSummary {
+    let active_secs = session.active_elapsed_ms / 1000;
+    let m = session.metrics.summary_metrics(active_secs);
+    SessionSummary {
+        id: session.id.clone(),
+        start_time: session.start_time,
+        duration_secs: active_secs,
+        ftp: Some(session.config.ftp),
+        avg_power: m.avg_power,
+        max_power: m.max_power,
+        normalized_power: m.normalized_power,
+        tss: m.tss,
+        intensity_factor: m.intensity_factor,
+        avg_hr: m.avg_hr,
+        max_hr: m.max_hr,
+        avg_cadence: m.avg_cadence,
+        avg_speed: m.avg_speed,
+        work_kj: m.work_kj,
+        variability_index: m.variability_index,
+        distance_km: m.distance_km,
+        title: None,
+        activity_type: None,
+        rpe: None,
+        notes: None,
     }
 }
 
@@ -547,6 +518,85 @@ mod tests {
         let if_ = summary.intensity_factor.unwrap();
         assert!((if_ - 1.0).abs() < 0.01, "snapshot IF should be ~1.0, got {if_}");
         assert!(summary.tss.is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_summary_rounds_avg_power_half_up() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        mgr.process_reading(power_reading(199)).await;
+        mgr.process_reading(power_reading(200)).await;
+        // (199 + 200) / 2 = 199.5 → 200 (truncation would give 199)
+        assert_eq!(mgr.stop_session().await.unwrap().avg_power, Some(200));
+    }
+
+    #[tokio::test]
+    async fn stop_summary_rounds_avg_power_down() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        for w in [199, 199, 199, 200, 200] {
+            mgr.process_reading(power_reading(w)).await;
+        }
+        // 997 / 5 = 199.4 → 199
+        assert_eq!(mgr.stop_session().await.unwrap().avg_power, Some(199));
+    }
+
+    #[tokio::test]
+    async fn stop_summary_rounds_np_to_nearest() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        // Seconds 0..=17 at 200W, 18..=29 at 199W, second 30 flushes second 29:
+        // one rolling value = (18·200 + 12·199) / 30 = 199.6 → NP 199.6 → 200
+        feed_constant_power(&mgr, 200, 18, 0).await;
+        feed_constant_power(&mgr, 199, 12, 18).await;
+        mgr.process_reading(power_reading_at(199, 30_000)).await;
+        assert_eq!(mgr.stop_session().await.unwrap().normalized_power, Some(200));
+    }
+
+    #[tokio::test]
+    async fn live_summary_equals_replayed_summary() {
+        let mgr = SessionManager::new();
+        mgr.start_session(default_config()).await.unwrap();
+        // Mixed channels, a short hole and a pause-sized gap
+        for s in 0..120u64 {
+            if (60..70).contains(&s) {
+                continue; // 10 s gap
+            }
+            if s == 30 || s == 31 {
+                continue; // 2 s hole
+            }
+            let ms = s * 1000;
+            mgr.process_reading(power_reading_at(150 + (s % 7) as u16 * 20, ms)).await;
+            mgr.process_reading(SensorReading::HeartRate {
+                bpm: 120 + (s % 11) as u8, timestamp: None, epoch_ms: ms + 300, device_id: "t".into(),
+            }).await;
+            mgr.process_reading(SensorReading::Cadence {
+                rpm: 85.0 + (s % 5) as f32, timestamp: None, epoch_ms: ms + 500, device_id: "t".into(),
+            }).await;
+            mgr.process_reading(SensorReading::Speed {
+                kmh: 30.0 + (s % 3) as f32, timestamp: None, epoch_ms: ms + 700, device_id: "t".into(),
+            }).await;
+        }
+        let (summary, log) = mgr.stop_session_with_log().await.unwrap();
+        let replay = crate::session::metrics::summarize_readings(
+            &log, summary.ftp.unwrap(), summary.duration_secs,
+        );
+        let live = crate::session::metrics::SummaryMetrics {
+            avg_power: summary.avg_power,
+            max_power: summary.max_power,
+            normalized_power: summary.normalized_power,
+            tss: summary.tss,
+            intensity_factor: summary.intensity_factor,
+            variability_index: summary.variability_index,
+            work_kj: summary.work_kj,
+            distance_km: summary.distance_km,
+            avg_hr: summary.avg_hr,
+            max_hr: summary.max_hr,
+            avg_cadence: summary.avg_cadence,
+            avg_speed: summary.avg_speed,
+        };
+        assert!(live.normalized_power.is_some() && live.distance_km.is_some());
+        assert_eq!(live, replay, "live stop summary must equal raw-log replay");
     }
 
     #[tokio::test]
