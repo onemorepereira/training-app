@@ -1,5 +1,10 @@
 <script lang="ts">
+  import '@fontsource/ibm-plex-mono/latin-400.css';
+  import '@fontsource/ibm-plex-mono/latin-500.css';
+  import '@fontsource/ibm-plex-mono/latin-600.css';
+  import '@fontsource/ibm-plex-mono/latin-700.css';
   import '../app.css';
+  import '$lib/ui/controls.css';
   import { page } from '$app/stores';
   import { onMount, onDestroy } from 'svelte';
   import { startSensorListening, stopSensorListening } from '$lib/stores/sensor';
