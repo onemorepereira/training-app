@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use super::gap;
+
 pub struct MetricsCalculator {
     ftp: u16,
     /// Timestamped power readings for time-based rolling averages
@@ -44,6 +46,7 @@ impl MetricsCalculator {
             Some(prev) if epoch_ms < prev => prev,
             _ => epoch_ms,
         };
+        let prev_ts = self.last_epoch_ms;
         self.last_epoch_ms = Some(ts);
         self.power_history.push((ts, watts));
 
@@ -58,35 +61,40 @@ impl MetricsCalculator {
             _ => {
                 // New second — flush the previous second's average into NP buffer
                 if !self.current_second_power.is_empty() {
-                    // Gap detection: if >2 seconds passed, reset NP buffer
-                    if let Some(prev) = self.last_np_second {
-                        if current_second.saturating_sub(prev) > 2 {
-                            self.np_buffer.clear();
-                            self.fourth_power_sum = 0.0;
-                            self.fourth_power_count = 0;
-                            self.current_second_power.clear();
-                            self.current_second_power.push(watts);
-                            self.last_np_second = Some(current_second);
-                            return;
-                        }
-                    }
                     let avg = self.current_second_power.iter().map(|&w| w as f64).sum::<f64>()
                         / self.current_second_power.len() as f64;
-                    self.np_buffer.push_back(avg);
-                    if self.np_buffer.len() > 30 {
-                        self.np_buffer.pop_front();
-                    }
-                    // Once we have a full 30-second window, accumulate 4th power
-                    if self.np_buffer.len() == 30 {
-                        let rolling_avg: f64 = self.np_buffer.iter().sum::<f64>() / 30.0;
-                        self.fourth_power_sum += rolling_avg.powi(4);
-                        self.fourth_power_count += 1;
+                    self.push_np_second(avg);
+                    if let (Some(prev_second), Some(prev_ts)) = (self.last_np_second, prev_ts) {
+                        if gap::is_gap(prev_ts, ts) {
+                            // Gap: the 30 s rolling window must not span it. The
+                            // whole-ride 4th-power accumulators are kept.
+                            self.np_buffer.clear();
+                        } else {
+                            // Hole ≤ 5 s: hold the previous second's power.
+                            for _ in (prev_second + 1)..current_second {
+                                self.push_np_second(avg);
+                            }
+                        }
                     }
                 }
                 self.current_second_power.clear();
                 self.current_second_power.push(watts);
                 self.last_np_second = Some(current_second);
             }
+        }
+    }
+
+    /// Push one second of power into the 30 s rolling buffer and, once full,
+    /// accumulate the rolling average's 4th power.
+    fn push_np_second(&mut self, watts: f64) {
+        self.np_buffer.push_back(watts);
+        if self.np_buffer.len() > 30 {
+            self.np_buffer.pop_front();
+        }
+        if self.np_buffer.len() == 30 {
+            let rolling_avg: f64 = self.np_buffer.iter().sum::<f64>() / 30.0;
+            self.fourth_power_sum += rolling_avg.powi(4);
+            self.fourth_power_count += 1;
         }
     }
 
@@ -121,10 +129,11 @@ impl MetricsCalculator {
             let sum: f32 = self.power_history.iter().map(|(_, w)| *w as f32).sum();
             return Some(sum / self.power_history.len() as f32);
         }
-        let cutoff = last_ms.saturating_sub(window_secs as u64 * 1000);
+        // Window is (last - window, last]: at 1 Hz a 3 s window holds exactly 3 samples.
+        let window_ms = window_secs as u64 * 1000;
         let slice: Vec<u16> = self.power_history.iter()
             .rev()
-            .take_while(|(ts, _)| *ts >= cutoff)
+            .take_while(|(ts, _)| last_ms - *ts < window_ms)
             .map(|(_, w)| *w)
             .collect();
         if slice.is_empty() {
@@ -198,7 +207,7 @@ impl MetricsCalculator {
         }
         let mut total_km: f64 = 0.0;
         for pair in self.speed_history.windows(2) {
-            let dt_hours = (pair[1].0 as f64 - pair[0].0 as f64) / 1000.0 / 3600.0;
+            let dt_hours = gap::capped_interval_ms(pair[0].0, pair[1].0) as f64 / 1000.0 / 3600.0;
             total_km += pair[0].1 as f64 * dt_hours;
         }
         Some(total_km as f32)
@@ -210,7 +219,7 @@ impl MetricsCalculator {
         }
         let mut total_joules: f64 = 0.0;
         for pair in self.power_history.windows(2) {
-            let dt_secs = (pair[1].0 as f64 - pair[0].0 as f64) / 1000.0;
+            let dt_secs = gap::capped_interval_ms(pair[0].0, pair[1].0) as f64 / 1000.0;
             total_joules += pair[0].1 as f64 * dt_secs;
         }
         Some((total_joules / 1000.0) as f32)
@@ -357,17 +366,64 @@ mod tests {
     // --- NP Gap Detection ---
 
     #[test]
-    fn np_gap_resets_buffer() {
+    fn np_rolling_window_does_not_span_gap() {
         let mut calc = MetricsCalculator::new(200);
-        // 35 seconds at 200W → NP established
-        feed_constant_power(&mut calc, 200, 35, 0);
-        assert!(calc.normalized_power().is_some());
-        // 5-second gap (jump from second 34 to second 40) → resets buffer
-        // Then 35 more seconds at 200W
-        feed_constant_power(&mut calc, 200, 35, 40);
+        // Seconds 0..=34 at 300W → flushed 0..=33 → 5 rolling values of 300
+        feed_constant_power(&mut calc, 300, 35, 0);
+        // Gap 34 s → 41 s (7 s > 5 s): flushes second 34 (6th value of 300),
+        // then the rolling buffer is cleared. 20 s at 100W never refills it.
+        feed_constant_power(&mut calc, 100, 20, 41);
         let np = calc.normalized_power().unwrap();
-        // NP should be ~200, not corrupted by the gap
-        assert_approx(np, 200.0, 0.1, "NP after gap reset");
+        // Only the 6 pre-gap rolling values (all 300) count → NP = 300
+        assert_approx(np, 300.0, 0.1, "rolling window must not mix across a gap");
+    }
+
+    #[test]
+    fn np_short_dropout_keeps_whole_ride_np() {
+        // 60-min ride at 200W with a 3 s dropout at 59:45 (seconds 3585..=3587 missing)
+        let mut calc = MetricsCalculator::new(200);
+        feed_constant_power(&mut calc, 200, 3585, 0);
+        feed_constant_power(&mut calc, 200, 12, 3588);
+        assert_approx(calc.normalized_power().unwrap(), 200.0, 0.1, "NP");
+        assert_approx(calc.intensity_factor().unwrap(), 1.0, 0.01, "IF");
+        assert_approx(calc.variability_index().unwrap(), 1.0, 0.01, "VI");
+        // TSS = 3600 * 200 * 1.0 / (200 * 3600) * 100 = 100
+        assert_approx(calc.tss(3600).unwrap(), 100.0, 0.5, "TSS");
+    }
+
+    #[test]
+    fn np_gap_clears_only_rolling_buffer() {
+        // 30 min at 100W (seconds 0..=1799), 10-min gap, 30 min at 300W (2400..=4199)
+        let mut calc = MetricsCalculator::new(200);
+        feed_constant_power(&mut calc, 100, 1800, 0);
+        feed_constant_power(&mut calc, 300, 1800, 2400);
+        // First half: 1800 flushed seconds → 1771 rolling values of 100.
+        // Second half (buffer cleared, last second still pending): 1799 flushed
+        // → 1770 rolling values of 300.
+        // NP = ((1771·100⁴ + 1770·300⁴) / 3541)^¼ = 253.0265
+        let np = calc.normalized_power().unwrap();
+        assert_approx(np, 253.03, 0.1, "NP over both halves");
+    }
+
+    #[test]
+    fn np_hole_within_5s_fills_missing_seconds() {
+        let mut calc = MetricsCalculator::new(200);
+        // Seconds 0..=25 at 200W, 4 s hole, then seconds 30 and 31.
+        // Without hold only 27 seconds are flushed (< 30, no NP);
+        // holding seconds 26..=29 gives 31 entries → 2 rolling values.
+        feed_constant_power(&mut calc, 200, 26, 0);
+        feed_constant_power(&mut calc, 200, 2, 30);
+        assert_approx(calc.normalized_power().unwrap(), 200.0, 0.1, "NP with held hole");
+    }
+
+    #[test]
+    fn np_hole_holds_previous_second_value() {
+        let mut calc = MetricsCalculator::new(200);
+        // Seconds 0..=29 at 100W, hole of 4 s, then 300W at second 34 (pending).
+        // Held seconds 30..=33 repeat 100W (not zero, not 300) → NP = 100.
+        feed_constant_power(&mut calc, 100, 30, 0);
+        calc.record_power(300, 34_000);
+        assert_approx(calc.normalized_power().unwrap(), 100.0, 0.1, "held value");
     }
 
     #[test]
@@ -470,13 +526,32 @@ mod tests {
     }
 
     #[test]
-    fn avg_power_window_boundary_is_inclusive() {
+    fn avg_power_window_excludes_sample_exactly_window_old() {
         let mut calc = MetricsCalculator::new(200);
-        calc.record_power(100, 7000);   // 7s — at cutoff boundary
+        calc.record_power(100, 7000);   // exactly 3 s before the latest → outside
         calc.record_power(200, 10000);  // 10s
-        // cutoff = 10000 - 3000 = 7000; both 10000 >= 7000 and 7000 >= 7000
+        // window is (10000 - 3000, 10000] → only the 10000 sample
         let avg = calc.avg_power(3).unwrap();
-        assert_approx(avg, 150.0, 0.1, "boundary inclusive avg");
+        assert_approx(avg, 200.0, 0.1, "boundary-exclusive avg");
+    }
+
+    #[test]
+    fn avg_power_3s_uses_exactly_last_3_samples_at_1hz() {
+        let mut calc = MetricsCalculator::new(200);
+        calc.record_power(100, 0);
+        calc.record_power(200, 1000);
+        calc.record_power(300, 2000);
+        calc.record_power(400, 3000);
+        // last 3 samples: (200 + 300 + 400) / 3 = 300
+        assert_approx(calc.avg_power(3).unwrap(), 300.0, 0.1, "3 s avg");
+    }
+
+    #[test]
+    fn avg_power_30s_uses_exactly_last_30_samples_at_1hz() {
+        let mut calc = MetricsCalculator::new(200);
+        calc.record_power(1000, 0); // 30 s before the latest → excluded
+        feed_constant_power(&mut calc, 100, 30, 1);
+        assert_approx(calc.avg_power(30).unwrap(), 100.0, 0.1, "30 s avg");
     }
 
     // --- FTP Guard ---
@@ -619,6 +694,16 @@ mod tests {
     }
 
     #[test]
+    fn work_gap_contributes_at_most_5s() {
+        let mut calc = MetricsCalculator::new(200);
+        // 30 min at 200W (0..=1799), 10-min gap, 30 min at 200W (2400..=4199)
+        feed_constant_power(&mut calc, 200, 1800, 0);
+        feed_constant_power(&mut calc, 200, 1800, 2400);
+        // intervals: 1799 s + 5 s (capped gap) + 1799 s = 3603 s × 200 W = 720.6 kJ
+        assert_approx(calc.work_kj().unwrap(), 720.6, 0.1, "work with gap");
+    }
+
+    #[test]
     fn work_kj_empty_returns_none() {
         let calc = MetricsCalculator::new(200);
         assert!(calc.work_kj().is_none());
@@ -668,6 +753,20 @@ mod tests {
         }
         let km = calc.distance_km().unwrap();
         assert_approx(km, 1.0, 0.01, "30 km/h for 120s");
+    }
+
+    #[test]
+    fn distance_gap_contributes_at_most_5s() {
+        let mut calc = MetricsCalculator::new(200);
+        // 30 km/h: 0..=1799 s, 10-min gap, 2400..=4200 s (1 h of riding)
+        for i in 0..1800u64 {
+            calc.record_speed(30.0, i * 1000);
+        }
+        for i in 2400..=4200u64 {
+            calc.record_speed(30.0, i * 1000);
+        }
+        // intervals: 1799 + 5 (capped) + 1800 = 3604 s → 30 × 3604 / 3600 = 30.033 km
+        assert_approx(calc.distance_km().unwrap(), 30.033, 0.01, "distance with gap");
     }
 
     #[test]
