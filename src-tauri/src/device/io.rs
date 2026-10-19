@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(ant_link_state(Some(&link(Some(age), false))), LinkState::Stale);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_token_wakes_waiter() {
         let t = CancelToken::new();
         let t2 = t.clone();
@@ -750,11 +750,11 @@ mod tests {
     async fn ant_probe_returns_while_ant_slot_locked() {
         let io = RealIo::new();
         io.insert_link("ant:120:1", link(Some(0), false));
-        // A "scan" holds the AntSlot for 300 ms on another thread.
-        let locked = io.hold_ant_slot_for(Duration::from_millis(300));
+        // A "scan" holds the AntSlot for 2 s on another thread; probe must not wait.
+        let locked = io.hold_ant_slot_for(Duration::from_secs(2));
         locked.recv().unwrap();
         let states = tokio::time::timeout(
-            Duration::from_millis(50),
+            Duration::from_millis(250),
             io.probe(vec!["ant:120:1".to_string()]),
         )
         .await

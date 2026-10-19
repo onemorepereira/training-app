@@ -280,14 +280,12 @@ impl BleManager {
     }
 
     pub async fn disconnect_device(&self, device_id: &str) -> Result<(), AppError> {
-        let mut connected = self.connected.lock().await;
-        if let Some(peripheral) = connected.remove(device_id) {
-            peripheral
-                .disconnect()
-                .await
-                .map_err(|e| BleError::Btleplug(format!("Failed to disconnect: {}", e)))?;
-        }
-        Ok(())
+        // The map lock is released before the (possibly slow) disconnect so the
+        // watchdog probe and other connects are never blocked behind it.
+        take_then(&self.connected, device_id, |peripheral| async move {
+            disconnect_peripheral(&peripheral).await
+        })
+        .await
     }
 
     pub fn get_connected(&self) -> Arc<Mutex<HashMap<String, Peripheral>>> {
@@ -407,6 +405,20 @@ where
             }
             Err(e)
         }
+    }
+}
+
+/// Remove `key` from `map` (holding the lock only for the removal), then run `f`
+/// on the removed value with the lock released. Missing key → Ok.
+pub(crate) async fn take_then<V, F, Fut>(map: &Mutex<HashMap<String, V>>, key: &str, f: F) -> Result<(), AppError>
+where
+    F: FnOnce(V) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    let value = map.lock().await.remove(key);
+    match value {
+        Some(v) => f(v).await,
+        None => Ok(()),
     }
 }
 
@@ -534,5 +546,42 @@ mod tests {
         .await;
         let msg = r.unwrap_err().to_string();
         assert!(msg.contains("discover services"), "original error kept: {msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_disconnect_does_not_hold_connected_map() {
+        let map: Arc<Mutex<HashMap<String, u8>>> =
+            Arc::new(Mutex::new(HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)])));
+        let slow = tokio::spawn({
+            let map = map.clone();
+            async move {
+                take_then(&map, "a", |_| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await; // slow disconnect
+                    Ok(())
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        // A probe-like access gets the map while the disconnect is still in progress.
+        let guard = tokio::time::timeout(std::time::Duration::from_millis(100), map.lock())
+            .await
+            .expect("connected map must not be held across disconnect()");
+        assert!(!guard.contains_key("a") && guard.contains_key("b"));
+        drop(guard);
+        slow.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn take_then_missing_key_is_ok() {
+        let map: Mutex<HashMap<String, u8>> = Mutex::new(HashMap::new());
+        let called = AtomicUsize::new(0);
+        take_then(&map, "x", |_| async {
+            called.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(called.load(Ordering::SeqCst), 0);
     }
 }

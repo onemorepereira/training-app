@@ -477,7 +477,7 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
 | Rev 2 / ruling 3 (AC4) | `types.rs` | `reading_after_disconnect_cannot_reclaim_primary`, `disconnect_removes_caps_before_primaries` |
 | Rev 2 / ruling 4 (AC17) | `ant/channel.rs` | `scan_channel_release_sends_close_reset_list_unassign_in_order`, `open_channel_resets_id_list_after_assign` |
 | Rev 2 / ruling 5 (AC4) | `types.rs` | `cadence_pod_outranks_power_meter_outranks_trainer`, `stale_primary_falls_back_to_power_meter_cadence`, `primary_resume_reclaims_forwarding`, `two_power_meters_cadence_never_interleave` |
-| Rev 2 / ruling 6 (AC8) | `io.rs`, `manager.rs` | `ant_probe_returns_while_ant_slot_locked`, `watchdog_tick_completes_within_50ms_during_scan` |
+| Rev 2 / ruling 6 (AC8) | `io.rs`, `manager.rs` | `ant_probe_returns_while_ant_slot_locked`, `watchdog_tick_completes_within_250ms_during_scan` |
 | Rev 2 / ruling 7 | `manager.rs` | `scan_merge_keeps_connecting_status`, `scan_merge_keeps_reconnecting_status`, `scan_merge_updates_in_range_only` |
 | Rev 2 / cancellation | `manager.rs` | `disconnect_cancels_in_flight_connect_promptly`, `cancelled_connect_does_not_commit_listener` (asserts Disconnect in event log, NB3) |
 | Rev 3 / NB1 | `manager.rs` | `connect_wins_gate_before_spawned_teardown_reopens_cleanly` |
@@ -585,7 +585,7 @@ Each slice is one commit with its tests (failing first).
 ## Verification
 
 Commands, all green at the final commit:
-- `cd src-tauri && cargo test` → 410 passed (lib). The baseline before this branch was 289.
+- `cd src-tauri && cargo test` → 422 passed (lib) after the rev 4 follow-ups. The baseline before this branch was 289.
 - `cd src-tauri && cargo check --features production` → clean apart from a pre-existing `pid.rs` warning.
 - `npm test` → 71 passed.
 - `npm run check` → 0 errors, 0 warnings.
@@ -601,7 +601,7 @@ Run any group with `cargo test --lib <path>`. Paths below are relative to `devic
 | AC5 (C2) | `ant::channel::tests::ant_connection_channel_search_config_bytes`, `wait_first_page_*` (3), `closed_channel_event_detects_search_timeout_and_close`; `manager::ant_lifecycle_tests::*` (10: stale → Reconnecting, recovery on the same channel, Lost teardown before reconnect, single listener, manual connect to Reconnecting with and without data, 10-minute give-up); `manager::lifecycle_tests::lost_teardown_*`, `connect_wins_gate_before_spawned_teardown_reopens_cleanly` |
 | AC6 (C4) | `manager::lifecycle_tests::connect_twice_spawns_one_listener`, `concurrent_connects_same_device_one_io_connect`, `manual_connect_clears_pending_reconnect`, `commit_aborts_existing_listener_handle`, `concurrent_connects_disconnect_cancels_owner_attempt`, `losing_attempt_cannot_remove_winner_token`, `disconnect_cancels_in_flight_connect_promptly`, `cancelled_connect_does_not_commit_listener` |
 | AC7 (C6) | `ant::channel::tests::ack_wait_*` (8), `ack_retry_skipped_when_trainer_stale` |
-| AC8 (C7) | `manager::lifecycle_tests::trainer_command_during_scan_completes_within_500ms`, `trainer_command_during_reconnect_completes_within_500ms`, `slow_reconnect_does_not_delay_next_tick`, `reconnects_bounded_to_two_concurrent`, `busy_gate_skips_reconnect_round`, `watchdog_tick_completes_within_50ms_during_scan`; `io::tests::ant_probe_returns_while_ant_slot_locked` |
+| AC8 (C7) | `manager::lifecycle_tests::trainer_command_during_scan_completes_within_500ms`, `trainer_command_during_reconnect_completes_within_500ms`, `slow_reconnect_does_not_delay_next_tick`, `reconnects_bounded_to_two_concurrent`, `busy_gate_skips_reconnect_round`, `watchdog_tick_completes_within_250ms_during_scan`; `io::tests::ant_probe_returns_while_ant_slot_locked` |
 | AC9 (C8) | `ble::tests::disconnect_on_err_runs_cleanup_on_failure`, `disconnect_on_err_skips_cleanup_on_success`, `disconnect_on_err_returns_original_error_when_cleanup_fails` |
 | AC10 (C9) | `protocol::tests::csc_first_notification_emits_nothing`, `csc_second_notification_computes_cadence_60rpm`, `csc_new_state_after_reconnect_reinitialises`, `csc_zero_*`, `cadence_resumes_after_zero_on_new_event` |
 | AC11 (C11) | `protocol::tests::cps_crank_only_cadence_90rpm`, `cps_crank_offset_after_balance_torque_wheel`, `cps_crank_event_time_rollover`, `cps_crank_first_sample_initialises`, `cps_truncated_crank_field_still_yields_power`, `cps_zero_cadence_after_3s_without_crank_event`; `ant::protocol::tests::ant_power_page_cadence_byte3`, `ant_power_page_cadence_0xff_omitted`, `ant_power_page_cadence_only_on_new_event` |
@@ -616,7 +616,6 @@ Run any group with `cargo test --lib <path>`. Paths below are relative to `devic
 **Not provable without hardware** (the user checks after merge):
 - Low-priority-only re-acquisition latency on a real stick.
 - Exclusion-list behaviour on ANT USB2 / USB-m.
-- The 3-octet 0x2AD6 scaling.
 - FE-C ack timing at 4 Hz.
 - BLE CPS crank data from real pedals.
 
@@ -630,3 +629,9 @@ Run any group with `cargo test --lib <path>`. Paths below are relative to `devic
 - **Router channel generations.** Per-channel senders live in a `ChannelBook` (`ant/channel.rs`) with a generation per registration. Every close we issue is stamped with a generation first (`note_close_issued`). An `EVENT_CHANNEL_CLOSED` drops the channel's sender only if the sender is older than our close, or if the close was unsolicited. A late close event therefore cannot kill a connection that re-registered the reused channel number. Tests: `late_close_event_does_not_kill_recovered_channel`, `unsolicited_close_event_drops_sender`, `close_event_for_sender_older_than_close_drops_it`.
 - **ID-list reset is best effort (ruling).** `reset_id_list` (0x5A size 0) in `open_channel` and in `release_scan_channel` logs a warning and continues on failure. If `reopen_excluding` fails (stick without ID lists), the scan re-opens the channel plain and stops excluding on it, which falls back to one device per profile. Tests: `open_channel_succeeds_when_stick_rejects_id_list`, `release_scan_channel_unassigns_when_stick_rejects_id_list`, `reopen_excluding_reports_unsupported_id_list`.
 - **0x2AD6 (ruling).** Only the 6-octet form (sint16 / sint16 / uint16 at 0.1) is scaled. Any other length is logged once per connect and resistance stays on the 0–100 % → 0–1000 mapping. Test: `resistance_range_3_octet_form_falls_back_to_legacy`.
+- **BLE disconnect lock scope.** `disconnect_device` removes the peripheral from the `connected` map, releases the lock, and only then awaits `peripheral.disconnect()` (helper `take_then`). Test: `ble::tests::slow_disconnect_does_not_hold_connected_map` (paused clock).
+- **Test clocks (ruling).** Async timing tests use paused tokio time; `cancel_token_wakes_waiter` was converted. The remaining real-clock checks are upper bounds of at least 250 ms and appear in two kinds of test. In `wait_first_page_*` and `ack_wait_times_out_within_bound`, a std thread blocks on its own. In `ant_probe_returns_while_ant_slot_locked` and `watchdog_tick_completes_within_250ms_during_scan`, the AntSlot is held for 2 s.
+- **Events and AC rows added in rev 4:**
+  - AC5 / ruling 2: `ui_event_tests::give_up_emits_list_only_after_teardown_and_final_status_disconnected`, `lost_transition_emits_reconnecting_list`, `failed_manual_connect_keeps_reconnect_target_and_reconnecting`, `disconnect_stale_ant_closes_channel_and_clears_state`, `disconnect_reconnecting_ble_clears_reconnect_target`.
+  - AC5 router: `ant::channel::tests::late_close_event_does_not_kill_recovered_channel` and the two companion tests.
+  - AC17 fallback: the three `*_rejects_id_list` / `reopen_excluding_reports_unsupported_id_list` tests.

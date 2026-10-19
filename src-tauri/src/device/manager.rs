@@ -1473,7 +1473,7 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn watchdog_tick_completes_within_50ms_during_scan() {
+    async fn watchdog_tick_completes_within_250ms_during_scan() {
         use crate::device::io::{AntLink, RealIo};
         use std::sync::atomic::{AtomicBool, AtomicI64};
         let io = RealIo::new();
@@ -1481,7 +1481,7 @@ mod lifecycle_tests {
         let last_seen = Arc::new(AtomicI64::new(0));
         crate::device::ant::listener::atomic_set_age(&last_seen, Duration::from_secs(1));
         io.insert_link(id, AntLink { last_seen, closed: Arc::new(AtomicBool::new(false)) });
-        let locked = io.hold_ant_slot_for(Duration::from_millis(300));
+        let locked = io.hold_ant_slot_for(Duration::from_secs(2));
         let mut manager = DeviceManager::with_io(io);
         manager.records.insert(
             id.to_string(),
@@ -1489,7 +1489,7 @@ mod lifecycle_tests {
         );
         let dm = Arc::new(Mutex::new(manager));
         locked.recv().unwrap();
-        let report = tokio::time::timeout(Duration::from_millis(50), DeviceManager::watchdog_tick(&dm, &tx()))
+        let report = tokio::time::timeout(Duration::from_millis(250), DeviceManager::watchdog_tick(&dm, &tx()))
             .await
             .expect("watchdog must not wait for a scan holding the AntSlot");
         assert!(report.disconnected.is_empty(), "fresh link stays connected");

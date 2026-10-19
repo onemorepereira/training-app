@@ -773,7 +773,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let start = Instant::now();
         assert_eq!(wait_first_page(&rx, Duration::from_millis(20), &AtomicBool::new(false)), None);
-        assert!(start.elapsed() < Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_millis(250));
     }
 
     #[test]
@@ -781,7 +781,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let start = Instant::now();
         assert_eq!(wait_first_page(&rx, Duration::from_secs(5), &AtomicBool::new(true)), None);
-        assert!(start.elapsed() < Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_millis(250));
     }
 
     #[test]
@@ -864,7 +864,7 @@ mod tests {
         let stick = AckStick::new(vec![None, None]);
         let start = Instant::now();
         assert!(send_acknowledged_and_wait(&stick, &stick.queue, 5, &PAGE, T, FRESH).is_err());
-        assert!(start.elapsed() < Duration::from_millis(50), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_millis(250), "{:?}", start.elapsed());
         assert_eq!(stick.sends(), 2);
     }
 
