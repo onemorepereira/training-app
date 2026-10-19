@@ -149,7 +149,7 @@ pub fn listen_ant_channel(
 
         let readings: Vec<SensorReading> = match device_type {
             DeviceType::HeartRate => decoder.decode_hr(&data, &device_id).into_iter().collect(),
-            DeviceType::Power => decoder.decode_power(&data, &device_id).into_iter().collect(),
+            DeviceType::Power => decoder.decode_power_page(&data, &device_id),
             DeviceType::CadenceSpeed => {
                 if device_type_id == 123 {
                     decoder

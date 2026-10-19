@@ -2,6 +2,7 @@ use btleplug::api::{Characteristic, Peripheral as _};
 use btleplug::platform::Peripheral;
 use futures::StreamExt;
 use log::{error, info, warn};
+use std::time::Instant;
 use tokio::sync::broadcast;
 
 use super::protocol::*;
@@ -54,10 +55,9 @@ pub async fn listen_to_device(
         }
     };
 
-    let mut prev_wheel_revs: u32 = 0;
-    let mut prev_wheel_time: u16 = 0;
-    let mut prev_crank_revs: u16 = 0;
-    let mut prev_crank_time: u16 = 0;
+    // Fresh per listener: the first notification after (re)connect only initialises.
+    let mut csc_state = CscState::default();
+    let mut cps_state = CpsState::default();
 
     while let Some(notification) = notification_stream.next().await {
         let readings: Vec<SensorReading> = if notification.uuid == HEART_RATE_MEASUREMENT {
@@ -65,18 +65,9 @@ pub async fn listen_to_device(
                 .into_iter()
                 .collect()
         } else if notification.uuid == CYCLING_POWER_MEASUREMENT {
-            decode_cycling_power(&notification.value, &device_id)
-                .into_iter()
-                .collect()
+            decode_cycling_power(&notification.value, &mut cps_state, &device_id, Instant::now())
         } else if notification.uuid == CSC_MEASUREMENT {
-            decode_csc(
-                &notification.value,
-                &mut prev_wheel_revs,
-                &mut prev_wheel_time,
-                &mut prev_crank_revs,
-                &mut prev_crank_time,
-                &device_id,
-            )
+            decode_csc(&notification.value, &mut csc_state, &device_id, Instant::now())
         } else if notification.uuid == INDOOR_BIKE_DATA {
             decode_indoor_bike_data(&notification.value, &device_id)
         } else {

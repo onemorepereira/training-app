@@ -78,7 +78,8 @@ impl AntDecoder {
 
         // Extract pedal balance from byte 2
         let pedal_power_byte = data[2];
-        let pedal_balance = if pedal_power_byte & 0x80 != 0 {
+        // 0xFF = pedal power not used (Bicycle Power Rev 5.0 Table 8-1)
+        let pedal_balance = if pedal_power_byte != 0xFF && pedal_power_byte & 0x80 != 0 {
             Some(pedal_power_byte & 0x7F) // right pedal contribution %
         } else {
             None
@@ -112,6 +113,26 @@ impl AntDecoder {
             device_id: device_id.to_string(),
             pedal_balance,
         })
+    }
+
+    /// Decode a Bicycle Power page: Power, plus Cadence from page 0x10 byte 3
+    /// (instantaneous cadence 0-254 rpm, 0xFF = invalid; Bicycle Power D00001086
+    /// Rev 5.0 Table 8-1), emitted on the same new-event samples as power.
+    pub fn decode_power_page(&mut self, data: &[u8; 8], device_id: &str) -> Vec<SensorReading> {
+        let Some(power) = self.decode_power(data, device_id) else {
+            return vec![];
+        };
+        let mut out = vec![power];
+        let cadence = data[3];
+        if cadence != 0xFF {
+            out.push(SensorReading::Cadence {
+                rpm: cadence as f32,
+                timestamp: Some(std::time::Instant::now()),
+                epoch_ms: now_epoch_ms(),
+                device_id: device_id.to_string(),
+            });
+        }
+        out
     }
 
     /// Decode ANT+ Cadence sensor data page (page 0 or default)
@@ -627,5 +648,46 @@ mod tests {
         let readings2 = decoder.decode_fec_trainer(&data2, "test");
         assert_eq!(readings2.len(), 1); // speed only
         assert!(matches!(&readings2[0], SensorReading::Speed { .. }));
+    }
+
+    // ---- Bicycle Power page 0x10 cadence (D00001086 Rev 5.0 Table 8-1) ----
+
+    #[test]
+    fn ant_power_page_cadence_byte3() {
+        let mut decoder = AntDecoder::new();
+        // byte 3 = 87 rpm, power 0x00F0 = 240 W
+        let data: [u8; 8] = [0x10, 1, 0xFF, 87, 0, 0, 0xF0, 0x00];
+        let r = decoder.decode_power_page(&data, "pm");
+        assert_eq!(r.len(), 2);
+        assert!(matches!(r[0], SensorReading::Power { watts: 240, .. }));
+        match r[1] {
+            SensorReading::Cadence { rpm, .. } => assert!((rpm - 87.0).abs() < 0.01),
+            ref other => panic!("expected Cadence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ant_power_page_cadence_0xff_omitted() {
+        let mut decoder = AntDecoder::new();
+        let data: [u8; 8] = [0x10, 1, 0xFF, 0xFF, 0, 0, 0xF0, 0x00];
+        assert_eq!(decoder.decode_power_page(&data, "pm").len(), 1);
+    }
+
+    #[test]
+    fn ant_power_page_cadence_only_on_new_event() {
+        let mut decoder = AntDecoder::new();
+        let data: [u8; 8] = [0x10, 1, 0xFF, 87, 0, 0, 0xF0, 0x00];
+        decoder.decode_power_page(&data, "pm");
+        assert!(decoder.decode_power_page(&data, "pm").is_empty(), "same event count: nothing new");
+    }
+
+    #[test]
+    fn ant_power_pedal_power_0xff_is_none() {
+        let mut decoder = AntDecoder::new();
+        let data: [u8; 8] = [0x10, 1, 0xFF, 80, 0, 0, 0xC8, 0x00];
+        match decoder.decode_power(&data, "pm").unwrap() {
+            SensorReading::Power { pedal_balance, .. } => assert_eq!(pedal_balance, None),
+            other => panic!("expected Power, got {:?}", other),
+        }
     }
 }
