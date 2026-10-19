@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use super::protocol::{AntDecoder, DEFAULT_WHEEL_CIRCUMFERENCE_MM};
-use crate::device::types::{is_dominated, AntDeviceMetadata, DeviceType, SensorReading};
+use crate::device::primary::{admit_reading, SharedPrimaryState};
+use crate::device::types::{AntDeviceMetadata, DeviceType, SensorReading};
 
 /// Monotonic reference epoch for lock-free timestamps.
 /// All `last_seen` values are stored as nanos elapsed since this instant.
@@ -96,7 +97,7 @@ pub fn listen_ant_channel(
     metadata_store: Arc<Mutex<HashMap<String, AntDeviceMetadata>>>,
     device_type_id: u8,
     last_seen: Arc<AtomicI64>,
-    primaries: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
+    primaries: Option<SharedPrimaryState>,
 ) {
     let mut decoder = AntDecoder::new();
 
@@ -164,11 +165,7 @@ pub fn listen_ant_channel(
 
         for reading in readings {
             if let Some(ref p) = primaries {
-                let dominated = {
-                    let guard = p.read().unwrap_or_else(|e| e.into_inner());
-                    is_dominated(&guard, &reading)
-                };
-                if dominated {
+                if !admit_reading(p, &reading, std::time::Instant::now()) {
                     continue;
                 }
             }

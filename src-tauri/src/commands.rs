@@ -5,7 +5,8 @@ use tauri::{Emitter, State};
 use tokio::sync::broadcast;
 
 use crate::device::manager::DeviceManager;
-use crate::device::types::{DeviceDetails, DeviceInfo, DeviceType, SensorReading};
+use crate::device::primary::{PrimaryKey, SharedPrimaryState};
+use crate::device::types::{DeviceDetails, DeviceInfo, SensorReading};
 use crate::error::AppError;
 use crate::prerequisites;
 use crate::session::analysis::{self, PowerCurvePoint, SessionAnalysis};
@@ -69,20 +70,12 @@ pub(crate) fn validate_user_config(config: &SessionConfig) -> Result<(), AppErro
     Ok(())
 }
 
-/// Format primary devices map for the frontend (DeviceType → stable string keys).
-fn format_primaries(primaries: &HashMap<DeviceType, String>) -> HashMap<String, String> {
-    primaries
-        .iter()
-        .map(|(k, v)| (k.as_str().to_owned(), v.clone()))
-        .collect()
-}
-
 pub struct AppState {
     pub device_manager: Arc<tokio::sync::Mutex<DeviceManager>>,
     pub session_manager: Arc<SessionManager>,
     pub storage: Arc<Storage>,
     pub sensor_tx: broadcast::Sender<SensorReading>,
-    pub primary_devices: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>,
+    pub primary_devices: SharedPrimaryState,
     pub zone_controller: Arc<ZoneController>,
     #[cfg(not(feature = "production"))]
     pub simulator: Arc<tokio::sync::Mutex<crate::simulator::Simulator>>,
@@ -249,10 +242,12 @@ pub async fn get_device_details(
     DeviceManager::device_details_shared(&state.device_manager, &device_id).await
 }
 
+/// `device_type` accepts the legacy DeviceType names and the per-metric names
+/// "Cadence" / "Speed" (see device::primary::PrimaryKey).
 #[tauri::command]
 pub async fn set_primary_device(
     state: State<'_, AppState>,
-    device_type: DeviceType,
+    device_type: PrimaryKey,
     device_id: String,
 ) -> Result<(), AppError> {
     info!("Set primary device: {:?} = {}", device_type, device_id);
@@ -260,7 +255,7 @@ pub async fn set_primary_device(
         .primary_devices
         .write()
         .map_err(|e| AppError::Session(format!("Lock poisoned: {e}")))?;
-    primaries.insert(device_type, device_id);
+    primaries.set_primary(device_type, &device_id);
     Ok(())
 }
 
@@ -272,7 +267,7 @@ pub async fn get_primary_devices(
         .primary_devices
         .read()
         .map_err(|e| AppError::Session(format!("Lock poisoned: {e}")))?;
-    Ok(format_primaries(&primaries))
+    Ok(primaries.legacy_map())
 }
 
 #[tauri::command]
@@ -733,24 +728,5 @@ mod tests {
         let err = validate_zones_ascending(&[5u8, 3], "HR zones").unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("HR zones"), "expected label in error: {msg}");
-    }
-
-    // --- format_primaries ---
-
-    #[test]
-    fn format_primaries_empty_map() {
-        let primaries = HashMap::new();
-        assert!(format_primaries(&primaries).is_empty());
-    }
-
-    #[test]
-    fn format_primaries_uses_debug_key_format() {
-        let primaries = HashMap::from([
-            (DeviceType::HeartRate, "hr-1".to_owned()),
-            (DeviceType::FitnessTrainer, "trainer-1".to_owned()),
-        ]);
-        let result = format_primaries(&primaries);
-        assert_eq!(result["HeartRate"], "hr-1");
-        assert_eq!(result["FitnessTrainer"], "trainer-1");
     }
 }

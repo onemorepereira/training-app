@@ -295,7 +295,7 @@ impl AntManager {
         &mut self,
         device_id: &str,
         tx: broadcast::Sender<SensorReading>,
-        primaries: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
+        primaries: Option<crate::device::primary::SharedPrimaryState>,
         cancel: &AtomicBool,
     ) -> Result<DeviceInfo, AppError> {
         // Idempotent: never open a second channel for a device that is still live.

@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use super::dedup::compute_device_groups;
 use super::fec::FecController;
 use super::io::*;
+use super::primary::{DeviceCaps, Metric, PrimaryState};
 use super::reconnect::ReconnectManager;
 use super::types::*;
 use crate::config;
@@ -152,7 +153,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
             attempts_spawned: HashSet::new(),
             reconnect_permits: Arc::new(Semaphore::new(RECONNECT_CONCURRENCY)),
             pending_report: Arc::new(StdMutex::new(WatchdogReport::default())),
-            primary_devices: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            primary_devices: PrimaryState::shared(),
         }
     }
 
@@ -170,16 +171,28 @@ impl<Io: DeviceIo> DeviceManager<Io> {
         self.io.clone()
     }
 
-    /// Set device as primary for its type if no primary exists yet.
-    fn auto_set_primary(&self, device_type: DeviceType, device_id: &str) {
-        let mut p = self.primary_devices.write().unwrap_or_else(|e| e.into_inner());
-        p.entry(device_type).or_insert_with(|| device_id.to_owned());
+    fn primary_state(&self) -> std::sync::RwLockWriteGuard<'_, PrimaryState> {
+        self.primary_devices.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Remove all primary entries that reference the given device.
-    fn remove_primary(&self, device_id: &str) {
-        let mut p = self.primary_devices.write().unwrap_or_else(|e| e.into_inner());
-        p.retain(|_, v| v != device_id);
+    /// Device is (again) delivering: real capabilities; the trainer primary is
+    /// claimed at connect (other metrics are claimed lazily on first reading).
+    fn on_connected(&self, device_type: DeviceType, device_id: &str) {
+        let mut p = self.primary_state();
+        p.register(device_id, DeviceCaps::for_device(device_id, device_type));
+        if device_type == DeviceType::FitnessTrainer {
+            p.claim_if_free(Metric::Trainer, device_id);
+        }
+    }
+
+    /// Stale or lost: free primary slots so a backup can take over.
+    fn release_claims(&self, device_id: &str) {
+        self.primary_state().release_claims(device_id);
+    }
+
+    /// Disconnected: capabilities first, then claims (ADR-3a).
+    fn unregister_device(&self, device_id: &str) {
+        self.primary_state().unregister(device_id);
     }
 
     fn gate(&mut self, device_id: &str) -> Arc<Mutex<()>> {
@@ -332,6 +345,10 @@ impl<Io: DeviceIo> DeviceManager<Io> {
                 .is_some_and(|r| matches!(r.phase, Phase::Stale { .. }));
             let token = CancelToken::new();
             g.in_flight.insert(device_id.to_string(), token.clone());
+            // NB2: registered by the gate holder, before any listener can run.
+            if !g.primary_state().is_registered(device_id) {
+                g.primary_state().register(device_id, DeviceCaps::pending());
+            }
             (token, stale)
         };
 
@@ -352,7 +369,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
             if got_data && matches!(rec.phase, Phase::Stale { .. }) {
                 rec.set_phase(Phase::Connected);
                 let info = rec.info.clone();
-                g.auto_set_primary(info.device_type, device_id);
+                g.on_connected(info.device_type, device_id);
                 g.pending_report
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -369,10 +386,18 @@ impl<Io: DeviceIo> DeviceManager<Io> {
 
         // Phase 5 (lock): commit, unless cancelled.
         let mut g = dm.lock().await;
-        if g.in_flight.get(device_id).is_some_and(|t| t.same_as(&token)) {
+        let mine = g.in_flight.get(device_id).is_some_and(|t| t.same_as(&token));
+        if mine {
             g.in_flight.remove(device_id);
         }
+        // Only the owning attempt may drop the registration it made (NB2).
+        let undo_registration = |g: &DeviceManager<Io>| {
+            if mine && !g.records.contains_key(device_id) {
+                g.unregister_device(device_id);
+            }
+        };
         if token.is_cancelled() {
+            undo_registration(&g);
             drop(g);
             // NB3: undo a connect that completed after the cancel, before releasing the gate.
             if let Ok(c) = result {
@@ -394,6 +419,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
                         g.records.remove(device_id);
                     }
                 }
+                undo_registration(&g);
                 Err(e)
             }
             Ok(c) => {
@@ -434,7 +460,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
             device_id.to_string(),
             DeviceRecord { info: info.clone(), phase: Phase::Connected },
         );
-        self.auto_set_primary(info.device_type, device_id);
+        self.on_connected(info.device_type, device_id);
         info
     }
 
@@ -448,7 +474,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
             }
             *g.disconnect_epoch.entry(device_id.to_string()).or_insert(0) += 1;
             g.reconnect.remove(device_id);
-            g.remove_primary(device_id);
+            g.unregister_device(device_id);
             g.gate(device_id)
         };
         let _gate = gate.lock_owned().await;
@@ -457,7 +483,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
             g.records.remove(device_id);
             // A watchdog Lost transition may have re-registered it while we waited.
             g.reconnect.remove(device_id);
-            g.remove_primary(device_id);
+            g.unregister_device(device_id);
             if let Some(h) = g.listener_handles.remove(device_id) {
                 h.abort();
             }
@@ -482,6 +508,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
             };
             if give_up {
                 g.records.remove(device_id);
+                g.unregister_device(device_id);
             } else {
                 rec.set_phase(Phase::TornDown);
             }
@@ -569,14 +596,14 @@ impl<Io: DeviceIo> DeviceManager<Io> {
                         // ADR-2: keep the channel searching; only the status changes.
                         warn!("[{}] Connection watchdog: no ANT+ data, searching", id);
                         rec.set_phase(Phase::Stale { since: now, ticks: 0 });
-                        g.remove_primary(&id);
+                        g.release_claims(&id);
                         report.disconnected.push(id);
                     }
                     (Phase::Stale { .. }, LinkState::Alive) => {
                         info!("[{}] ANT+ data resumed on the same channel", id);
                         rec.set_phase(Phase::Connected);
                         let device_type = rec.info.device_type;
-                        g.auto_set_primary(device_type, &id);
+                        g.on_connected(device_type, &id);
                         report.reconnected.push(id);
                     }
                     (Phase::Stale { since, ticks }, LinkState::Stale) => {
@@ -595,7 +622,7 @@ impl<Io: DeviceIo> DeviceManager<Io> {
                         warn!("[{}] Connection watchdog: {:?} link lost", id, rec.info.device_type);
                         rec.set_phase(Phase::LostPendingTeardown { give_up: false });
                         let info = rec.info.clone();
-                        g.remove_primary(&id);
+                        g.release_claims(&id);
                         g.trainer_backends.remove(&id);
                         g.reconnect.register(info);
                         if !report.disconnected.contains(&id) {
@@ -1485,7 +1512,7 @@ mod ant_lifecycle_tests {
         assert_eq!(g.records[ID].info.status, ConnectionStatus::Reconnecting);
         assert!(g.connected_trainer_id().is_none());
         assert!(!g.reconnect.contains(ID), "a searching channel needs no reconnect");
-        assert!(!g.primaries_handle().read().unwrap().values().any(|v| v == ID), "claims released");
+        assert!(g.primaries_handle().read().unwrap().legacy_map().is_empty(), "claims released");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1515,7 +1542,7 @@ mod ant_lifecycle_tests {
         assert_eq!(count(&io, IoEvent::Connect(ID.into())), 1, "no second channel");
         assert_eq!(count(&io, IoEvent::Disconnect(ID.into())), 0);
         assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1, "single listener, no duplicates");
-        assert_eq!(dm.lock().await.primaries_handle().read().unwrap().get(&DeviceType::HeartRate).map(String::as_str), Some(ID));
+        assert!(dm.lock().await.primaries_handle().read().unwrap().is_registered(ID), "still registered; re-claims lazily");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1605,5 +1632,91 @@ mod ant_lifecycle_tests {
         assert_eq!(count(&io, IoEvent::Disconnect(ID.into())), 1, "channel freed");
         assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 0);
         assert!(!dm.lock().await.reconnect.contains(ID));
+    }
+}
+
+#[cfg(test)]
+mod primary_lifecycle_tests {
+    //! Primary-state bookkeeping across connect/disconnect (ADR-3a, NB2).
+    use super::*;
+    use crate::device::io::fake::FakeIo;
+
+    type Dm = SharedDeviceManager<FakeIo>;
+
+    fn dm() -> Dm {
+        Arc::new(Mutex::new(DeviceManager::with_io(FakeIo::default())))
+    }
+
+    fn tx() -> broadcast::Sender<SensorReading> {
+        broadcast::channel(16).0
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trainer_primary_claimed_at_connect_commit() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-trainer", tx()).await.unwrap();
+        let map = dm.lock().await.primaries_handle().read().unwrap().legacy_map();
+        assert_eq!(map.get("FitnessTrainer").map(String::as_str), Some("ble-trainer"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_trainer_primary_not_claimed_until_first_reading() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-pm", tx()).await.unwrap();
+        let handle = dm.lock().await.primaries_handle();
+        assert!(handle.read().unwrap().legacy_map().is_empty());
+        assert!(handle.read().unwrap().is_registered("ble-pm"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn losing_attempt_cannot_remove_winner_caps() {
+        let dm = dm();
+        dm.lock().await.io().set_connect_delay("ble-pm", Duration::from_secs(3));
+        let winner = tokio::spawn({
+            let dm = dm.clone();
+            async move { DeviceManager::connect_shared(&dm, "ble-pm", tx()).await }
+        });
+        settle().await;
+        // The winner registered (pending) caps post-gate; a losing auto attempt is skipped.
+        let loser =
+            DeviceManager::connect_with_origin(&dm, "ble-pm", tx(), ConnectOrigin::AutoReconnect).await;
+        assert!(matches!(loser, Ok(ConnectOutcome::Skipped)));
+        let handle = dm.lock().await.primaries_handle();
+        assert!(handle.read().unwrap().is_registered("ble-pm"));
+        winner.await.unwrap().unwrap();
+        assert!(handle.read().unwrap().is_registered("ble-pm"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_connect_unregisters_pending_caps() {
+        let dm = dm();
+        dm.lock().await.io().set_connect_fail("ble-pm", "gone");
+        assert!(DeviceManager::connect_shared(&dm, "ble-pm", tx()).await.is_err());
+        let handle = dm.lock().await.primaries_handle();
+        assert!(!handle.read().unwrap().is_registered("ble-pm"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_unregisters_device_so_late_readings_drop() {
+        let dm = dm();
+        DeviceManager::connect_shared(&dm, "ble-pm", tx()).await.unwrap();
+        let handle = dm.lock().await.primaries_handle();
+        let reading = SensorReading::Power {
+            watts: 250,
+            timestamp: None,
+            epoch_ms: 0,
+            device_id: "ble-pm".into(),
+            pedal_balance: None,
+        };
+        assert!(crate::device::primary::admit_reading(&handle, &reading, std::time::Instant::now()));
+        DeviceManager::disconnect_shared(&dm, "ble-pm").await.unwrap();
+        assert!(!crate::device::primary::admit_reading(&handle, &reading, std::time::Instant::now()));
+        assert!(handle.read().unwrap().legacy_map().is_empty(), "no re-claim after disconnect");
     }
 }

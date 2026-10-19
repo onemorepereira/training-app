@@ -28,8 +28,8 @@ use super::types::*;
 use crate::config;
 use crate::error::{AntError, AppError, BleError};
 
-/// Shared primary-device map handed to listeners.
-pub type PrimariesHandle = Arc<std::sync::RwLock<HashMap<DeviceType, String>>>;
+/// Shared primary-source state handed to listeners.
+pub use super::primary::SharedPrimaryState as PrimariesHandle;
 
 /// Trainer control backend for a connected trainer.
 pub enum TrainerBackend {

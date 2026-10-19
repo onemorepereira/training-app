@@ -6,6 +6,7 @@ pub mod ftms;
 pub mod io;
 pub mod listener;
 pub mod manager;
+pub mod primary;
 pub mod protocol;
 pub mod reconnect;
 pub mod types;
