@@ -1,5 +1,5 @@
 # Frontend correctness — Design
-**Spec:** ./spec.md   **Last updated:** 2026-10-18   **Status:** Draft
+**Spec:** ./spec.md   **Last updated:** 2026-10-18   **Status:** Current
 
 ## Overview
 Fix the dashboard, zone-ride, trainer, history, analytics and settings defects D1–D16 by moving
@@ -464,3 +464,67 @@ and (for backend slices) `cargo test` before each commit.
     - Run M-AC14.
 13. **Close-out.** Run the full suites. Write `## Verification` (AC → tests/commands, manual
     results), set design Status: Current and spec Status: Built.
+
+### ADR-17 (build): How the manual checks were run
+- **Context.** The manual checks were planned in `npm run tauri dev`, but this machine's display
+  is the user's live desktop.
+  - Driving the WebKitGTK window would take over their mouse and keyboard.
+  - xdotool does not reach native Wayland windows.
+- **Decision.** Run the real SvelteKit frontend (`npx vite dev --port 5299`) in headless Chromium
+  via Playwright.
+  - A mock of `window.__TAURI_INTERNALS__` stands in for IPC: `invoke`, `transformCallback` and
+    the event plugin.
+  - The mock is scriptable: session status, stop errors, zone status, save errors and emitted
+    `sensor_reading` events.
+  - This exercises the real components, stores and ECharts against controlled backend responses.
+- **Not covered.** The real Rust backend and WebKitGTK are not exercised. Those are covered by
+  `cargo test` and the steps in "Still to run in `npm run tauri dev`" below.
+- **Reversibility:** n/a (verification method only).
+
+### ADR-18 (build): Dismissing a notice
+The dismissed zone result is stored with `$state.raw`. A deep `$state` proxy never compares equal
+to the store value (Svelte `state_proxy_equality_mismatch`), so the first build's Dismiss did
+nothing. The manual check caught it.
+
+## Verification
+- **Commands** (at commit `444ce17`):
+  - `npm test`: 16 files, 203 tests passed. The baseline was 71.
+  - `npm run check`: 0 errors, 0 warnings.
+  - `cd src-tauri && cargo test`: 294 passed.
+  - `TZ=UTC npx vitest run` passes too, which shows the TZ pin overrides the host zone.
+- **CI.** Vitest does not run in CI until Area E's E7 lands. The TZ guard
+  (`timezone_is_pinned_to_chicago`) fails in CI once it does, if the pin is lost.
+
+| AC | Proof |
+|---|---|
+| AC1 | `autoSession.test.ts`: `paused_with_zero_speed_never_auto_stops`, `zero_speed_for_three_ticks_ends_session_once`, `two_idle_ticks_then_moving_resets_counter`, `fresh_speed_takes_precedence_over_zero_cadence`, `no_speed_source_falls_back_to_zero_cadence`, `stale_speed_falls_back_to_cadence`, `sensor_dropout_never_auto_stops`, `no_sensors_never_auto_stop`, `is_rider_idle_0..5` |
+| AC2 | `sessionLifecycle.test.ts` (endSession ordering, saving under the summary id, a previously completed zone ride saved, modal, single-flight, save and stop failures, all four `zoneRideResult` lifecycle rules); `zoneRide.test.ts` (self-completion reason + polling stop, final time in zone, `self_completed_ride_saves_non_empty_commanded_power_series`, safety note, status `stop_reason` precedence, `active: true` during finalize is not completion, manual stop, replacement, `describe_zone_stop_*`). Manual (Playwright): self-stop with `TrainerUnresponsive` showed "Trainer stopped responding — zone ride ended for safety (Trainer not responding) · 4:55 in zone"; the badge disappeared; polling stopped (2 → 2 calls over 2.5 s); Stop opened the modal and saved the config with `commanded_power_series: [165]` |
+| AC3 | `zoneRide.test.ts`: `power_zone_{1..7}_default_bounds`, `power_zone_{1..6}_custom_bounds`, `power_zone7_upper_exceeds_lower_when_z6_above_two_ftp`, `power_zone_above_7_clamps_to_7`, `hr_zone_{1..5}_default_bounds`, `hr_zone_{1..5}_custom_bounds`, `hr_zone_above_5_clamps_to_5` |
+| AC4 | Rust: `update_session_metadata_none_clears_field`, `update_session_metadata_empty_string_stored_as_null`, `update_session_metadata_round_trip`. Vitest `session.test.ts`: `display_title_empty_falls_back_to_auto_title`, `display_title_whitespace_falls_back_to_auto_title` |
+| AC5 | `timezone.test.ts`: `timezone_is_pinned_to_chicago`. `analytics.test.ts`: `local_date_key_*`, `today_key_is_local`, `add_days_across_spring_forward_is_one_calendar_day`, `evening_ride_counts_on_local_day`, `pmc_spring_forward_has_no_skipped_day`, `pmc_fall_back_has_no_duplicate_day`, `sunday_2100_cdt_ride_counts_toward_that_sunday_week`, `current_week_tss_uses_local_monday` |
+| AC6 | `latestWins.test.ts`: `rapid_submits_during_flight_send_only_latest_once`, `rejected_send_reports_error_and_still_sends_pending`, `no_follow_up_when_nothing_pending`, `idle_submit_sends_immediately`, `submit_after_idle_sends_again`. Wiring in `TrainerControl` was checked by review only, because it needs a trainer |
+| AC7 | `liveChart.test.ts`: `zone_mark_area_empty_when_band_null`, `echarts_ssr_mark_area_removed_after_band_cleared` (a throwaway spike confirmed the old omit-key pattern keeps the band). Manual (Playwright, Graphs view): ECharts `markArea.data` went from 1 to 0 after the zone ride ended |
+| AC8 | Rust: `status_none_without_session`, `status_running_after_start`, `status_paused_after_pause`, `status_none_after_stop`. Vitest: `rehydrate_sets_active_paused_and_id`, `rehydrate_with_no_session_leaves_inactive`, `rehydrate_starts_zone_polling_when_zone_active`, `rehydrate_failure_surfaces_error`, `stop_after_rehydrate_calls_stop_session`. Manual (Playwright): after a warm reload, Pause/Stop were visible about 264 ms after navigation start; with a paused session, Resume/Stop showed and Stop opened the modal |
+| AC9 | `sensor.test.ts`: `ten_events_in_one_second_produce_one_sample`, `one_sample_per_second_regardless_of_sensor_count`, `history_caps_at_600_samples`, `no_samples_while_paused`, `no_samples_without_active_session`, `stale_metric_sampled_as_null`. `sessionLifecycle.test.ts`: `session_start_clears_chart_history`. Manual (Playwright): 16 events/s gave about 1 point/s; after a viewport resize the canvas width matched its container (754 px) with no per-update `resize()` |
+| AC10 | `disposeGuard.test.ts`: `cleanup_added_after_dispose_runs_immediately`, `dispose_runs_cleanups_once_in_reverse_order`, `cleanup_added_before_dispose_runs_on_dispose`, `throwing_cleanup_does_not_skip_others`. Wiring in Devices, PowerGauge and PowerCurve was checked by review; the leak itself was not observed in a real webview (unproven at runtime) |
+| AC11 | `analytics.test.ts`: `weekly_avg_power_is_duration_weighted` (170.0), `weekly_avg_hr_is_duration_weighted` (135.0), `groups_sessions_into_correct_week_buckets` (212.0), `empty_week_between_rides_has_zero_volume`, `weeks_filled_through_current_week`, `zero_duration_sessions_give_null_average` |
+| AC12 | `zones.test.ts`: `bpm_equal_to_z1_upper_is_zone1`, `bpm_one_above_z1_upper_is_zone2`, `bpm_equal_to_z4_upper_is_zone4`, `bpm_above_all_is_zone5`, `bpm_below_z1_upper_is_zone1` |
+| AC13 | `devices.test.ts`: `manual_reconnect_marks_reconnected_then_clears_after_3s`, `failed_manual_reconnect_keeps_disconnected_banner` |
+| AC14 | `units.test.ts`: `convert_75kg_to_imperial_is_165_3`, `convert_typed_80kg_to_imperial_is_176_4`, `convert_165_3lbs_to_metric_is_75_0`, `same_unit_conversion_is_identity`, `non_finite_weight_passes_through`. Manual (Playwright): typed 80 kg → Imperial showed 176.4; `unitSystem` stayed `metric` after the toggle and after leaving the page without saving; after Save it was `imperial`, and 165.3 lbs was saved as 75 kg |
+| AC15 | The command results above |
+
+**New UI states (ruling 6).** Checked in Playwright against the app's single theme. The app is
+dark-only (`color-scheme: dark`); there is no light theme.
+- `lifecycleError`: the stop failure showed "Database error: database is locked" inline. The
+  button returned to Start, no modal opened, and Dismiss removed the error.
+- Zone-stop notice: shown, and Dismiss works.
+- "Zone ride not saved: disk full": appended to the notice after Stop, and Dismiss works.
+- Screenshots in the scratchpad: `D-m-ac8-rehydrated.png`, `D-m-lifecycle-error.png`,
+  `D-m-zone-notice.png`, `D-m-zone-not-saved.png`, `D-m-ac7-band.png`, `D-m-ac7-noband.png`,
+  `D-m-ac14-settings.png`.
+
+**Still to run in `npm run tauri dev` (needs the user's desktop and/or hardware):**
+- M-AC1: auto-stop with the simulator.
+- M-AC8: reload in the real WebKitGTK webview.
+- M-AC10: quick-navigation smoke test.
+- M-AC2 and M-AC6: these need a real trainer.
