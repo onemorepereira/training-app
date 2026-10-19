@@ -29,9 +29,9 @@ pub struct AutosaveTicket<'a> {
     pub delta: Vec<SensorReading>,
 }
 
-/// Maximum gap between readings before we stop counting elapsed time.
-/// Prevents pauses, sensor drops, or reconnects from inflating duration.
-const MAX_READING_GAP_SECS: u64 = 5;
+// Maximum gap between readings before we stop counting elapsed time
+// (shared gap rule; prevents pauses, sensor drops or reconnects inflating duration).
+use super::gap::MAX_READING_GAP_MS;
 
 struct ActiveSession {
     id: String,
@@ -155,7 +155,7 @@ impl SessionManager {
         if let Some(prev) = session.last_reading_time {
             let delta_ms = prev.elapsed().as_millis() as u64;
             // Cap gap to avoid counting sensor dropouts or reconnects
-            let capped = delta_ms.min(MAX_READING_GAP_SECS * 1000);
+            let capped = delta_ms.min(MAX_READING_GAP_MS);
             session.active_elapsed_ms += capped;
         }
         session.last_reading_time = Some(now);

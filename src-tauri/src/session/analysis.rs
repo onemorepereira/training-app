@@ -42,7 +42,7 @@ pub struct ZoneBucket {
     pub percentage: f64,
 }
 
-const MAX_READING_GAP_MS: u64 = 5000;
+use super::gap::capped_interval_ms;
 
 const POWER_CURVE_DURATIONS: &[u32] = &[
     1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120, 300, 600, 1200, 1800, 3600,
@@ -281,7 +281,7 @@ fn compute_zone_distribution(
 
     let mut power_zone_time = [0.0f64; 7];
     for pair in power_data.windows(2) {
-        let delta_ms = pair[1].0.saturating_sub(pair[0].0).min(MAX_READING_GAP_MS);
+        let delta_ms = capped_interval_ms(pair[0].0, pair[1].0);
         let zone = classify_power_zone(pair[0].1, ftp, power_zones);
         power_zone_time[(zone - 1) as usize] += delta_ms as f64 / 1000.0;
     }
@@ -313,7 +313,7 @@ fn compute_zone_distribution(
 
     let mut hr_zone_time = [0.0f64; 5];
     for pair in hr_data.windows(2) {
-        let delta_ms = pair[1].0.saturating_sub(pair[0].0).min(MAX_READING_GAP_MS);
+        let delta_ms = capped_interval_ms(pair[0].0, pair[1].0);
         let zone = classify_hr_zone(pair[0].1, hr_zones);
         hr_zone_time[(zone - 1) as usize] += delta_ms as f64 / 1000.0;
     }
