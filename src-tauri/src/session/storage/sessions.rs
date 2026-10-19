@@ -3,9 +3,12 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use super::fsio::{io_error, remove_durable, write_durable};
+use super::power_curves::replace_power_curve_in_tx;
 use super::Storage;
 use crate::device::types::{CommandSource, SensorReading};
 use crate::error::AppError;
+use crate::session::analysis::PowerCurvePoint;
+use crate::session::metrics::SummaryMetrics;
 use crate::session::types::{SessionSummary, ZoneSnapshot};
 
 /// Legacy sensor reading format: Power variant lacked pedal_balance field because
@@ -437,6 +440,54 @@ impl Storage {
             return Err(AppError::Session(format!("Session not found: {}", session_id)));
         }
         Ok(())
+    }
+
+    /// Overwrite a session's recomputed summary metrics and power-curve cache
+    /// in one transaction (used by the one-time metrics repair). Only metric
+    /// columns are touched; duration, FTP, metadata and zones are left alone.
+    /// When `update_if_and_tss` is false the stored IF and TSS are kept.
+    /// Returns false (and writes nothing) if the session no longer exists.
+    pub async fn replace_session_metrics(
+        &self,
+        session_id: &str,
+        m: &SummaryMetrics,
+        update_if_and_tss: bool,
+        curve: &[PowerCurvePoint],
+    ) -> Result<bool, AppError> {
+        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+        let result = sqlx::query(
+            "UPDATE sessions SET avg_power = ?, max_power = ?, normalized_power = ?, \
+             tss = CASE WHEN ? THEN ? ELSE tss END, \
+             intensity_factor = CASE WHEN ? THEN ? ELSE intensity_factor END, \
+             variability_index = ?, work_kj = ?, distance_km = ?, \
+             avg_hr = ?, max_hr = ?, avg_cadence = ?, avg_speed = ? \
+             WHERE id = ?",
+        )
+        .bind(m.avg_power.map(|v| v as i32))
+        .bind(m.max_power.map(|v| v as i32))
+        .bind(m.normalized_power.map(|v| v as i32))
+        .bind(update_if_and_tss)
+        .bind(m.tss.map(|v| v as f64))
+        .bind(update_if_and_tss)
+        .bind(m.intensity_factor.map(|v| v as f64))
+        .bind(m.variability_index.map(|v| v as f64))
+        .bind(m.work_kj.map(|v| v as f64))
+        .bind(m.distance_km.map(|v| v as f64))
+        .bind(m.avg_hr.map(|v| v as i32))
+        .bind(m.max_hr.map(|v| v as i32))
+        .bind(m.avg_cadence.map(|v| v as f64))
+        .bind(m.avg_speed.map(|v| v as f64))
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(AppError::Database)?;
+            return Ok(false);
+        }
+        replace_power_curve_in_tx(&mut tx, session_id, curve).await?;
+        tx.commit().await.map_err(AppError::Database)?;
+        Ok(true)
     }
 
     pub async fn get_zone_config(&self, session_id: &str) -> Result<Option<String>, AppError> {
