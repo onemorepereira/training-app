@@ -30,25 +30,19 @@ pub(crate) struct ResistanceRange {
 }
 
 /// Parse 0x2AD6. FTMS v1.0 §4.13 defers the format to the SIG assigned numbers, and
-/// the official definitions disagree, so the layout is chosen by length:
-/// - 6 octets: sint16 min, sint16 max, uint16 increment, all 0.1 resolution (2017
-///   SIG characteristic XML; also what GoldenCheetah parses);
-/// - 3 octets: uint8 min, max, increment (current GATT Specification Supplement
-///   §3.231), taken as whole levels → ×10 to the 0.1-unit raw scale.
-/// Anything else, or an empty/inverted range, yields None (legacy 0-100 % mapping).
+/// the official definitions disagree: the 2017 SIG characteristic XML gives 6 octets
+/// (sint16 min, sint16 max, uint16 increment, 0.1 resolution — also what GoldenCheetah
+/// parses), the current GATT Specification Supplement §3.231 gives 3 uint8 octets with
+/// self-contradictory scaling. Only the 6-octet form is used; any other length (or an
+/// empty/inverted range) yields None and resistance keeps the 0-100 % mapping.
 pub(crate) fn parse_resistance_range(data: &[u8]) -> Option<ResistanceRange> {
-    let range = match data.len() {
-        6 => ResistanceRange {
-            min: i16::from_le_bytes([data[0], data[1]]),
-            max: i16::from_le_bytes([data[2], data[3]]),
-            increment: u16::from_le_bytes([data[4], data[5]]),
-        },
-        3 => ResistanceRange {
-            min: data[0] as i16 * 10,
-            max: data[1] as i16 * 10,
-            increment: data[2] as u16 * 10,
-        },
-        _ => return None,
+    if data.len() != 6 {
+        return None;
+    }
+    let range = ResistanceRange {
+        min: i16::from_le_bytes([data[0], data[1]]),
+        max: i16::from_le_bytes([data[2], data[3]]),
+        increment: u16::from_le_bytes([data[4], data[5]]),
     };
     (range.max > range.min).then_some(ResistanceRange { increment: range.increment.max(1), ..range })
 }
@@ -139,7 +133,14 @@ impl TrainerController {
         match self.peripheral.read(c).await {
             Ok(data) => {
                 self.resistance_range = parse_resistance_range(&data);
-                info!("FTMS: supported resistance range {:?} (raw {:02X?})", self.resistance_range, data);
+                match self.resistance_range {
+                    Some(r) => info!("FTMS: supported resistance range {:?}", r),
+                    // Read once per connect, so this logs once per trainer connection.
+                    None => warn!(
+                        "FTMS: unsupported Supported Resistance Level Range format {:02X?}; using 0-100 %",
+                        data
+                    ),
+                }
             }
             Err(e) => warn!("FTMS: reading Supported Resistance Level Range failed: {}", e),
         }
@@ -402,18 +403,18 @@ mod tests {
     }
 
     #[test]
-    fn resistance_range_parse_3_octet_layout() {
-        // uint8 levels 1..40 step 1 → raw 10..400 step 10
-        let r = parse_resistance_range(&[1, 40, 1]).unwrap();
-        assert_eq!(r, ResistanceRange { min: 10, max: 400, increment: 10 });
+    fn resistance_range_3_octet_form_falls_back_to_legacy() {
+        // The 3-octet (uint8) form's scaling is ambiguous across SIG sources: don't guess.
+        assert_eq!(parse_resistance_range(&[1, 40, 1]), None);
+        assert_eq!(encode_resistance(50, parse_resistance_range(&[1, 40, 1])), vec![0x04, 0xF4, 0x01]);
     }
 
     #[test]
     fn resistance_range_parse_bad_length_is_none() {
         assert_eq!(parse_resistance_range(&[]), None);
         assert_eq!(parse_resistance_range(&[1, 2, 3, 4]), None);
-        // inverted range
-        assert_eq!(parse_resistance_range(&[40, 1, 1]), None);
+        // inverted 6-octet range: max 10 < min 400
+        assert_eq!(parse_resistance_range(&[0x90, 0x01, 0x0A, 0x00, 0x0A, 0x00]), None);
     }
 
     #[test]

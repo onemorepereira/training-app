@@ -371,11 +371,11 @@ pub enum LinkState { Alive, Stale /* ANT: no page > DEVICE_DISCONNECT_TIMEOUT_SE
 - **Decision.**
   - Read 0x2AD6 once in `TrainerController::new` (now async, run during `io.connect`, outside the DM lock). Parse by length:
     - 6 octets → the 2017 layout, raw in 0.1 units.
-    - 3 octets → uint8 levels, treated as whole units, raw = v × 10.
+    - 3 octets → **not used** (rev 4 ruling: its scaling is ambiguous, so it is not guessed). It is logged and falls back to the legacy mapping.
     - Anything else, or a read error → `None`.
   - `encode_resistance(pct, range: Option<Range>)` maps `pct ∈ [0,100]` → `raw = min + round((max-min) × pct/100 / inc) × inc`, clamped to `[min, max]`.
   - `None` → today's `pct × 10`.
-  - The 3-octet interpretation is unproven, so hardware validation is listed in Risks.
+  - Only the 6-octet form is scaled (rev 4). AC13 is satisfied for trainers that expose the 2017 layout; the others keep the previous behaviour.
 - **Reversibility: easy.**
 
 ### ADR-8: ANT+ background pages (C14) and combo S&C (C12)
@@ -606,7 +606,7 @@ Run any group with `cargo test --lib <path>`. Paths below are relative to `devic
 | AC10 (C9) | `protocol::tests::csc_first_notification_emits_nothing`, `csc_second_notification_computes_cadence_60rpm`, `csc_new_state_after_reconnect_reinitialises`, `csc_zero_*`, `cadence_resumes_after_zero_on_new_event` |
 | AC11 (C11) | `protocol::tests::cps_crank_only_cadence_90rpm`, `cps_crank_offset_after_balance_torque_wheel`, `cps_crank_event_time_rollover`, `cps_crank_first_sample_initialises`, `cps_truncated_crank_field_still_yields_power`, `cps_zero_cadence_after_3s_without_crank_event`; `ant::protocol::tests::ant_power_page_cadence_byte3`, `ant_power_page_cadence_0xff_omitted`, `ant_power_page_cadence_only_on_new_event` |
 | AC12 (C12) | `ant::protocol::tests::combined_sc_first_page_initialises`, `combined_sc_speed_and_cadence_from_one_page`, `combined_sc_counter_rollover`; `ant::channel::tests::profile_speed_cadence_is_type_121_period_8086`, `scan_profiles_include_combined_sc` |
-| AC13 (C13) | `ftms::tests::resistance_range_parse_6_octet_layout`, `resistance_range_parse_3_octet_layout`, `resistance_range_parse_bad_length_is_none`, `resistance_50pct_scaled_into_range_with_increment`, `resistance_range_with_negative_min`, `resistance_without_range_uses_legacy_mapping` |
+| AC13 (C13) | `ftms::tests::resistance_range_parse_6_octet_layout`, `resistance_range_3_octet_form_falls_back_to_legacy`, `resistance_range_parse_bad_length_is_none`, `resistance_50pct_scaled_into_range_with_increment`, `resistance_range_with_negative_min`, `resistance_without_range_uses_legacy_mapping` |
 | AC14 (C14) | `ant::listener::tests::hr_page2_ignored_before_toggle_seen`, `page_toggle_gate_opens_after_both_states`, `hr_page2_manufacturer_and_serial_with_toggle_bit_set`, `hr_page3_hw_sw_model`, `sc_page2_serial_combines_device_number` |
 | AC15 (C15) | `protocol::tests::cps_balance_unknown_reference_is_none`, `cps_balance_left_reference_inverted_rounded`; `ant::protocol::tests::ant_power_pedal_power_0xff_is_none` |
 | AC16 (C16) | `dedup::tests::name_number_requires_whole_token`, `name_number_matches_token_after_separator`, `name_number_leading_zero_token_matches` |
@@ -629,3 +629,4 @@ Run any group with `cargo test --lib <path>`. Paths below are relative to `devic
 - **Accepted, documented.** Trainer commands still hold the DM lock across the FE-C ack wait: ≤ 600 ms per attempt, plus one retry unless the trainer is stale.
 - **Router channel generations.** Per-channel senders live in a `ChannelBook` (`ant/channel.rs`) with a generation per registration. Every close we issue is stamped with a generation first (`note_close_issued`). An `EVENT_CHANNEL_CLOSED` drops the channel's sender only if the sender is older than our close, or if the close was unsolicited. A late close event therefore cannot kill a connection that re-registered the reused channel number. Tests: `late_close_event_does_not_kill_recovered_channel`, `unsolicited_close_event_drops_sender`, `close_event_for_sender_older_than_close_drops_it`.
 - **ID-list reset is best effort (ruling).** `reset_id_list` (0x5A size 0) in `open_channel` and in `release_scan_channel` logs a warning and continues on failure. If `reopen_excluding` fails (stick without ID lists), the scan re-opens the channel plain and stops excluding on it, which falls back to one device per profile. Tests: `open_channel_succeeds_when_stick_rejects_id_list`, `release_scan_channel_unassigns_when_stick_rejects_id_list`, `reopen_excluding_reports_unsupported_id_list`.
+- **0x2AD6 (ruling).** Only the 6-octet form (sint16 / sint16 / uint16 at 0.1) is scaled. Any other length is logged once per connect and resistance stays on the 0–100 % → 0–1000 mapping. Test: `resistance_range_3_octet_form_falls_back_to_legacy`.
