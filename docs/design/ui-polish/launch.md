@@ -24,9 +24,9 @@ There are no backend behaviour, data or schema changes. Only these non-frontend 
 ## Packaging: three stacked PRs
 | PR | Branch | Commits | Contents |
 |---|---|---|---|
-| 1 | `feat/ui-polish-1-foundations` | `e21f984`..`013735b` | Harness and baseline, spec and design; fonts and tokens; shared components and chart theme; navigation, Esc and fullscreen |
-| 2 | `feat/ui-polish-2-ride` | `1748f1a`..`747caef` | Post-ride and edit dialog; ride screen |
-| 3 | `feat/ui-polish-3-screens` | `1ef200f`..branch head | Devices, History and detail, Analytics, Settings and About; docs; verification |
+| 1 (#197) | `feat/ui-polish-1-foundations` | squash-merged as `dae7517` | Harness and baseline, spec and design; fonts and tokens; shared components and chart theme; navigation, Esc and fullscreen |
+| 2 (#198) | `feat/ui-polish-2-ride` | squash-merged as `aafe15d` | Post-ride and edit dialog; ride screen |
+| 3 (#199) | `feat/ui-polish-3-screens` | branch commits after `aafe15d` | Devices, History and detail, Analytics, Settings and About; docs; verification |
 
 - PR 1 targets `main`, and each later PR targets the one before it.
 - After each squash merge, rebase the next PR onto `main` and retarget it, as was done for #191–#195.
