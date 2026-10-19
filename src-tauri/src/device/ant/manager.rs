@@ -200,7 +200,7 @@ impl AntManager {
                 device_number: 0,     // wildcard
                 transmission_type: 0, // wildcard
             };
-            match open_channel(&*self.usb, &config, SCAN_SEARCH, &self.response_queue) {
+            match open_channel(&*self.usb, &config, SCAN_SEARCH, &self.response_queue, &*self.book) {
                 Ok(()) => {
                     open.insert(ch);
                     receivers.insert(ch, self.register_sender(ch));
@@ -265,8 +265,7 @@ impl AntManager {
                 if list.len() <= MAX_ID_LIST && !no_id_lists.contains(&ch) {
                     self.unregister_sender(ch);
                     receivers.remove(&ch);
-                    self.note_close_issued(ch);
-                    if let Err(e) = reopen_excluding(&*self.usb, ch, list, &self.response_queue) {
+                    if let Err(e) = reopen_excluding(&*self.usb, ch, list, &self.response_queue, &*self.book) {
                         // Stick without ID lists: fall back to one device per profile.
                         warn!("ANT+ scan ch{}: exclusion list unsupported ({}); single device per profile", ch, e);
                         no_id_lists.insert(ch);
@@ -281,8 +280,7 @@ impl AntManager {
 
         for &ch in &open {
             self.unregister_sender(ch);
-            self.note_close_issued(ch);
-            if let Err(e) = release_scan_channel(&*self.usb, ch, &self.response_queue) {
+            if let Err(e) = release_scan_channel(&*self.usb, ch, &self.response_queue, &*self.book) {
                 warn!("ANT+ scan ch{}: release failed: {}", ch, e);
             }
         }
@@ -333,12 +331,14 @@ impl AntManager {
             device_number: discovered.device_number,
             transmission_type: discovered.transmission_type,
         };
-        // Register with the router before opening so the first page is not missed.
-        let data_rx = self.register_sender(channel_number);
-        if let Err(e) = open_channel(&*self.usb, &config, CONNECTION_SEARCH, &self.response_queue) {
+        if let Err(e) = open_channel(&*self.usb, &config, CONNECTION_SEARCH, &self.response_queue, &*self.book) {
             self.release_connect_channel(channel_number);
             return Err(e);
         }
+        // Register after opening: the sender is then newer than any close the open
+        // (recovery path) issued, so a late close event can't drop it. Pages arrive
+        // at 4 Hz, so the first-page wait just takes the next one.
+        let data_rx = self.register_sender(channel_number);
 
         // Connected only once the device actually delivers a page (design ADR-2).
         let Some(first_page) = wait_first_page(&data_rx, ANT_FIRST_PAGE_TIMEOUT, cancel) else {
@@ -413,8 +413,7 @@ impl AntManager {
     /// Undo a connect that failed after the channel was registered/opened.
     fn release_connect_channel(&self, channel_number: u8) {
         self.unregister_sender(channel_number);
-        self.note_close_issued(channel_number);
-        if let Err(e) = close_channel(&*self.usb, channel_number, &self.response_queue) {
+        if let Err(e) = close_channel(&*self.usb, channel_number, &self.response_queue, &*self.book) {
             warn!("ANT+ ch{}: close after failed connect failed: {}", channel_number, e);
         }
     }
@@ -437,8 +436,7 @@ impl AntManager {
             }
             // Tolerate a channel the radio already closed (search timeout, stick reset):
             // the bookkeeping above is what matters for a clean reopen.
-            self.note_close_issued(conn.channel_number);
-            if let Err(e) = close_channel(&*self.usb, conn.channel_number, &self.response_queue) {
+            if let Err(e) = close_channel(&*self.usb, conn.channel_number, &self.response_queue, &*self.book) {
                 warn!("[{}] Closing ANT+ channel {} failed (treated as closed): {}", device_id, conn.channel_number, e);
             }
         }

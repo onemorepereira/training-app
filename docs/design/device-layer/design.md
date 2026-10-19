@@ -635,3 +635,10 @@ Run any group with `cargo test --lib <path>`. Paths below are relative to `devic
   - AC5 / ruling 2: `ui_event_tests::give_up_emits_list_only_after_teardown_and_final_status_disconnected`, `lost_transition_emits_reconnecting_list`, `failed_manual_connect_keeps_reconnect_target_and_reconnecting`, `disconnect_stale_ant_closes_channel_and_clears_state`, `disconnect_reconnecting_ble_clears_reconnect_target`.
   - AC5 router: `ant::channel::tests::late_close_event_does_not_kill_recovered_channel` and the two companion tests.
   - AC17 fallback: the three `*_rejects_id_list` / `reopen_excluding_reports_unsupported_id_list` tests.
+- **Pending-close tracking (re-review).** Fills three gaps in the router-generation rule:
+  - **Every close is reported.** All closes we send go through a `CloseTracker` (implemented by the router's `ChannelBook`), including the `open_channel` recovery close after a failed assign.
+  - **Connect registers its sender after `open_channel` returns,** so it is newer than any close that open issued. Pages arrive at 4 Hz, so the first-page wait takes the next one.
+  - **Several closes can be pending per channel.** Each `EVENT_CHANNEL_CLOSED` absorbs the oldest one.
+  - **Dropped pending closes.** A pending close is forgotten when `close_only` times out without an event, or when the stick rejects the close (error response, so no event will follow). A missed event therefore cannot permanently mask a genuine radio close.
+  - Tests: `open_channel_recovery_close_does_not_drop_new_sender`, `missed_close_event_then_genuine_close_drops_sender`, `close_rejected_by_stick_clears_pending`, `multiple_pending_closes_each_absorb_one_event`, `close_only_timeout_reports_to_tracker`, `close_only_seen_event_is_not_a_timeout`.
+  - The path from a dropped sender to the watchdog seeing `Lost` (listener exits → `closed` flag → probe) is covered by `io::tests::ant_link_closed_is_lost_even_if_fresh`.

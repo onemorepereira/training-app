@@ -136,14 +136,41 @@ fn reset_id_list(usb: &dyn AntTx, ch: u8, response_queue: &Arc<Mutex<Vec<AntMess
     }
 }
 
+/// Told about closes we send, so the router can tell our (possibly late) close
+/// events from genuine radio closes.
+pub trait CloseTracker {
+    /// Called right before a close is sent on `ch`.
+    fn close_issued(&self, ch: u8);
+    /// Called when a close we sent never produced EVENT_CHANNEL_CLOSED in time.
+    fn close_timed_out(&self, ch: u8);
+}
+
+/// For callers without a router (tests, pre-router init).
+pub struct NoTracking;
+
+impl CloseTracker for NoTracking {
+    fn close_issued(&self, _ch: u8) {}
+    fn close_timed_out(&self, _ch: u8) {}
+}
+
+impl CloseTracker for Mutex<ChannelBook> {
+    fn close_issued(&self, ch: u8) {
+        self.lock().unwrap_or_else(|e| e.into_inner()).note_close_issued(ch);
+    }
+    fn close_timed_out(&self, ch: u8) {
+        self.lock().unwrap_or_else(|e| e.into_inner()).close_timed_out(ch);
+    }
+}
+
 /// Per-channel data senders for the router, tagged with a generation so a late
 /// EVENT_CHANNEL_CLOSED from an earlier close cannot kill a sender registered after
 /// that close was issued (channel numbers are reused).
 #[derive(Default)]
 pub struct ChannelBook {
     senders: HashMap<u8, (u64, std::sync::mpsc::Sender<Vec<u8>>)>,
-    /// Generation stamped when we issued a close on the channel.
-    close_issued: HashMap<u8, u64>,
+    /// Generations of closes we issued whose EVENT_CHANNEL_CLOSED is still pending,
+    /// oldest first (several closes can be outstanding on one channel).
+    close_issued: HashMap<u8, std::collections::VecDeque<u64>>,
     next_gen: u64,
 }
 
@@ -167,7 +194,22 @@ impl ChannelBook {
     /// Record that we are about to close `ch` (call right before sending the close).
     pub fn note_close_issued(&mut self, ch: u8) {
         let gen = self.bump();
-        self.close_issued.insert(ch, gen);
+        self.close_issued.entry(ch).or_default().push_back(gen);
+    }
+
+    fn pop_pending_close(&mut self, ch: u8) -> Option<u64> {
+        let queue = self.close_issued.get_mut(&ch)?;
+        let gen = queue.pop_front();
+        if queue.is_empty() {
+            self.close_issued.remove(&ch);
+        }
+        gen
+    }
+
+    /// Our close produced no event (missed / timed out): forget it, so it can't
+    /// later mask a genuine radio close.
+    pub fn close_timed_out(&mut self, ch: u8) {
+        self.pop_pending_close(ch);
     }
 
     pub fn clear(&mut self) {
@@ -185,8 +227,16 @@ impl ChannelBook {
             }
             return None;
         }
+        // A rejected close (e.g. channel already idle) will never produce an event.
+        if msg.msg_id == MSG_CHANNEL_RESPONSE
+            && msg.data.len() >= 3
+            && msg.data[1] == MSG_CLOSE_CHANNEL
+            && msg.data[2] != RESPONSE_NO_ERROR
+        {
+            self.pop_pending_close(msg.data[0]);
+        }
         if let Some(ch) = closed_channel_event(&msg) {
-            let issued = if msg.data[2] == EVENT_CHANNEL_CLOSED { self.close_issued.remove(&ch) } else { None };
+            let issued = if msg.data[2] == EVENT_CHANNEL_CLOSED { self.pop_pending_close(ch) } else { None };
             let sender_gen = self.senders.get(&ch).map(|(g, _)| *g);
             match (sender_gen, issued) {
                 (Some(g), Some(close_gen)) if g > close_gen => {
@@ -288,6 +338,7 @@ pub fn open_channel(
     config: &AntChannelConfig,
     search: SearchConfig,
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+    tracker: &dyn CloseTracker,
 ) -> Result<(), AppError> {
     let ch = config.channel_number;
 
@@ -300,6 +351,7 @@ pub fn open_channel(
     if let Err(_) = poll_response(response_queue, ch, MSG_ASSIGN_CHANNEL) {
         // Channel likely in wrong state — force close + unassign and retry
         log::info!("[ant+ ch{}] Assign failed, resetting channel state", ch);
+        tracker.close_issued(ch);
         let _ = usb.send(&AntMessage {
             msg_id: MSG_CLOSE_CHANNEL,
             data: vec![ch],
@@ -397,8 +449,9 @@ pub fn close_channel(
     usb: &dyn AntTx,
     channel_number: u8,
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+    tracker: &dyn CloseTracker,
 ) -> Result<(), AppError> {
-    close_only(usb, channel_number, response_queue)?;
+    close_only(usb, channel_number, response_queue, tracker)?;
     usb.send(&AntMessage {
         msg_id: MSG_UNASSIGN_CHANNEL,
         data: vec![channel_number],
@@ -412,12 +465,24 @@ fn close_only(
     usb: &dyn AntTx,
     channel_number: u8,
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+    tracker: &dyn CloseTracker,
 ) -> Result<(), AppError> {
+    close_only_within(usb, channel_number, response_queue, tracker, Duration::from_secs(2))
+}
+
+fn close_only_within(
+    usb: &dyn AntTx,
+    channel_number: u8,
+    response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+    tracker: &dyn CloseTracker,
+    timeout: Duration,
+) -> Result<(), AppError> {
+    tracker.close_issued(channel_number);
     usb.send(&AntMessage {
         msg_id: MSG_CLOSE_CHANNEL,
         data: vec![channel_number],
     })?;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         {
             let mut queue = response_queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -439,8 +504,10 @@ fn close_only(
                 return Ok(());
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
+    log::warn!("ANT+ ch{}: no EVENT_CHANNEL_CLOSED within {:?}", channel_number, timeout);
+    tracker.close_timed_out(channel_number);
     Ok(())
 }
 
@@ -450,8 +517,9 @@ pub fn reopen_excluding(
     ch: u8,
     excluded: &[FoundId],
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+    tracker: &dyn CloseTracker,
 ) -> Result<(), AppError> {
-    close_only(usb, ch, response_queue)?;
+    close_only(usb, ch, response_queue, tracker)?;
     for msg in exclusion_messages(ch, excluded) {
         usb.send(&msg)?;
         poll_response(response_queue, ch, msg.msg_id)?;
@@ -466,8 +534,9 @@ pub fn release_scan_channel(
     usb: &dyn AntTx,
     ch: u8,
     response_queue: &Arc<Mutex<Vec<AntMessage>>>,
+    tracker: &dyn CloseTracker,
 ) -> Result<(), AppError> {
-    close_only(usb, ch, response_queue)?;
+    close_only(usb, ch, response_queue, tracker)?;
     reset_id_list(usb, ch, response_queue);
     usb.send(&AntMessage { msg_id: MSG_UNASSIGN_CHANNEL, data: vec![ch] })?;
     poll_response(response_queue, ch, MSG_UNASSIGN_CHANNEL)
@@ -688,11 +757,26 @@ pub mod test_stick {
         pub queue: Arc<Mutex<Vec<AntMessage>>>,
         /// Commands answered with an error code (e.g. a stick without ID lists).
         pub reject: Option<u8>,
+        /// Command answered with an error code once (then accepted).
+        pub reject_once: Mutex<Option<u8>>,
+        /// Hold EVENT_CHANNEL_CLOSED back (a late event) instead of queueing it.
+        pub defer_close_events: bool,
+        pub deferred: Mutex<Vec<AntMessage>>,
     }
 
     impl RecordingStick {
         pub fn new() -> Self {
-            Self { sent: Mutex::new(Vec::new()), queue: Arc::new(Mutex::new(Vec::new())), reject: None }
+            Self {
+                sent: Mutex::new(Vec::new()),
+                queue: Arc::new(Mutex::new(Vec::new())),
+                reject: None,
+                reject_once: Mutex::new(None),
+                defer_close_events: false,
+                deferred: Mutex::new(Vec::new()),
+            }
+        }
+        pub fn deferring_close_events() -> Self {
+            Self { defer_close_events: true, ..Self::new() }
         }
         pub fn rejecting(msg_id: u8) -> Self {
             Self { reject: Some(msg_id), ..Self::new() }
@@ -709,12 +793,21 @@ pub mod test_stick {
             let mut q = self.queue.lock().unwrap();
             if msg.msg_id == MSG_CLOSE_CHANNEL {
                 q.push(AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![ch, MSG_CLOSE_CHANNEL, 0] });
-                q.push(AntMessage {
+                let event = AntMessage {
                     msg_id: MSG_CHANNEL_RESPONSE,
                     data: vec![ch, CHANNEL_EVENT, EVENT_CHANNEL_CLOSED],
-                });
+                };
+                if self.defer_close_events {
+                    self.deferred.lock().unwrap().push(event);
+                } else {
+                    q.push(event);
+                }
             } else if msg.msg_id != MSG_ACKNOWLEDGED_DATA && msg.msg_id != MSG_REQUEST_MESSAGE {
-                let code = if self.reject == Some(msg.msg_id) { 0x28 /* INVALID_MESSAGE */ } else { RESPONSE_NO_ERROR };
+                let once = {
+                    let mut r = self.reject_once.lock().unwrap();
+                    if *r == Some(msg.msg_id) { r.take().is_some() } else { false }
+                };
+                let code = if once || self.reject == Some(msg.msg_id) { 0x28 /* INVALID_MESSAGE */ } else { RESPONSE_NO_ERROR };
                 q.push(AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![ch, msg.msg_id, code] });
             }
             Ok(())
@@ -740,7 +833,7 @@ mod tests {
     #[test]
     fn ant_connection_channel_search_config_bytes() {
         let stick = RecordingStick::new();
-        open_channel(&stick, &hr_config(3), CONNECTION_SEARCH, &stick.queue).unwrap();
+        open_channel(&stick, &hr_config(3), CONNECTION_SEARCH, &stick.queue, &NoTracking).unwrap();
         let sent = stick.sent();
         // D00000652 §9.5.2.5: HP timeout 0 = HP search disabled;
         // §9.5.2.15: LP timeout 0xFF = infinite background search
@@ -754,7 +847,7 @@ mod tests {
     #[test]
     fn scan_channel_uses_finite_search_and_chip_default_lp() {
         let stick = RecordingStick::new();
-        open_channel(&stick, &hr_config(0), SCAN_SEARCH, &stick.queue).unwrap();
+        open_channel(&stick, &hr_config(0), SCAN_SEARCH, &stick.queue, &NoTracking).unwrap();
         let sent = stick.sent();
         assert!(sent.contains(&(MSG_SET_CHANNEL_SEARCH_TIMEOUT, vec![0, 2])));
         assert!(!sent.iter().any(|(id, _)| *id == MSG_SET_LP_SEARCH_TIMEOUT));
@@ -974,7 +1067,7 @@ mod tests {
     #[test]
     fn scan_channel_release_sends_close_reset_list_unassign_in_order() {
         let stick = RecordingStick::new();
-        release_scan_channel(&stick, 2, &stick.queue).unwrap();
+        release_scan_channel(&stick, 2, &stick.queue, &NoTracking).unwrap();
         assert_eq!(
             stick.sent(),
             vec![
@@ -988,7 +1081,7 @@ mod tests {
     #[test]
     fn open_channel_resets_id_list_after_assign() {
         let stick = RecordingStick::new();
-        open_channel(&stick, &hr_config(1), SCAN_SEARCH, &stick.queue).unwrap();
+        open_channel(&stick, &hr_config(1), SCAN_SEARCH, &stick.queue, &NoTracking).unwrap();
         let sent = stick.sent();
         assert_eq!(sent[0].0, MSG_ASSIGN_CHANNEL);
         assert_eq!(sent[1], (MSG_CONFIG_ID_LIST, vec![1, 0, 0]));
@@ -998,7 +1091,7 @@ mod tests {
     fn reopen_excluding_closes_lists_then_opens() {
         let stick = RecordingStick::new();
         let found = [FoundId { device_number: 7, device_type: 121, transmission_type: 1 }];
-        reopen_excluding(&stick, 3, &found, &stick.queue).unwrap();
+        reopen_excluding(&stick, 3, &found, &stick.queue, &NoTracking).unwrap();
         let ids: Vec<u8> = stick.sent().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![MSG_CLOSE_CHANNEL, MSG_ADD_CHANNEL_ID_TO_LIST, MSG_CONFIG_ID_LIST, MSG_OPEN_CHANNEL]);
     }
@@ -1049,14 +1142,14 @@ mod tests {
     #[test]
     fn open_channel_succeeds_when_stick_rejects_id_list() {
         let stick = RecordingStick::rejecting(MSG_CONFIG_ID_LIST);
-        open_channel(&stick, &hr_config(1), CONNECTION_SEARCH, &stick.queue).unwrap();
+        open_channel(&stick, &hr_config(1), CONNECTION_SEARCH, &stick.queue, &NoTracking).unwrap();
         assert_eq!(stick.sent().last(), Some(&(MSG_OPEN_CHANNEL, vec![1])));
     }
 
     #[test]
     fn release_scan_channel_unassigns_when_stick_rejects_id_list() {
         let stick = RecordingStick::rejecting(MSG_CONFIG_ID_LIST);
-        release_scan_channel(&stick, 2, &stick.queue).unwrap();
+        release_scan_channel(&stick, 2, &stick.queue, &NoTracking).unwrap();
         assert_eq!(stick.sent().last(), Some(&(MSG_UNASSIGN_CHANNEL, vec![2])));
     }
 
@@ -1064,6 +1157,95 @@ mod tests {
     fn reopen_excluding_reports_unsupported_id_list() {
         let stick = RecordingStick::rejecting(MSG_ADD_CHANNEL_ID_TO_LIST);
         let found = [FoundId { device_number: 7, device_type: 120, transmission_type: 1 }];
-        assert!(reopen_excluding(&stick, 0, &found, &stick.queue).is_err(), "scan falls back on this error");
+        assert!(reopen_excluding(&stick, 0, &found, &stick.queue, &NoTracking).is_err(), "scan falls back on this error");
+    }
+
+    // ---- Pending-close tracking (re-review follow-up) ----
+
+    /// Records tracker callbacks.
+    #[derive(Default)]
+    struct SpyTracker {
+        issued: Mutex<Vec<u8>>,
+        timed_out: Mutex<Vec<u8>>,
+    }
+
+    impl CloseTracker for SpyTracker {
+        fn close_issued(&self, ch: u8) {
+            self.issued.lock().unwrap().push(ch);
+        }
+        fn close_timed_out(&self, ch: u8) {
+            self.timed_out.lock().unwrap().push(ch);
+        }
+    }
+
+    #[test]
+    fn open_channel_recovery_close_does_not_drop_new_sender() {
+        // Assign fails once → open_channel's recovery closes/unassigns and retries.
+        // The recovery close's EVENT_CHANNEL_CLOSED arrives late, after connect has
+        // registered its sender (connect registers after open_channel returns).
+        let stick = RecordingStick::deferring_close_events();
+        *stick.reject_once.lock().unwrap() = Some(MSG_ASSIGN_CHANNEL);
+        let book = Mutex::new(ChannelBook::default());
+        open_channel(&stick, &hr_config(5), CONNECTION_SEARCH, &stick.queue, &book).unwrap();
+        let rx = book.lock().unwrap().register(5);
+        for late in stick.deferred.lock().unwrap().drain(..) {
+            book.lock().unwrap().route(late);
+        }
+        book.lock().unwrap().route(broadcast(5, [0x04, 0, 0, 0, 0, 0, 0, 150]));
+        let page = wait_first_page(&rx, Duration::from_millis(250), &AtomicBool::new(false));
+        assert_eq!(page.map(|p| p[7]), Some(150), "connect succeeds the first time");
+    }
+
+    #[test]
+    fn missed_close_event_then_genuine_close_drops_sender() {
+        let mut book = ChannelBook::default();
+        book.note_close_issued(3);
+        book.close_timed_out(3); // close_only never saw its event
+        let rx = book.register(3);
+        // A real radio close later must not be masked by the stale pending entry,
+        // so the listener exits and the watchdog sees the link Lost.
+        book.route(closed_event(3));
+        assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn close_rejected_by_stick_clears_pending() {
+        let mut book = ChannelBook::default();
+        book.note_close_issued(2);
+        // Close on an idle channel: error response, no event will follow.
+        book.route(AntMessage { msg_id: MSG_CHANNEL_RESPONSE, data: vec![2, MSG_CLOSE_CHANNEL, 0x15] });
+        let rx = book.register(2);
+        book.route(closed_event(2));
+        assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn multiple_pending_closes_each_absorb_one_event() {
+        let mut book = ChannelBook::default();
+        book.note_close_issued(6);
+        book.note_close_issued(6);
+        let rx = book.register(6);
+        book.route(closed_event(6));
+        book.route(closed_event(6));
+        assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)), "both late events absorbed");
+        book.route(closed_event(6)); // a third, unsolicited close
+        assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn close_only_timeout_reports_to_tracker() {
+        let stick = RecordingStick::deferring_close_events();
+        let spy = SpyTracker::default();
+        close_only_within(&stick, 4, &stick.queue, &spy, Duration::from_millis(20)).unwrap();
+        assert_eq!(*spy.issued.lock().unwrap(), vec![4]);
+        assert_eq!(*spy.timed_out.lock().unwrap(), vec![4]);
+    }
+
+    #[test]
+    fn close_only_seen_event_is_not_a_timeout() {
+        let stick = RecordingStick::new();
+        let spy = SpyTracker::default();
+        close_only_within(&stick, 4, &stick.queue, &spy, Duration::from_millis(250)).unwrap();
+        assert!(spy.timed_out.lock().unwrap().is_empty());
     }
 }
