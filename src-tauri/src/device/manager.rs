@@ -588,6 +588,7 @@ impl DeviceManager {
     // Trainer control methods -- C2: FE-C calls wrapped in spawn_blocking
 
     pub async fn set_target_power(&mut self, device_id: &str, watts: i16) -> Result<(), AppError> {
+        let watts = config::clamp_trainer_watts(watts as i32);
         let result = match self.trainer_backends.get_mut(device_id) {
             Some(TrainerBackend::Ftms(controller)) => {
                 controller.set_target_power(watts).await

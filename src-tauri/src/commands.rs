@@ -15,7 +15,10 @@ use crate::session::storage::Storage;
 use crate::session::types::{SessionConfig, SessionSummary};
 use crate::session::analysis::{compute_hr_power_regression, TimeseriesPoint};
 use crate::session::zone_control::controller::ZoneController;
-use crate::session::zone_control::types::{StopReason, ZoneControlStatus, ZoneMode, ZoneTarget};
+use crate::session::zone_control::lifecycle as zone_lifecycle;
+use crate::session::zone_control::types::{
+    StopReason, ZoneControlStatus, ZoneMode, ZoneTarget, MAX_HR_BOUND,
+};
 
 /// Validate that a session ID from the frontend is a safe UUID string.
 /// Prevents path traversal via crafted IDs like "../../etc/passwd".
@@ -40,6 +43,32 @@ fn validate_zones_ascending<T: PartialOrd>(zones: &[T], label: &str) -> Result<(
     Ok(())
 }
 
+/// Validate a user config before saving (design ADR-9): FTP range, zone
+/// ordering, and per-value bounds the zone controller relies on.
+pub(crate) fn validate_user_config(config: &SessionConfig) -> Result<(), AppError> {
+    if !(50..=1000).contains(&config.ftp) {
+        return Err(AppError::Session(format!(
+            "FTP must be between 50 and 1000 W, got {}",
+            config.ftp
+        )));
+    }
+    validate_zones_ascending(&config.hr_zones, "HR zones")?;
+    validate_zones_ascending(&config.power_zones, "Power zones")?;
+    if let Some(&hr) = config.hr_zones.iter().find(|&&z| z as u16 > MAX_HR_BOUND) {
+        return Err(AppError::Session(format!(
+            "HR zone boundaries must be at most {} bpm, got {}",
+            MAX_HR_BOUND, hr
+        )));
+    }
+    if let Some(&pct) = config.power_zones.iter().find(|&&z| z == 0 || z > 1000) {
+        return Err(AppError::Session(format!(
+            "Power zone percentages must be between 1 and 1000, got {}",
+            pct
+        )));
+    }
+    Ok(())
+}
+
 /// Format primary devices map for the frontend (DeviceType → stable string keys).
 fn format_primaries(primaries: &HashMap<DeviceType, String>) -> HashMap<String, String> {
     primaries
@@ -54,7 +83,7 @@ pub struct AppState {
     pub storage: Arc<Storage>,
     pub sensor_tx: broadcast::Sender<SensorReading>,
     pub primary_devices: Arc<std::sync::RwLock<HashMap<DeviceType, String>>>,
-    pub zone_controller: Arc<tokio::sync::Mutex<ZoneController>>,
+    pub zone_controller: Arc<ZoneController>,
     #[cfg(not(feature = "production"))]
     pub simulator: Arc<tokio::sync::Mutex<crate::simulator::Simulator>>,
 }
@@ -115,6 +144,7 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, AppErro
 
 #[tauri::command]
 pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSummary>, AppError> {
+    zone_lifecycle::on_session_stop(&state.zone_controller).await;
     let result = state.session_manager.stop_session_with_log().await;
 
     if let Some((ref summary, ref sensor_log)) = result {
@@ -147,12 +177,14 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<Option<SessionSu
 
 #[tauri::command]
 pub async fn pause_session(state: State<'_, AppState>) -> Result<(), AppError> {
+    zone_lifecycle::on_session_pause(&state.zone_controller).await;
     state.session_manager.pause_session().await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn resume_session(state: State<'_, AppState>) -> Result<(), AppError> {
+    zone_lifecycle::on_session_resume(&state.zone_controller).await;
     state.session_manager.resume_session().await;
     Ok(())
 }
@@ -199,8 +231,7 @@ pub async fn save_user_config(
     state: State<'_, AppState>,
     config: SessionConfig,
 ) -> Result<(), AppError> {
-    validate_zones_ascending(&config.hr_zones, "HR zones")?;
-    validate_zones_ascending(&config.power_zones, "Power zones")?;
+    validate_user_config(&config)?;
     state
         .storage
         .save_user_config(&config)
@@ -252,6 +283,7 @@ pub async fn get_primary_devices(
 #[tauri::command]
 pub async fn set_trainer_power(state: State<'_, AppState>, watts: i16) -> Result<(), AppError> {
     info!("Set trainer power: {}W", watts);
+    state.zone_controller.ensure_manual_control_allowed()?;
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -262,6 +294,7 @@ pub async fn set_trainer_power(state: State<'_, AppState>, watts: i16) -> Result
 #[tauri::command]
 pub async fn set_trainer_resistance(state: State<'_, AppState>, level: u8) -> Result<(), AppError> {
     info!("Set trainer resistance: level {}", level);
+    state.zone_controller.ensure_manual_control_allowed()?;
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -277,6 +310,7 @@ pub async fn set_trainer_simulation(
     cw: f32,
 ) -> Result<(), AppError> {
     info!("Set trainer simulation: grade={}, crr={}, cw={}", grade, crr, cw);
+    state.zone_controller.ensure_manual_control_allowed()?;
     let mut dm = state.device_manager.lock().await;
     let trainer_id = dm
         .connected_trainer_id()
@@ -412,13 +446,15 @@ pub async fn start_zone_control(
         "Start zone control: {:?} zone {} ({}-{})",
         target.mode, target.zone, target.lower_bound, target.upper_bound
     );
+    target.validate()?;
     let config = state.storage.get_user_config().await?;
     let ftp = Some(config.ftp);
     let max_hr = config.max_hr;
 
     // For HR mode, try to estimate initial power from historical data
     let initial_power_estimate = if target.mode == ZoneMode::HeartRate {
-        let target_hr = ((target.lower_bound + target.upper_bound) / 2) as u8;
+        // validate() caps HR bounds at 250, so the midpoint fits in u8
+        let target_hr = target.midpoint().min(u8::MAX as u16) as u8;
         match estimate_power_from_history(&state.storage, target_hr).await {
             Ok(v) => v,
             Err(e) => {
@@ -431,10 +467,11 @@ pub async fn start_zone_control(
     };
 
     let power_zones = Some(config.power_zones);
-    let dm = state.device_manager.clone();
     let tx = state.sensor_tx.clone();
-    let mut zc = state.zone_controller.lock().await;
-    zc.start_with_config(target, dm, tx, ftp, max_hr, initial_power_estimate, power_zones).await
+    state
+        .zone_controller
+        .start_with_config(target, tx, ftp, max_hr, initial_power_estimate, power_zones)
+        .await
 }
 
 #[tauri::command]
@@ -449,23 +486,20 @@ pub async fn estimate_initial_power(
 pub async fn stop_zone_control(
     state: State<'_, AppState>,
 ) -> Result<Option<StopReason>, AppError> {
-    let mut zc = state.zone_controller.lock().await;
-    let reason = zc.stop().await;
+    let reason = state.zone_controller.stop(StopReason::UserStopped).await;
     info!("Stop zone control: {:?}", reason);
     Ok(reason)
 }
 
 #[tauri::command]
 pub async fn pause_zone_control(state: State<'_, AppState>) -> Result<(), AppError> {
-    let zc = state.zone_controller.lock().await;
-    zc.pause().await;
+    state.zone_controller.pause().await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn resume_zone_control(state: State<'_, AppState>) -> Result<(), AppError> {
-    let zc = state.zone_controller.lock().await;
-    zc.resume().await;
+    state.zone_controller.resume().await;
     Ok(())
 }
 
@@ -473,8 +507,7 @@ pub async fn resume_zone_control(state: State<'_, AppState>) -> Result<(), AppEr
 pub async fn get_zone_control_status(
     state: State<'_, AppState>,
 ) -> Result<ZoneControlStatus, AppError> {
-    let zc = state.zone_controller.lock().await;
-    Ok(zc.status().await)
+    Ok(state.zone_controller.status().await)
 }
 
 #[tauri::command]
@@ -630,6 +663,47 @@ mod tests {
     #[test]
     fn rejects_null_bytes() {
         assert!(validate_session_id("abc\0def").is_err());
+    }
+
+    // --- validate_user_config ---
+
+    fn config_with_ftp(ftp: u16) -> SessionConfig {
+        SessionConfig { ftp, ..SessionConfig::default() }
+    }
+
+    #[test]
+    fn ftp_below_50_rejected() {
+        let msg = validate_user_config(&config_with_ftp(49)).unwrap_err().to_string();
+        assert!(msg.contains("FTP must be between 50 and 1000 W, got 49"), "{msg}");
+        assert!(validate_user_config(&config_with_ftp(50)).is_ok());
+    }
+
+    #[test]
+    fn ftp_above_1000_rejected() {
+        assert!(validate_user_config(&config_with_ftp(1001)).is_err());
+        assert!(validate_user_config(&config_with_ftp(1000)).is_ok());
+    }
+
+    #[test]
+    fn non_increasing_hr_zones_rejected() {
+        let mut c = SessionConfig::default();
+        c.hr_zones = [120, 140, 140, 175, 190];
+        assert!(validate_user_config(&c).is_err());
+    }
+
+    #[test]
+    fn hr_zone_above_250_rejected() {
+        let mut c = SessionConfig::default();
+        c.hr_zones = [120, 140, 160, 175, 251];
+        let msg = validate_user_config(&c).unwrap_err().to_string();
+        assert!(msg.contains("at most 250 bpm, got 251"), "{msg}");
+    }
+
+    #[test]
+    fn zero_power_zone_percentage_rejected() {
+        let mut c = SessionConfig::default();
+        c.power_zones = [0, 75, 90, 105, 120, 150];
+        assert!(validate_user_config(&c).is_err());
     }
 
     // --- validate_zones_ascending ---
