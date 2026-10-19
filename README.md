@@ -7,7 +7,7 @@ A cycling training application with real-time sensor support over BLE and ANT+.
 - **Backend**: Rust, Tauri v2
 - **Frontend**: Svelte 5, TypeScript, ECharts
 - **Sensors**: BLE (btleplug), ANT+ (custom USB driver via rusb)
-- **Storage**: SQLite (sqlx)
+- **Storage**: SQLite (sqlx), schema migrations in `src-tauri/migrations/` (see [CONTRIBUTING.md](CONTRIBUTING.md#schema-changes))
 
 ## Features
 

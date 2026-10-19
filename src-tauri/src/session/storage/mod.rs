@@ -2,6 +2,7 @@ mod autosave;
 mod config;
 mod devices;
 mod power_curves;
+mod schema;
 mod sessions;
 
 use log::info;
@@ -10,16 +11,6 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::error::AppError;
-
-/// Execute an ALTER TABLE statement, ignoring "duplicate column" errors (expected
-/// on re-run) but propagating all other errors (disk full, corruption, malformed SQL).
-async fn run_alter_ignore_duplicate(pool: &SqlitePool, stmt: &str) -> Result<(), AppError> {
-    match sqlx::raw_sql(stmt).execute(pool).await {
-        Ok(_) => Ok(()),
-        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
-        Err(e) => Err(AppError::Database(e)),
-    }
-}
 
 pub struct Storage {
     pub(crate) pool: SqlitePool,
@@ -40,89 +31,8 @@ impl Storage {
             .await
             .map_err(AppError::Database)?;
         info!("Database opened: {}", db_path.display());
-        let migration_sql = include_str!("../../../migrations/001_init.sql");
-        sqlx::raw_sql(migration_sql)
-            .execute(&pool)
-            .await
-            .map_err(AppError::Database)?;
-        // Run each ALTER TABLE individually, ignoring "duplicate column" errors on
-        // re-run but propagating real failures (disk full, corruption, etc.)
-        let migration_002_stmts = [
-            "ALTER TABLE user_config ADD COLUMN units TEXT NOT NULL DEFAULT 'metric'",
-            "ALTER TABLE user_config ADD COLUMN power_zone_1 INTEGER NOT NULL DEFAULT 55",
-            "ALTER TABLE user_config ADD COLUMN power_zone_2 INTEGER NOT NULL DEFAULT 75",
-            "ALTER TABLE user_config ADD COLUMN power_zone_3 INTEGER NOT NULL DEFAULT 90",
-            "ALTER TABLE user_config ADD COLUMN power_zone_4 INTEGER NOT NULL DEFAULT 105",
-            "ALTER TABLE user_config ADD COLUMN power_zone_5 INTEGER NOT NULL DEFAULT 120",
-            "ALTER TABLE user_config ADD COLUMN power_zone_6 INTEGER NOT NULL DEFAULT 150",
-        ];
-        for stmt in migration_002_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        let migration_003_stmts = [
-            "ALTER TABLE user_config ADD COLUMN date_of_birth TEXT",
-            "ALTER TABLE user_config ADD COLUMN sex TEXT",
-            "ALTER TABLE user_config ADD COLUMN resting_hr INTEGER",
-            "ALTER TABLE user_config ADD COLUMN max_hr INTEGER",
-        ];
-        for stmt in migration_003_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 004: store FTP used in each session for audit trail
-        run_alter_ignore_duplicate(&pool, "ALTER TABLE sessions ADD COLUMN ftp INTEGER").await?;
-        // Migration 005: device metadata for cross-transport deduplication
-        let migration_005_stmts = [
-            "ALTER TABLE known_devices ADD COLUMN device_group TEXT",
-            "ALTER TABLE known_devices ADD COLUMN manufacturer TEXT",
-            "ALTER TABLE known_devices ADD COLUMN model_number TEXT",
-            "ALTER TABLE known_devices ADD COLUMN serial_number TEXT",
-        ];
-        for stmt in migration_005_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 006: activity metadata on sessions
-        let migration_006_stmts = [
-            "ALTER TABLE sessions ADD COLUMN title TEXT",
-            "ALTER TABLE sessions ADD COLUMN activity_type TEXT",
-            "ALTER TABLE sessions ADD COLUMN rpe INTEGER",
-            "ALTER TABLE sessions ADD COLUMN notes TEXT",
-        ];
-        for stmt in migration_006_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 007: zone ride config snapshot per session
-        run_alter_ignore_duplicate(
-            &pool,
-            "ALTER TABLE sessions ADD COLUMN zone_config TEXT",
-        )
-        .await?;
-        // Migration 008: work (kJ) and variability index
-        let migration_008_stmts = [
-            "ALTER TABLE sessions ADD COLUMN work_kj REAL",
-            "ALTER TABLE sessions ADD COLUMN variability_index REAL",
-        ];
-        for stmt in migration_008_stmts {
-            run_alter_ignore_duplicate(&pool, stmt).await?;
-        }
-        // Migration 009: distance
-        run_alter_ignore_duplicate(
-            &pool,
-            "ALTER TABLE sessions ADD COLUMN distance_km REAL",
-        )
-        .await?;
-        // Power curve cache table (idempotent CREATE IF NOT EXISTS)
-        sqlx::raw_sql(
-            "CREATE TABLE IF NOT EXISTS session_power_curves (
-                session_id TEXT NOT NULL,
-                duration_secs INTEGER NOT NULL,
-                watts INTEGER NOT NULL,
-                PRIMARY KEY (session_id, duration_secs)
-            )"
-        )
-        .execute(&pool)
-        .await
-        .map_err(AppError::Database)?;
-        info!("Database migrations complete");
+        let version = schema::migrate(&pool, &db_path).await?;
+        info!("Database schema at version {}", version);
         Ok(Self {
             pool,
             data_dir: data_dir.to_string(),
