@@ -356,17 +356,56 @@ The ordering is **raw file durable first, then row**. A single function, `save_s
 ## Verification
 
 Commands, run on the final commit:
-- `cd src-tauri && cargo test`: 339 passed, 0 failed (main had 289).
+- `cd src-tauri && cargo test`: 342 passed, 0 failed (main had 289).
 - `cd src-tauri && cargo build --features production`: OK. Its only warning (`integral` never used) was already there.
 - `npm test`: 71 passed. `npm run check`: 0 errors, 0 warnings.
 
 | AC | Proven by |
 |---|---|
-| AC1 | `save_session_existing_row_keeps_original_raw_file`, `save_session_returns_inserted_then_already_existed`, `crash_after_row_before_autosave_removal_keeps_final_raw`, `crash_after_final_autosave_before_raw_recovers_full_ride`, `crash_after_raw_before_row_inserts_row_and_keeps_raw`, `crash_after_raw_before_row_with_stale_autosave_keeps_orphan_and_consistent_pair`, `legacy_row_without_raw_is_repaired_from_autosave`, `delete_session_removes_leftover_autosave_so_restart_cannot_resurrect`, `stop_waits_for_in_flight_autosave_ticket`, `autosave_tick_after_stop_writes_nothing`, `ticks_accumulate_full_log_across_deltas`, `recovery_removes_stray_tmp_files`, `remove_autosave_missing_file_is_ok`, `write_durable_replaces_content_and_leaves_no_tmp`, `remove_durable_reports_missing_file_as_false` |
+| AC1 | `stop_waits_until_autosave_write_completes` (a gated fake writer proves the ticket is held through the write; it fails if the gate is released before the write), `save_session_existing_row_keeps_original_raw_file`, `save_session_returns_inserted_then_already_existed`, `crash_after_row_before_autosave_removal_keeps_final_raw`, `crash_after_final_autosave_before_raw_recovers_full_ride`, `crash_after_raw_before_row_inserts_row_and_keeps_raw`, `crash_after_raw_before_row_with_stale_autosave_keeps_orphan_and_consistent_pair`, `legacy_row_without_raw_is_repaired_from_autosave`, `delete_session_removes_leftover_autosave_so_restart_cannot_resurrect`, `stop_waits_for_in_flight_autosave_ticket`, `autosave_tick_after_stop_writes_nothing`, `ticks_accumulate_full_log_across_deltas`, `recovery_removes_stray_tmp_files`, `remove_autosave_missing_file_is_ok`, `write_durable_replaces_content_and_leaves_no_tmp`, `remove_durable_reports_missing_file_as_false` |
 | AC2 | `finalize_with_failed_db_save_keeps_full_log_on_disk` (DB closed: error text says the ride will be recovered; after restart all 10 readings are recovered, not the 6 from the stale autosave), `finalize_success_persists_and_removes_autosave` |
-| AC3 | `fix_invocation_all_missing_is_single_pkexec_call`, `fix_invocation_without_udev_step_has_no_stdin`, `fix_invocation_passes_no_paths_or_temp_files`, `fix_invocation_all_met_is_none`, `fix_invocation_only_bluez_missing_without_package_manager_is_none`, `embedded_udev_rule_satisfies_the_check`, `setup_script_rejects_unknown_step_before_any_change`, `setup_script_treats_shell_metacharacters_as_data`, `setup_script_requires_a_step`, `setup_script_has_non_interactive_package_installs`, `closed_stdin_is_judged_by_exit_status`, `describe_failure_maps_pkexec_denied_and_step_codes`. **Manual check NOT yet performed:** one prompt with the GUI polkit agent on Fedora, for both deb and AppImage, with the rule installed 0644 root:root. |
+| AC3 | `fix_invocation_all_missing_is_single_pkexec_call`, `fix_invocation_without_udev_step_has_no_stdin`, `fix_invocation_passes_no_paths_or_temp_files`, `fix_invocation_all_met_is_none`, `fix_invocation_only_bluez_missing_without_package_manager_is_none`, `embedded_udev_rule_satisfies_the_check`, `setup_script_rejects_unknown_step_before_any_change`, `setup_script_treats_shell_metacharacters_as_data`, `setup_script_requires_a_step`, `setup_script_has_non_interactive_package_installs`, `closed_stdin_is_judged_by_exit_status`, `describe_failure_maps_pkexec_denied_and_step_codes`. **Manual check: Deferred to user.** It needs an interactive polkit prompt on the user's desktop; the steps are in *Manual checks* below. |
 | AC4 | `delete_session_failed_transaction_leaves_row_curves_and_file`, `delete_session_removes_row_curves_and_file`, `delete_session_aborts_when_autosave_cannot_be_removed`, existing `delete_session_removes_power_curves` |
-| AC5 | `format_panic_str_payload_includes_location`, `format_panic_string_payload`, `format_panic_non_string_payload`, `format_panic_on_real_panic_payload`. **Manual check NOT yet performed:** the log file ends with "Application exiting" after closing the window (Linux and macOS), and a forced panic appears in the log file. |
+| AC5 | `format_panic_str_payload_includes_location`, `format_panic_string_payload`, `format_panic_non_string_payload`, `format_panic_on_real_panic_payload`. `logging_scope_blocks_nested_entry_and_resets_on_drop`, `log_format_functions_run_inside_logging_scope` (re-entrancy guard). **Manual check: Deferred to user.** It needs a real window close on the user's desktop; the steps are in *Manual checks* below. |
 | AC6 | `fresh_db_reaches_latest_user_version`, `fresh_db_gets_no_backup_file`, `reopening_migrated_db_changes_nothing`, `every_fixture_upgrades_preserving_all_values`, `every_fixture_upgrades_to_fresh_column_sets`, `upgraded_main_fixture_is_readable_through_storage_api`, `legacy_upgrade_writes_one_backup_before_step_two`, `existing_backup_is_not_overwritten`, `failed_step_rolls_back_and_keeps_version`, `add_column_is_skipped_when_column_exists`, `newer_user_version_is_left_untouched`, `split_statements_drops_comment_lines_and_empty_chunks`, `parse_add_column_extracts_table_and_column`, `baseline_statement_count_is_pinned`, `every_add_column_spells_out_column_with_plain_identifiers`, `migration_files_match_registry`, `shipped_migrations_match_pinned_sha256`, `backup_path_appends_version_suffix`. The guard and hash tests were mutation-checked: disabling the existence guard fails 6 tests, and editing a shipped file fails the hash pin. The old `001`–`008` files are deleted. README, CONTRIBUTING and CLAUDE.md are updated. |
-| AC7 | `ci.yml` and `release.yml` now have a "Run frontend tests" step (`npm test`). Both files parse as YAML. Not yet proven on GitHub, which needs a PR run. |
+| AC7 | `ci.yml` and `release.yml` now have a "Run frontend tests" step (`npm test`). `ci.yml` also gained the "Forbid edits to shipped migrations" step, which runs on pull_request only with `fetch-depth: 0`, via `.github/scripts/check-migrations-immutable.sh`. The guard script was checked in a throwaway repo: adding a migration passes (exit 0), retiring a legacy 3-digit file passes (exit 0), and modifying, deleting or renaming a 4-digit migration fails (exit 1). It also passes against `main` on this branch. Both workflows parse as YAML. Not yet proven on GitHub, which needs a PR run. |
 | AC8 | Full suites are green as above. Each new behaviour test was seen failing, either against the old behaviour (mutation) or before its implementation existed. |
+
+### Manual checks (deferred to user)
+
+These checks need an interactive desktop session, which an agent can't do. They have **not** been performed.
+
+**AC3: single privileged prompt (Linux, GNOME/Fedora with a graphical polkit agent)**
+
+1. Build the bundles: `npm ci && npm run build:release`. The outputs are in `src-tauri/target/release/bundle/{appimage,rpm,deb}/`.
+2. Recreate the "everything missing" state:
+   - `sudo rm -f /etc/udev/rules.d/99-ant-usb.rules`
+   - `sudo udevadm control --reload-rules`
+   - `sudo systemctl disable --now bluetooth`
+3. Start the AppImage: `chmod +x src-tauri/target/release/bundle/appimage/*.AppImage`, then run it. The setup banner appears. Click **Fix All**.
+4. **Expect exactly one** polkit authentication dialog, naming `/bin/sh` as the program. Authenticate. The banner then reports "All prerequisites fixed successfully."
+5. Verify:
+   - `stat -c '%a %U:%G' /etc/udev/rules.d/99-ant-usb.rules` → `644 root:root`
+   - `cmp /etc/udev/rules.d/99-ant-usb.rules src-tauri/resources/99-ant-usb.rules` → no output
+   - `systemctl is-active bluetooth` → `active`
+   - `ls /tmp/99-ant-usb.rules` → "No such file or directory"
+6. Repeat steps 2–5 with the package-installed binary: `sudo dnf install ./src-tauri/target/release/bundle/rpm/*.rpm` (or the `.deb` via `apt` on Debian/Ubuntu), then launch it from the app menu.
+7. Cancel path: repeat step 2, click **Fix All**, then dismiss the dialog. Expect a single dialog and the message "Authentication was cancelled."
+
+**AC5: log flush on exit and panic logging**
+
+1. Run `npm run tauri dev` and use the app briefly, e.g. open Devices.
+2. Close the window with the title-bar close button.
+3. Open the newest log file:
+   - Linux: `~/.local/share/com.training-app.dev/logs/training-app*.log`
+   - macOS: `~/Library/Application Support/com.training-app.dev/logs/`
+   - Release builds use `com.training-app` in place of `com.training-app.dev`.
+4. Expect the last line to read `<date> <time> INFO  [app_lib] Application exiting`, with every earlier line of the run present (nothing truncated). Repeat on macOS.
+5. Panic logging: temporarily add `std::thread::spawn(|| panic!("manual panic check"));` just before `log::info!("Application startup complete");` in `src-tauri/src/lib.rs`, and **don't commit it**. Run `npm run tauri dev`.
+6. Expect the log file to contain `ERROR [app_lib] panic: manual panic check at src/lib.rs:<line>:<col>`, with the usual "thread ... panicked" message still on stderr. Revert the edit.
+
+## Known limitations / follow-ups
+
+- **Double-failure recovery isn't shown to the user.** This happens when the final autosave write fails *and* the process crashes after the raw file was written but before the row was inserted. Recovery then keeps the row and raw consistent with the older periodic autosave, for example 6 readings in the test. The full log survives only as `sessions/<id>.bin.orphan-<ms>`, with a `warn!` in the log. Nothing in the UI mentions or restores it. Possible follow-up: list orphans in the UI, or recompute the summary from the orphan once Area A's recompute lands.
+- **A failed pre-migration backup stops the app from starting.** For example, if `VACUUM INTO training.db.pre-v<N>` fails because the disk is full, `Storage::new` returns an error and `lib.rs` setup calls `.expect("Failed to initialize storage")`. The app then exits with a panic, which is now logged, instead of showing a message. That is safer than migrating without a copy, but the experience is poor. Possible follow-up: show a startup error dialog explaining the free-space requirement, and/or allow opening the DB read-only at its current version.
+
