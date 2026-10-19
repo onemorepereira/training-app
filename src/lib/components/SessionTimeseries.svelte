@@ -3,6 +3,7 @@
   import * as echarts from 'echarts';
   import { kmhToMph } from '$lib/stores/units';
   import type { TimeseriesPoint } from '$lib/tauri';
+  import { SERIES, withAlpha, axisLabel, axisNameStyle, axisLine, splitLine, legendDefaults, tooltipDefaults, CHART_TEXT } from '$lib/charts/theme';
 
   interface Props {
     timeseries: TimeseriesPoint[];
@@ -15,12 +16,7 @@
   let chartEl: HTMLDivElement;
   let chart = $state<echarts.ECharts | null>(null);
 
-  const COLORS = {
-    power: '#ff4d6d',
-    hr: '#f44336',
-    cadence: '#64b5f6',
-    speed: '#4caf50',
-  };
+  const COLORS = SERIES;
 
   function formatElapsed(secs: number): string {
     const h = Math.floor(secs / 3600);
@@ -68,14 +64,14 @@
       backgroundColor: 'transparent',
       animation: false,
       grid: {
-        left: 50,
-        right: 50,
-        top: 40,
-        bottom: 70,
+        left: 56,
+        right: 56,
+        top: 48,
+        bottom: 72,
       },
       legend: {
         top: 4,
-        textStyle: { color: '#a0a0b8', fontSize: 12, fontFamily: 'Outfit, sans-serif' },
+        textStyle: legendDefaults().textStyle,
         itemWidth: 16,
         itemHeight: 2,
         itemGap: 16,
@@ -86,9 +82,7 @@
           type: 'line',
           lineStyle: { color: 'rgba(255,255,255,0.2)', type: 'dashed' },
         },
-        backgroundColor: '#1c1c30',
-        borderColor: 'rgba(255,255,255,0.08)',
-        textStyle: { color: '#f0f0f5', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' },
+        ...tooltipDefaults(),
         formatter(params: unknown) {
           const items = params as { seriesName: string; value: number | null; color: string }[];
           const lines: string[] = [];
@@ -113,8 +107,8 @@
           borderColor: 'rgba(255,255,255,0.06)',
           backgroundColor: 'rgba(255,255,255,0.02)',
           fillerColor: 'rgba(255,255,255,0.04)',
-          handleStyle: { color: '#70708a' },
-          textStyle: { color: '#70708a', fontSize: 10 },
+          handleStyle: { color: CHART_TEXT.axis.color },
+          textStyle: { color: CHART_TEXT.axis.color, fontSize: CHART_TEXT.axis.fontSize },
           dataBackground: {
             lineStyle: { color: 'rgba(255,255,255,0.1)' },
             areaStyle: { color: 'rgba(255,255,255,0.03)' },
@@ -125,29 +119,29 @@
       xAxis: {
         type: 'category',
         boundaryGap: false,
-        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
+        axisLine: axisLine(),
         axisTick: { show: false },
-        axisLabel: { color: '#70708a', fontSize: 10 },
+        axisLabel: axisLabel(),
         data: [],
       },
       yAxis: [
         {
           type: 'value',
           name: 'W / bpm',
-          nameTextStyle: { color: '#70708a', fontSize: 10 },
+          nameTextStyle: axisNameStyle(),
           min: 0,
-          splitLine: { lineStyle: { color: 'rgba(255,255,255,0.04)' } },
+          splitLine: splitLine(),
           axisLine: { show: false },
-          axisLabel: { color: '#70708a', fontSize: 10 },
+          axisLabel: axisLabel(),
         },
         {
           type: 'value',
           name: `rpm / ${spdUnit}`,
-          nameTextStyle: { color: '#70708a', fontSize: 10 },
+          nameTextStyle: axisNameStyle(),
           min: 0,
           splitLine: { show: false },
           axisLine: { show: false },
-          axisLabel: { color: '#70708a', fontSize: 10 },
+          axisLabel: axisLabel(),
         },
       ],
       series: [
@@ -161,8 +155,8 @@
           itemStyle: { color: COLORS.power },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(255, 77, 109, 0.25)' },
-              { offset: 1, color: 'rgba(255, 77, 109, 0)' },
+              { offset: 0, color: withAlpha(COLORS.power, 0.25) },
+              { offset: 1, color: withAlpha(COLORS.power, 0) },
             ]),
           },
           data: [],
@@ -177,8 +171,8 @@
           itemStyle: { color: COLORS.hr },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(244, 67, 54, 0.15)' },
-              { offset: 1, color: 'rgba(244, 67, 54, 0)' },
+              { offset: 0, color: withAlpha(COLORS.hr, 0.15) },
+              { offset: 1, color: withAlpha(COLORS.hr, 0) },
             ]),
           },
           data: [],
@@ -193,8 +187,8 @@
           itemStyle: { color: COLORS.cadence },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(100, 181, 246, 0.12)' },
-              { offset: 1, color: 'rgba(100, 181, 246, 0)' },
+              { offset: 0, color: withAlpha(COLORS.cadence, 0.12) },
+              { offset: 1, color: withAlpha(COLORS.cadence, 0) },
             ]),
           },
           data: [],
@@ -209,8 +203,8 @@
           itemStyle: { color: COLORS.speed },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(76, 175, 80, 0.12)' },
-              { offset: 1, color: 'rgba(76, 175, 80, 0)' },
+              { offset: 0, color: withAlpha(COLORS.speed, 0.12) },
+              { offset: 1, color: withAlpha(COLORS.speed, 0) },
             ]),
           },
           data: [],

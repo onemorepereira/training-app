@@ -14,13 +14,48 @@
   import { formatDuration, formatDateLong, formatTime } from '$lib/utils/format';
   import { TYPE_LABELS, displayTitle, rpeColor } from '$lib/utils/session';
   import { formatSpeed } from '$lib/stores/units';
+  import { SERIES } from '$lib/charts/theme';
+  import SegmentedControl from '$lib/ui/SegmentedControl.svelte';
+  import StateView from '$lib/ui/StateView.svelte';
+  import Notice from '$lib/ui/Notice.svelte';
+
+  const SMOOTHING = [
+    { value: 1, label: 'Raw' },
+    { value: 3, label: '3s' },
+    { value: 10, label: '10s' },
+    { value: 30, label: '30s' },
+  ] as const;
+  const PERIODS = [
+    { value: 'all', label: 'All' },
+    { value: '90d', label: '90d' },
+    { value: '30d', label: '30d' },
+  ] as const;
+  const POWER_BUCKETS = [
+    { value: 10, label: '10W' },
+    { value: 20, label: '20W' },
+    { value: 50, label: '50W' },
+  ] as const;
+  const HR_BUCKETS = [
+    { value: 3, label: '3 bpm' },
+    { value: 5, label: '5 bpm' },
+    { value: 10, label: '10 bpm' },
+  ] as const;
 
   let session = $state<SessionSummary | null>(null);
   let analysis = $state<SessionAnalysis | null>(null);
   let config = $state<SessionConfig | null>(null);
   let loading = $state(true);
   let analysisLoading = $state(true);
+  /** Loading the ride itself failed (page-level error state). */
+  let loadError = $state('');
+  /** Loading the analysis (charts) failed; the summary still shows. */
+  let analysisError = $state('');
+  /** An action (export, save, delete) failed: dismissible notice. */
   let error = $state('');
+  /** Bumped by Retry to re-run the loads. */
+  let reloadToken = $state(0);
+  // A missing ride: sqlx's "no rows returned" from the backend, or "session … not found".
+  let notFound = $derived(/no rows returned|session\b.*\bnot found/i.test(loadError));
   let editSession = $state<SessionSummary | null>(null);
   let exportingFit = $state(false);
   let smoothing = $state(10);
@@ -37,11 +72,14 @@
 
   $effect(() => {
     const sessionId = $page.params.id;
+    void reloadToken;
     if (!sessionId) return;
 
     let cancelled = false;
     loading = true;
     analysisLoading = true;
+    loadError = '';
+    analysisError = '';
 
     // Load session summary (fast) and config
     Promise.all([api.getSession(sessionId), api.getUserConfig()])
@@ -53,14 +91,14 @@
       })
       .catch((e) => {
         if (cancelled) return;
-        error = extractError(e);
+        loadError = extractError(e);
         loading = false;
       });
 
     // Load analysis (slower, file I/O + computation)
     api.getSessionAnalysis(sessionId)
       .then((a) => { if (!cancelled) analysis = a; })
-      .catch((e) => { if (!cancelled) error = extractError(e); })
+      .catch((e) => { if (!cancelled) analysisError = extractError(e); })
       .finally(() => { if (!cancelled) analysisLoading = false; });
 
     // Load zone ride config (if any)
@@ -84,8 +122,13 @@
       .catch(() => { bestCurve = []; });
   });
 
+  function retry() {
+    reloadToken++;
+  }
+
   async function exportFit() {
     if (!session) return;
+    error = '';
     exportingFit = true;
     try {
       await api.exportSessionFit(session.id);
@@ -122,68 +165,89 @@
   let hasHrHist = $derived(analysis != null && analysis.timeseries.some((p) => p.heart_rate != null));
 </script>
 
-<div class="page">
-  <!-- Back nav -->
-  <a href="/history" class="back-link">
-    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<div class="page-wide detail" data-page="history-detail">
+  <a href="/history" class="btn btn-ghost back">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <polyline points="15 18 9 12 15 6"/>
     </svg>
     History
   </a>
 
-  {#if error}
-    <div class="error-banner">{error}</div>
-  {/if}
-
   {#if loading}
-    <div class="loading-state">
-      <div class="loading-spinner"></div>
-      <p class="loading-text">Loading session...</p>
-    </div>
+    <StateView kind="loading" title="Loading ride…" />
+  {:else if loadError && notFound}
+    <StateView
+      kind="empty"
+      title="Ride not found"
+      message="It may have been deleted."
+      action={{ label: 'Back to History', onclick: () => goto('/history') }}
+    />
+  {:else if loadError}
+    <StateView
+      kind="error"
+      title="Couldn't load this ride"
+      message="The ride is still saved; it just couldn't be read right now."
+      details={loadError}
+      action={{ label: 'Retry', onclick: retry }}
+    />
   {:else if session}
-    <!-- Summary header -->
-    <div class="summary-header">
-      <div class="title-row">
-        <h1>{displayTitle(session)}</h1>
-        {#if session.activity_type}
-          <span class="type-badge">{TYPE_LABELS[session.activity_type] ?? session.activity_type}</span>
-        {/if}
-        {#if session.rpe != null}
-          <span class="rpe-badge" style="color: {rpeColor(session.rpe)}">RPE {session.rpe}</span>
+    <header class="detail-header">
+      <div class="title-block">
+        <div class="title-row">
+          <h1 class="page-title">{displayTitle(session)}</h1>
+          {#if session.activity_type}
+            <span class="type-badge">{TYPE_LABELS[session.activity_type] ?? session.activity_type}</span>
+          {/if}
+          {#if session.rpe != null}
+            <span class="rpe-badge data" style="color: {rpeColor(session.rpe)}">RPE {session.rpe}</span>
+          {/if}
+        </div>
+        <div class="subtitle">{formatDateLong(session.start_time)} · {formatTime(session.start_time)}</div>
+        {#if session.notes}
+          <p class="notes">{session.notes}</p>
         {/if}
       </div>
-      <div class="subtitle">
-        <span>{formatDateLong(session.start_time)}</span>
-        <span class="sep"></span>
-        <span class="time">{formatTime(session.start_time)}</span>
+      <div class="actions">
+        <button type="button" class="btn btn-secondary" onclick={() => (editSession = session)}>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+          Edit
+        </button>
+        <button type="button" class="btn btn-secondary" disabled={exportingFit} onclick={exportFit}>
+          {exportingFit ? 'Exporting…' : 'Export FIT'}
+        </button>
       </div>
-      {#if session.notes}
-        <p class="notes">{session.notes}</p>
-      {/if}
-    </div>
+    </header>
 
-    <!-- Grouped Metrics -->
-    <div class="metrics-groups">
-      <div class="metric-group" style="--group-tint: rgba(100, 181, 246, 0.12)">
-        <span class="group-label">Time</span>
+    {#if error}
+      <div class="notice-slot">
+        <Notice tone="error" ondismiss={() => (error = '')}>{error}</Notice>
+      </div>
+    {/if}
+
+    <div class="groups">
+      <section class="group" style="--panel: var(--panel-time)" aria-label="Time">
+        <h2 class="group-label">Time</h2>
         <div class="group-cards">
           <MetricCard label="Duration" value={formatDuration(session.duration_secs)} size="sm" />
           <MetricCard label="Work" value={session.work_kj != null ? Math.round(session.work_kj) : null} unit="kJ" size="sm" />
         </div>
-      </div>
+      </section>
 
-      <div class="metric-group" style="--group-tint: rgba(255, 167, 38, 0.12)">
-        <span class="group-label">Effort</span>
+      <section class="group" style="--panel: var(--panel-effort)" aria-label="Effort">
+        <h2 class="group-label">Effort</h2>
         <div class="group-cards">
           <MetricCard label="NP" value={session.normalized_power} unit="W" size="sm" />
           <MetricCard label="TSS" value={session.tss != null ? Math.round(session.tss) : null} size="sm" />
           <MetricCard label="IF" value={session.intensity_factor != null ? session.intensity_factor.toFixed(2) : null} size="sm" />
           <MetricCard label="VI" value={session.variability_index != null ? session.variability_index.toFixed(2) : null} size="sm" />
         </div>
-      </div>
+      </section>
 
-      <div class="metric-group" style="--group-tint: rgba(255, 77, 109, 0.12)">
-        <span class="group-label">Power</span>
+      <section class="group" style="--panel: var(--panel-power)" aria-label="Power">
+        <h2 class="group-label">Power</h2>
         <div class="group-cards">
           <MetricCard label="Avg Power" value={session.avg_power} unit="W" size="sm" />
           <MetricCard label="Max Power" value={session.max_power} unit="W" size="sm" />
@@ -193,21 +257,21 @@
             <MetricCard label="PWC170" value={analysis.pwc.pwc170} unit="W" size="sm" />
           {/if}
         </div>
-      </div>
+      </section>
 
       {#if session.avg_hr != null || session.max_hr != null}
-        <div class="metric-group" style="--group-tint: rgba(244, 67, 54, 0.12)">
-          <span class="group-label">Heart Rate</span>
+        <section class="group" style="--panel: var(--panel-hr)" aria-label="Heart rate">
+          <h2 class="group-label">Heart rate</h2>
           <div class="group-cards">
             <MetricCard label="Avg HR" value={session.avg_hr} unit="bpm" size="sm" />
             <MetricCard label="Max HR" value={session.max_hr} unit="bpm" size="sm" />
           </div>
-        </div>
+        </section>
       {/if}
 
       {#if session.avg_cadence != null || session.avg_speed != null || session.distance_km != null}
-        <div class="metric-group" style="--group-tint: rgba(76, 175, 80, 0.12)">
-          <span class="group-label">Movement</span>
+        <section class="group" style="--panel: var(--panel-move)" aria-label="Movement">
+          <h2 class="group-label">Movement</h2>
           <div class="group-cards">
             {#if session.avg_cadence != null}
               <MetricCard label="Avg Cadence" value={Math.round(session.avg_cadence)} unit="rpm" size="sm" />
@@ -229,160 +293,116 @@
               />
             {/if}
           </div>
-        </div>
+        </section>
       {/if}
     </div>
 
-    <!-- Actions -->
-    <div class="actions">
-      <button class="btn-secondary" onclick={() => editSession = session}>
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-        </svg>
-        Edit
-      </button>
-      <button class="btn-secondary" disabled={exportingFit} onclick={exportFit}>
-        {exportingFit ? 'Exporting...' : 'Export FIT'}
-      </button>
-    </div>
-
-    <!-- Time-series chart -->
-    <section class="chart-section">
-      <div class="section-header">
-        <h2>Time Series</h2>
-        <div class="smoothing-toggle">
-          {#each [{ v: 1, l: 'Raw' }, { v: 3, l: '3s' }, { v: 10, l: '10s' }, { v: 30, l: '30s' }] as opt}
-            <button
-              class="smooth-btn"
-              class:active={smoothing === opt.v}
-              onclick={() => smoothing = opt.v}
-            >
-              {opt.l}
-            </button>
-          {/each}
-        </div>
+    {#if analysisError}
+      <div class="panel">
+        <StateView
+          kind="error"
+          title="Couldn't load the charts for this ride"
+          message="The summary above is complete; the detailed recording couldn't be read."
+          details={analysisError}
+          action={{ label: 'Retry', onclick: retry }}
+        />
       </div>
-      <div class="timeseries-wrap">
-        {#if analysisLoading}
-          <div class="chart-skeleton">Loading chart...</div>
-        {:else if analysis && analysis.timeseries.length > 0}
-          <SessionTimeseries timeseries={analysis.timeseries} {smoothing} {units} />
-        {:else}
-          <div class="chart-empty">No time-series data</div>
-        {/if}
-      </div>
-    </section>
-
-    <!-- Zone Ride Analysis (if applicable) -->
-    {#if zoneConfig && analysis && analysis.timeseries.length > 0}
-      <ZoneRideAnalysis
-        config={zoneConfig}
-        timeseries={analysis.timeseries.map((pt) => ({
-          elapsed_secs: pt.elapsed_secs,
-          power: pt.power ?? null,
-          heart_rate: pt.heart_rate ?? null,
-        }))}
-      />
-    {/if}
-
-    <!-- Power Curve + Zone Distribution (two-column) -->
-    <div class="two-col">
+    {:else}
       <section class="chart-section">
         <div class="section-header">
-          <h2>Power Curve</h2>
-          <div class="smoothing-toggle">
-            {#each [{ v: 'all', l: 'All' }, { v: '90d', l: '90d' }, { v: '30d', l: '30d' }] as opt}
-              <button
-                class="smooth-btn"
-                class:active={overlayPeriod === opt.v}
-                onclick={() => overlayPeriod = opt.v}
-              >
-                {opt.l}
-              </button>
-            {/each}
-          </div>
+          <h2 class="section-title">Time series</h2>
+          <SegmentedControl label="Smoothing" options={SMOOTHING} bind:value={smoothing} />
         </div>
-        <div class="panel-wrap">
+        <div class="chart-box timeseries-box">
           {#if analysisLoading}
-            <div class="chart-skeleton">Loading chart...</div>
-          {:else if analysis && analysis.power_curve.length > 0}
-            <PowerCurve
-              powerCurve={analysis.power_curve}
-              ftp={session.ftp}
-              overlays={bestCurve.length > 0
-                ? [{ label: `Best (${overlayPeriod === 'all' ? 'All time' : overlayPeriod})`, data: bestCurve, color: '#4a90d9' }]
-                : []}
-            />
+            <div class="chart-placeholder loading">Loading chart…</div>
+          {:else if analysis && analysis.timeseries.length > 0}
+            <SessionTimeseries timeseries={analysis.timeseries} {smoothing} {units} />
           {:else}
-            <div class="chart-empty">No power data</div>
+            <div class="chart-placeholder">No recorded data for this ride.</div>
           {/if}
         </div>
       </section>
 
-      <section class="zone-section">
-        <h2>Zone Distribution</h2>
-        {#if analysisLoading}
-          <div class="chart-skeleton">Loading zones...</div>
-        {:else if analysis}
-          <ZoneDistribution
-            powerZones={analysis.power_zone_distribution}
-            hrZones={analysis.hr_zone_distribution}
-            ftp={session.ftp}
-            {powerZonePcts}
-            hrZoneBounds={hrZones}
-          />
-        {/if}
-      </section>
-    </div>
+      {#if zoneConfig && analysis && analysis.timeseries.length > 0}
+        <ZoneRideAnalysis
+          config={zoneConfig}
+          timeseries={analysis.timeseries.map((pt) => ({
+            elapsed_secs: pt.elapsed_secs,
+            power: pt.power ?? null,
+            heart_rate: pt.heart_rate ?? null,
+          }))}
+        />
+      {/if}
 
-    <!-- Power + HR Distribution (two-column) -->
-    {#if hasPowerHist || hasHrHist}
-      <div class="dist-row">
-        {#if hasPowerHist}
-          <section class="chart-section">
-            <div class="section-header">
-              <h2>Power Distribution</h2>
-              <div class="smoothing-toggle">
-                {#each [{ v: 10, l: '10W' }, { v: 20, l: '20W' }, { v: 50, l: '50W' }] as opt}
-                  <button
-                    class="smooth-btn"
-                    class:active={histBucket === opt.v}
-                    onclick={() => histBucket = opt.v}
-                  >
-                    {opt.l}
-                  </button>
-                {/each}
-              </div>
-            </div>
-            <div class="panel-wrap">
-              <PowerHistogram timeseries={analysis!.timeseries} bucketWidth={histBucket} ftp={session.ftp} />
-            </div>
-          </section>
-        {/if}
+      <div class="two-col">
+        <section class="chart-section">
+          <div class="section-header">
+            <h2 class="section-title">Power curve</h2>
+            <SegmentedControl label="Compare with best from" options={PERIODS} bind:value={overlayPeriod} />
+          </div>
+          <div class="chart-box panel-box">
+            {#if analysisLoading}
+              <div class="chart-placeholder loading">Loading chart…</div>
+            {:else if analysis && analysis.power_curve.length > 0}
+              <PowerCurve
+                powerCurve={analysis.power_curve}
+                ftp={session.ftp}
+                overlays={bestCurve.length > 0
+                  ? [{ label: `Best (${overlayPeriod === 'all' ? 'All time' : overlayPeriod})`, data: bestCurve, color: SERIES.best }]
+                  : []}
+              />
+            {:else}
+              <div class="chart-placeholder">No power data for this ride.</div>
+            {/if}
+          </div>
+        </section>
 
-        {#if hasHrHist}
-          <section class="chart-section">
-            <div class="section-header">
-              <h2>HR Distribution</h2>
-              <div class="smoothing-toggle">
-                {#each [{ v: 3, l: '3 bpm' }, { v: 5, l: '5 bpm' }, { v: 10, l: '10 bpm' }] as opt}
-                  <button
-                    class="smooth-btn"
-                    class:active={hrHistBucket === opt.v}
-                    onclick={() => hrHistBucket = opt.v}
-                  >
-                    {opt.l}
-                  </button>
-                {/each}
-              </div>
-            </div>
-            <div class="panel-wrap">
-              <HrHistogram timeseries={analysis!.timeseries} bucketWidth={hrHistBucket} {hrZones} />
-            </div>
-          </section>
-        {/if}
+        <section class="chart-section">
+          <div class="section-header">
+            <h2 class="section-title">Zone distribution</h2>
+          </div>
+          {#if analysisLoading}
+            <div class="chart-box panel-box"><div class="chart-placeholder loading">Loading zones…</div></div>
+          {:else if analysis}
+            <ZoneDistribution
+              powerZones={analysis.power_zone_distribution}
+              hrZones={analysis.hr_zone_distribution}
+              ftp={session.ftp}
+              {powerZonePcts}
+              hrZoneBounds={hrZones}
+            />
+          {/if}
+        </section>
       </div>
+
+      {#if hasPowerHist || hasHrHist}
+        <div class="two-col">
+          {#if hasPowerHist}
+            <section class="chart-section">
+              <div class="section-header">
+                <h2 class="section-title">Power distribution</h2>
+                <SegmentedControl label="Bucket size" options={POWER_BUCKETS} bind:value={histBucket} />
+              </div>
+              <div class="chart-box panel-box">
+                <PowerHistogram timeseries={analysis!.timeseries} bucketWidth={histBucket} ftp={session.ftp} />
+              </div>
+            </section>
+          {/if}
+
+          {#if hasHrHist}
+            <section class="chart-section">
+              <div class="section-header">
+                <h2 class="section-title">Heart rate distribution</h2>
+                <SegmentedControl label="Bucket size" options={HR_BUCKETS} bind:value={hrHistBucket} />
+              </div>
+              <div class="chart-box panel-box">
+                <HrHistogram timeseries={analysis!.timeseries} bucketWidth={hrHistBucket} {hrZones} />
+              </div>
+            </section>
+          {/if}
+        </div>
+      {/if}
     {/if}
   {/if}
 </div>
@@ -398,145 +418,101 @@
 {/if}
 
 <style>
-  .page {
-    max-width: 100%;
+  .detail {
     padding-bottom: var(--space-3xl);
   }
 
-  .back-link {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-xs);
-    color: var(--text-muted);
-    text-decoration: none;
-    font-size: var(--text-sm);
-    font-weight: 600;
+  .back {
+    margin: 0 0 var(--space-md) calc(-1 * var(--space-md));
+  }
+
+  .detail-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-md) var(--space-xl);
     margin-bottom: var(--space-lg);
-    transition: color var(--transition-fast);
   }
 
-  .back-link svg {
-    transition: transform var(--transition-fast);
-  }
-
-  .back-link:hover {
-    color: var(--accent);
-  }
-
-  .back-link:hover svg {
-    transform: translateX(-2px);
-  }
-
-  .loading-state {
-    text-align: center;
-    padding: var(--space-3xl) var(--space-lg);
-  }
-
-  .loading-spinner {
-    display: inline-block;
-    width: 24px;
-    height: 24px;
-    border: 2.5px solid var(--border-strong);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin-bottom: var(--space-md);
-  }
-
-  .loading-text {
-    color: var(--text-muted);
-    font-size: var(--text-base);
-    margin: 0;
-  }
-
-  /* --- Summary Header --- */
-  .summary-header {
-    margin-bottom: var(--space-lg);
+  .title-block {
+    min-width: 0;
+    flex: 1 1 420px;
   }
 
   .title-row {
     display: flex;
     align-items: center;
-    gap: var(--space-sm);
     flex-wrap: wrap;
+    gap: var(--space-sm) var(--space-md);
     margin-bottom: 4px;
-  }
-
-  h1 {
-    margin: 0;
-    font-size: var(--text-2xl);
-    font-weight: 800;
   }
 
   .type-badge {
     padding: 2px var(--space-sm);
     border-radius: var(--radius-full);
     background: var(--accent-soft);
-    color: var(--accent);
+    color: var(--text-primary);
     font-size: var(--text-xs);
     font-weight: 600;
     white-space: nowrap;
   }
 
   .rpe-badge {
-    font-size: var(--text-xs);
+    font-size: var(--text-sm);
     font-weight: 700;
-    font-family: var(--font-data);
   }
 
   .subtitle {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    font-size: var(--text-sm);
     color: var(--text-secondary);
-  }
-
-  .sep {
-    width: 3px;
-    height: 3px;
-    border-radius: 50%;
-    background: var(--text-faint);
-  }
-
-  .time {
-    color: var(--text-muted);
-    font-size: var(--text-xs);
+    font-size: var(--text-sm);
   }
 
   .notes {
+    max-width: 80ch;
     margin: var(--space-sm) 0 0;
+    color: var(--text-secondary);
     font-size: var(--text-sm);
-    color: var(--text-muted);
     font-style: italic;
   }
 
-  /* --- Grouped Metrics --- */
-  .metrics-groups {
+  .actions {
     display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-md);
+    gap: var(--space-sm);
+  }
+
+  .notice-slot {
     margin-bottom: var(--space-lg);
   }
 
-  .metric-group {
+  /* --- Summary groups --- */
+  /* Groups size to their cards and wrap; cards never exceed 360px */
+  .groups {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+    margin-bottom: var(--space-2xl);
+  }
+
+  .group {
+    flex: 1 1 auto;
+    min-width: min(100%, 260px);
     display: flex;
     flex-direction: column;
-    gap: var(--space-xs);
-    flex: 1 1 auto;
-    min-width: 250px;
-    background: var(--group-tint, transparent);
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-md) var(--space-md);
     border-radius: var(--radius-lg);
-    padding: var(--space-sm) var(--space-md);
+    background: var(--panel, transparent);
   }
 
   .group-label {
-    font-size: var(--text-xs);
-    color: var(--text-faint);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    font-weight: 600;
+    margin: 0;
     padding-left: 2px;
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
   }
 
   .group-cards {
@@ -546,119 +522,66 @@
   }
 
   .group-cards > :global(*) {
-    min-width: 120px;
-    flex: 1 1 0;
+    flex: 1 1 120px;
+    max-width: 360px;
   }
 
-  /* --- Actions --- */
-  .actions {
-    display: flex;
-    gap: var(--space-sm);
-    margin-bottom: var(--space-xl);
+  /* MetricCard's small size draws its unit at 0.5em (11px); keep units at the 12px floor */
+  .group-cards :global(.unit) {
+    font-size: max(0.5em, var(--text-xs));
   }
 
-  .btn-secondary {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-xs);
-    padding: var(--space-xs) var(--space-md);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-md);
-    background: var(--bg-elevated);
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .btn-secondary:hover:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .btn-secondary:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
-  /* --- Chart Sections --- */
+  /* --- Charts --- */
   .chart-section {
-    margin-bottom: var(--space-xl);
-  }
-
-  .chart-section h2, .zone-section h2 {
-    margin: 0 0 var(--space-md);
-    font-size: var(--text-base);
-    font-weight: 700;
-    color: var(--text-primary);
+    min-width: 0;
+    margin-bottom: var(--space-2xl);
   }
 
   .section-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-sm) var(--space-md);
     margin-bottom: var(--space-md);
   }
 
-  .section-header h2 {
+  .section-header .section-title {
     margin: 0;
   }
 
-  .smoothing-toggle {
-    display: flex;
-    gap: 2px;
-    background: var(--bg-body);
-    border-radius: var(--radius-md);
-    padding: 3px;
-  }
-
-  .smooth-btn {
-    padding: 4px 10px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .smooth-btn:hover {
-    color: var(--text-secondary);
-  }
-
-  .smooth-btn.active {
-    background: var(--bg-elevated);
-    color: var(--accent);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .timeseries-wrap {
+  .chart-box {
     position: relative;
-    height: 400px;
   }
 
-  .panel-wrap {
-    position: relative;
-    height: 350px;
+  .timeseries-box {
+    height: clamp(320px, 45vh, 560px);
   }
 
-  .chart-skeleton, .chart-empty {
+  .panel-box {
+    height: clamp(300px, 38vh, 460px);
+  }
+
+  .panel {
+    margin-bottom: var(--space-2xl);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    background: var(--bg-surface);
+  }
+
+  .chart-placeholder {
     display: flex;
     align-items: center;
     justify-content: center;
     height: 100%;
-    background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-lg);
-    color: var(--text-muted);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
     font-size: var(--text-sm);
   }
 
-  .chart-skeleton {
+  .chart-placeholder.loading {
     animation: pulse 1.5s ease-in-out infinite;
   }
 
@@ -667,35 +590,19 @@
     50% { opacity: 1; }
   }
 
-  /* --- Two Column Layout --- */
   .two-col {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-xl);
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0 var(--space-xl);
   }
 
-  .zone-section {
-    margin-bottom: var(--space-xl);
-  }
-
-  /* --- Distribution Row (Power + HR histograms) --- */
-  .dist-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-xl);
-  }
-
-  .dist-row > :only-child {
-    grid-column: 1 / -1;
-  }
-
-  @media (max-width: 720px) {
+  @media (min-width: 1200px) {
     .two-col {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     }
 
-    .dist-row {
-      grid-template-columns: 1fr;
+    .two-col > :only-child {
+      grid-column: 1 / -1;
     }
   }
 </style>

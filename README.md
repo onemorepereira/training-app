@@ -34,6 +34,16 @@ A desktop app for indoor cycling. It reads heart rate, power, cadence, and speed
 
 - Athlete profile (FTP, weight, date of birth, sex, resting/max HR), metric or imperial units, custom HR and power zones
 
+### Using the ride screen
+
+- **Fit and scaling:** the ride screen fits any window from 800×600 up. The numbers grow with the space you give them, and Start/Stop, Pause and the trainer controls always stay visible.
+- **Fullscreen:**
+  - To enter, press **F11** on Linux or **⌃⌘F** on macOS, or use the fullscreen button.
+  - To leave, press **Esc** or move the pointer and click **Exit fullscreen**.
+- **Esc:** closes the open dialog first. Otherwise it leaves fullscreen.
+- **Trainer:** with a trainer connected, **↑/↓** adjust the trainer target. Hold **Shift** for bigger steps.
+- **Offline:** the app makes no network requests for its interface. It uses your system font plus a bundled monospace font for numbers.
+
 ## Install
 
 Download the latest build from [Releases](https://github.com/onemorepereira/training-app/releases).
@@ -135,6 +145,7 @@ npm run build:release   # production bundles in src-tauri/target/release/bundle/
 cd src-tauri && cargo test   # Rust unit tests
 npm test                     # Frontend unit tests (Vitest)
 npm run check                # Svelte/TypeScript type checking
+npm run ui:check             # UI rules in Chromium + WebKit (see tools/ui-harness)
 ```
 
 ## Contributing

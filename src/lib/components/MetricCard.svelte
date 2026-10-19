@@ -113,7 +113,7 @@
   .lg .value { font-size: 3.5rem; }
 
   .unit {
-    font-size: 0.5em;
+    font-size: max(12px, 0.5em);
     font-weight: 500;
     color: var(--text-muted);
     margin-left: 0.3em;
@@ -142,7 +142,7 @@
 
   .stage .unit,
   .stage-sm .unit {
-    font-size: 0.45em;
+    font-size: max(12px, 0.45em);
   }
 
   .stage-sm .label {

@@ -8,7 +8,6 @@
   import { createDisposeGuard } from '$lib/utils/disposeGuard';
   import {
     connectedDevices,
-    refreshDevices,
     scanDevices as storeScan,
     connectDevice as storeConnect,
     disconnectDevice as storeDisconnect,
@@ -16,6 +15,9 @@
   } from '$lib/stores/devices';
   import { get } from 'svelte/store';
   import { unitSystem, formatSpeed } from '$lib/stores/units';
+  import Dialog from '$lib/ui/Dialog.svelte';
+  import Notice from '$lib/ui/Notice.svelte';
+  import StateView from '$lib/ui/StateView.svelte';
 
   let scanning = $state(false);
   let error = $state('');
@@ -25,30 +27,40 @@
   const guard = createDisposeGuard();
 
   let detailModal = $state<DeviceDetails | null>(null);
+  let detailOpen = $state(false);
   let detailLoading = $state('');
-  let detailDialogEl = $state<HTMLDialogElement | null>(null);
   let connectingIds = $state<Set<string>>(new Set());
   let disconnectingIds = $state<Set<string>>(new Set());
 
-  $effect(() => {
-    if (detailModal && detailDialogEl && !detailDialogEl.open) {
-      detailDialogEl.showModal();
-    }
-  });
+  /** First load: 'loading' until the known-devices list arrives, 'error' if it can't be read. */
+  let loadState = $state<'loading' | 'ready' | 'error'>('loading');
+  let loadError = $state('');
 
-  onMount(async () => {
-    await refreshDevices();
+  async function load() {
+    loadError = '';
+    try {
+      connectedDevices.set(await api.getKnownDevices());
+      loadState = 'ready';
+    } catch (e) {
+      loadError = extractError(e);
+      loadState = 'error';
+      return;
+    }
     try {
       primaryDevices = await api.getPrimaryDevices();
     } catch { /* no primaries yet */ }
+  }
+
+  onMount(async () => {
+    await load();
 
     if (guard.disposed) return;
     const unlisten = await listen<SensorReading>('sensor_reading', (event) => {
       const r = event.payload;
       if (r.Power) {
-        sensorPreview['Power'] = `${r.Power.watts}W`;
+        sensorPreview['Power'] = `${r.Power.watts} W`;
         if (r.Power.device_id) {
-          sensorPreview[`Power:${r.Power.device_id}`] = `${r.Power.watts}W`;
+          sensorPreview[`Power:${r.Power.device_id}`] = `${r.Power.watts} W`;
           if (r.Power.pedal_balance != null) {
             const bal = r.Power.pedal_balance;
             pedalLabels[r.Power.device_id] = bal > 80 ? 'Right pedal' : 'Combined (L+R)';
@@ -75,6 +87,8 @@
     error = '';
     try {
       await storeScan();
+      // A scan that works means the device list is readable again: reload it fully (incl. primaries).
+      if (loadState === 'error') await load();
     } catch (e) {
       error = extractError(e);
     } finally {
@@ -167,6 +181,7 @@
     error = '';
     try {
       detailModal = await api.getDeviceDetails(device.id);
+      detailOpen = true;
     } catch (e) {
       error = extractError(e);
     } finally {
@@ -175,8 +190,34 @@
   }
 
   function closeModal() {
-    detailDialogEl?.close();
+    detailOpen = false;
     detailModal = null;
+  }
+
+  const transportName = (d: DeviceInfo) => (d.transport === 'Ble' ? 'BLE' : 'ANT+');
+
+  /** Button label for one transport of a (possibly linked) device. */
+  function actionLabel(td: DeviceInfo, all: DeviceInfo[]): string {
+    const action = actionFor(td);
+    if (all.length < 2) return action.label;
+    const otherConnected = all.some((d) => d.id !== td.id && d.status === 'Connected');
+    if (action.kind === 'connect' && otherConnected) return `Also connect ${transportName(td)}`;
+    return `${action.label} ${transportName(td)}`;
+  }
+
+  function actionClass(td: DeviceInfo, all: DeviceInfo[]): string {
+    const action = actionFor(td);
+    if (action.kind === 'disconnect') return 'btn-secondary btn-danger-text';
+    if (action.kind === 'stop') return 'btn-secondary';
+    return all.some((d) => d.status === 'Connected') ? 'btn-secondary' : 'btn-primary';
+  }
+
+  function statusOf(all: DeviceInfo[]): { label: string; tone: 'on' | 'busy' | 'off' } {
+    if (all.some((d) => d.status === 'Connected')) return { label: 'Connected', tone: 'on' };
+    if (all.some((d) => d.status === 'Reconnecting')) return { label: 'Searching…', tone: 'busy' };
+    if (all.some((d) => d.status === 'Connecting' || connectingIds.has(d.id))) return { label: 'Connecting…', tone: 'busy' };
+    if (all.every((d) => d.in_range === false)) return { label: 'Not in range', tone: 'off' };
+    return { label: 'Available', tone: 'off' };
   }
 
   function shortUuid(uuid: string): string {
@@ -249,383 +290,229 @@
   });
 </script>
 
-<div class="page">
-  <div class="page-header">
-    <h1>Devices</h1>
-    <button class="scan-btn" onclick={scan} disabled={scanning}>
+<div class="page-wide" data-page="devices">
+  <header class="page-header">
+    <h1 class="page-title">Devices</h1>
+    <button type="button" class="btn btn-primary" onclick={scan} disabled={scanning || loadState === 'loading'}>
       {#if scanning}
-        <span class="scan-spinner"></span>
-        Scanning...
+        <span class="spinner" aria-hidden="true"></span>
+        Scanning…
       {:else}
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="11" cy="11" r="8"/>
           <line x1="21" y1="21" x2="16.65" y2="16.65"/>
         </svg>
-        Scan
+        Scan for devices
       {/if}
     </button>
-  </div>
+  </header>
 
   <SetupBanner />
 
   {#if error}
-    <div class="error-banner">{error}</div>
-  {/if}
-
-  {#if $connectedDevices.length === 0 && !scanning}
-    <div class="empty-state">
-      <div class="empty-icon">
-        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M4.9 16.1C1 12.2 1 5.8 4.9 1.9"/>
-          <path d="M7.8 4.7a6.14 6.14 0 0 0-.8 7.5"/>
-          <circle cx="12" cy="9" r="2"/>
-          <path d="M16.2 4.8c2 2 2.26 5.11.8 7.47"/>
-          <path d="M19.1 1.9a9.96 9.96 0 0 1 0 14.1"/>
-          <path d="M9.5 18h5"/>
-          <path d="m8 22 4-11 4 11"/>
-        </svg>
-      </div>
-      <p class="empty-text">No devices found</p>
-      <p class="empty-hint">Click Scan to search for BLE and ANT+ devices</p>
+    <div class="notice-slot">
+      <Notice tone="error" ondismiss={() => (error = '')}>{error}</Notice>
     </div>
   {/if}
 
-  {#each groupedDevices as group}
-    <div class="device-group">
-      <div class="group-header">
-        <span class="group-icon">
-          {#if group.type === 'HeartRate'}
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/>
-            </svg>
-          {:else if group.type === 'Power'}
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-            </svg>
-          {:else if group.type === 'CadenceSpeed'}
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="23 4 23 10 17 10"/>
-              <polyline points="1 20 1 14 7 14"/>
-              <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
-            </svg>
-          {:else if group.type === 'FitnessTrainer'}
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="5" cy="18" r="3"/>
-              <circle cx="19" cy="18" r="3"/>
-              <path d="M12 2l-3.5 7H15l-2 6"/>
-              <line x1="8" y1="18" x2="16" y2="18"/>
-            </svg>
-          {:else}
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="10"/>
-              <line x1="12" y1="8" x2="12" y2="12"/>
-              <line x1="12" y1="16" x2="12.01" y2="16"/>
-            </svg>
-          {/if}
-        </span>
-        <span class="group-label">{deviceTypeLabel(group.type)}</span>
-        <span class="group-count">{group.devices.length}</span>
-      </div>
-      <div class="device-list">
-        {#each group.devices as dd}
-          {@const device = dd.primary}
-          {@const allTransports = [device, ...dd.linked]}
-          <div class="device-card" class:connected={allTransports.some(d => d.status === 'Connected')} class:out-of-range={!allTransports.some(d => d.status === 'Connected') && allTransports.every(d => d.in_range === false)}>
-            <div class="device-info">
-              <div class="device-header">
-                <span class="device-name">{device.name ?? 'Unknown Device'}</span>
-                {#if pedalLabels[device.id]}
-                  <span class="pedal-label">{pedalLabels[device.id]}</span>
-                {/if}
-                {#each allTransports as td}
-                  {#if td.transport === 'AntPlus'}
-                    <span class="transport-badge ant" class:transport-connected={td.status === 'Connected'}>
-                      <svg viewBox="0 0 24 24" width="16" height="16" aria-label="ANT+">
-                        <line x1="13" y1="13" x2="7.5" y2="5" stroke="currentColor" stroke-width="2"/>
-                        <line x1="13" y1="13" x2="4.5" y2="18.5" stroke="currentColor" stroke-width="2"/>
-                        <circle cx="13" cy="13" r="5" fill="currentColor"/>
-                        <circle cx="7.5" cy="5" r="2.5" fill="currentColor"/>
-                        <circle cx="4.5" cy="18.5" r="1.8" fill="currentColor"/>
-                        <line x1="19" y1="2" x2="19" y2="7" stroke="currentColor" stroke-width="1.8"/>
-                        <line x1="16.5" y1="4.5" x2="21.5" y2="4.5" stroke="currentColor" stroke-width="1.8"/>
-                      </svg>
+  {#if loadState === 'loading'}
+    <StateView kind="loading" title="Loading your devices…" />
+  {:else if loadState === 'error'}
+    <StateView kind="error" title="Couldn't load your devices" message="The app couldn't read its saved device list. Retry, and restart the app if it keeps happening." details={loadError} action={{ label: 'Retry', onclick: load }} />
+  {:else if $connectedDevices.length === 0}
+    {#if scanning}
+      <StateView kind="loading" title="Looking for devices…" message="Make sure your sensors are awake: spin the cranks or put on the strap." />
+    {:else}
+      <StateView
+        kind="empty"
+        title="No devices yet"
+        message="Turn on your sensors and trainer, then scan for Bluetooth and ANT+ devices nearby."
+        action={{ label: 'Scan for devices', onclick: scan }}
+      />
+    {/if}
+  {:else}
+    {#each groupedDevices as group (group.type)}
+      <section class="device-group" aria-labelledby="group-{group.type}">
+        <h2 class="group-header" id="group-{group.type}">
+          <span class="group-icon" aria-hidden="true">
+            {#if group.type === 'HeartRate'}
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/></svg>
+            {:else if group.type === 'Power'}
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            {:else if group.type === 'CadenceSpeed'}
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+            {:else if group.type === 'FitnessTrainer'}
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="M12 2l-3.5 7H15l-2 6"/><line x1="8" y1="18" x2="16" y2="18"/></svg>
+            {:else}
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            {/if}
+          </span>
+          {deviceTypeLabel(group.type)}
+          <span class="group-count">{group.devices.length}</span>
+        </h2>
+
+        <ul class="device-list">
+          {#each group.devices as dd (dd.primary.id)}
+            {@const device = dd.primary}
+            {@const allTransports = [device, ...dd.linked]}
+            {@const st = statusOf(allTransports)}
+            {@const preview = device.status === 'Connected' ? (sensorPreview[`${device.device_type}:${device.id}`] ?? sensorPreview[device.device_type]) : undefined}
+            <li class="device-row" class:connected={st.tone === 'on'}>
+              <div class="device-main">
+                <div class="device-title">
+                  <span class="device-name">{device.name ?? 'Unknown device'}</span>
+                  {#each allTransports as td (td.id)}
+                    <span class="badge transport" class:transport-on={td.status === 'Connected'} title={td.status === 'Connected' ? `Connected over ${td.transport === 'Ble' ? 'Bluetooth' : 'ANT+'}` : undefined}>
+                      {#if td.transport === 'AntPlus'}
+                        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><line x1="13" y1="13" x2="7.5" y2="5" stroke="currentColor" stroke-width="2"/><line x1="13" y1="13" x2="4.5" y2="18.5" stroke="currentColor" stroke-width="2"/><circle cx="13" cy="13" r="5" fill="currentColor"/><circle cx="7.5" cy="5" r="2.5" fill="currentColor"/><circle cx="4.5" cy="18.5" r="1.8" fill="currentColor"/></svg>
+                        ANT+
+                      {:else}
+                        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M7 7l10 10-5 5V2l5 5L7 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                        BLE
+                      {/if}
                     </span>
-                  {:else}
-                    <span class="transport-badge ble" class:transport-connected={td.status === 'Connected'}>
-                      <svg viewBox="0 0 24 24" width="16" height="16" aria-label="Bluetooth">
-                        <circle cx="12" cy="12" r="12" fill="#4285F4"/>
-                        <path d="M12.5 5L16 8.5l-3 3 3 3L12.5 18v-4.5L9.5 16.5l-1-1 3.5-3.5-3.5-3.5 1-1 3 3V5z" fill="white" stroke="white" stroke-width="0.6" stroke-linejoin="round"/>
-                      </svg>
+                  {/each}
+                  {#if device.status === 'Connected' && isPrimary(device)}
+                    <span class="badge primary">Primary</span>
+                  {/if}
+                </div>
+
+                <div class="device-meta">
+                  <span class="meta status-{st.tone}"><span class="dot" aria-hidden="true"></span>{st.label}</span>
+                  {#if device.battery_level != null}
+                    <span class="meta" title="Battery">
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="7" width="17" height="10" rx="2"/><line x1="22" y1="11" x2="22" y2="13"/><rect x="4" y="9" width={Math.max(1, Math.round(13 * device.battery_level / 100))} height="6" fill="currentColor" stroke="none"/></svg>
+                      <span class="sr-only">Battery</span>{device.battery_level}%
                     </span>
+                  {/if}
+                  {#if device.rssi != null}
+                    <span class="meta" title="{device.rssi} dBm">
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="20" x2="4" y2="16"/><line x1="10" y1="20" x2="10" y2="12"/><line x1="16" y1="20" x2="16" y2="8" opacity={device.rssi > -80 ? 1 : 0.3}/><line x1="22" y1="20" x2="22" y2="4" opacity={device.rssi > -60 ? 1 : 0.3}/></svg>
+                      <span class="sr-only">Signal</span>{rssiLabel(device.rssi)} signal
+                    </span>
+                  {/if}
+                  {#if dd.linked.length > 0}
+                    <span class="meta">Linked BLE + ANT+</span>
+                  {/if}
+                  {#if pedalLabels[device.id]}
+                    <span class="meta">{pedalLabels[device.id]}</span>
+                  {/if}
+                  {#if preview}
+                    <span class="meta live data" title="Live reading">{preview}</span>
+                  {/if}
+                </div>
+              </div>
+
+              <div class="device-actions">
+                {#each allTransports as td (td.id)}
+                  {#if td.status === 'Connected'}
+                    <button type="button" class="btn btn-ghost" onclick={() => showDetails(td)} disabled={detailLoading === td.id}>
+                      {#if detailLoading === td.id}<span class="spinner" aria-hidden="true"></span>{/if}
+                      Details{#if dd.linked.length > 0}{' '}({transportName(td)}){/if}
+                    </button>
+                    {#if !isPrimary(td)}
+                      <button type="button" class="btn btn-ghost" onclick={() => setPrimary(td)}>Set as primary</button>
+                    {/if}
                   {/if}
                 {/each}
-                {#if allTransports.some(d => d.status === 'Connected')}
-                  <span class="connected-dot"></span>
-                {/if}
-                {#if device.status === 'Connected' && isPrimary(device)}
-                  <span class="primary-badge">Primary</span>
-                {/if}
-              </div>
-              <div class="device-meta">
-                {#if device.battery_level != null}
-                  <span class="meta-item battery">{device.battery_level}%</span>
-                {/if}
-                {#if device.rssi != null}
-                  <span class="meta-item" title="{device.rssi} dBm">
-                    {rssiLabel(device.rssi)}
-                  </span>
-                {/if}
                 {#if dd.linked.length > 0}
-                  <span class="meta-item linked-badge">Linked</span>
+                  <button type="button" class="btn btn-ghost" onclick={() => unlinkDevice(device)}>Unlink</button>
                 {/if}
-                {#if !allTransports.some(d => d.status === 'Connected') && allTransports.every(d => d.in_range === false)}
-                  <span class="meta-item out-of-range-badge">Not in range</span>
-                {/if}
-              </div>
-            </div>
-            {#if device.status === 'Connected' && (sensorPreview[`${device.device_type}:${device.id}`] || sensorPreview[device.device_type])}
-              <div class="sensor-preview">{sensorPreview[`${device.device_type}:${device.id}`] ?? sensorPreview[device.device_type]}</div>
-            {/if}
-            <div class="device-actions">
-              {#if dd.linked.length > 0}
-                <button class="action-btn ghost" onclick={() => unlinkDevice(device)} aria-label="Unlink devices">
-                  Unlink
-                </button>
-              {/if}
-              {#each allTransports as td}
-                {#if td.status === 'Connected'}
+                {#each allTransports as td (td.id)}
+                  {@const action = actionFor(td)}
                   <button
-                    class="action-btn ghost info-btn"
-                    onclick={() => showDetails(td)}
-                    disabled={detailLoading === td.id}
-                    aria-label="Device details"
+                    type="button"
+                    class="btn {actionClass(td, allTransports)}"
+                    disabled={action.disabled}
+                    title={action.disabled && action.kind === 'connect' ? 'Not in range: wake the sensor and scan again' : undefined}
+                    onclick={() => toggleConnection(td)}
                   >
-                    {#if detailLoading === td.id}
-                      <span class="btn-spinner"></span>
-                    {:else}
-                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="10"/>
-                        <line x1="12" y1="16" x2="12" y2="12"/>
-                        <line x1="12" y1="8" x2="12.01" y2="8"/>
-                      </svg>
-                    {/if}
+                    {#if action.busy}<span class="spinner" aria-hidden="true"></span>{/if}
+                    {actionLabel(td, allTransports)}
                   </button>
-                {/if}
-                {#if td.status === 'Connected' && !isPrimary(td)}
-                  <button class="action-btn ghost" onclick={() => setPrimary(td)}>
-                    Set Primary
-                  </button>
-                {/if}
-                {@const action = actionFor(td)}
-                {#if action.searching}
-                  <span class="searching-hint">Searching…</span>
-                {/if}
-                <button
-                  class="action-btn"
-                  class:danger={action.kind !== 'connect' && !action.disabled}
-                  disabled={action.disabled}
-                  onclick={() => toggleConnection(td)}
-                >
-                  {#if action.busy}
-                    <span class="btn-spinner"></span>
-                  {/if}
-                  {action.label}{#if dd.linked.length > 0}{' '}{td.transport === 'Ble' ? 'BLE' : 'ANT+'}{/if}
-                </button>
-              {/each}
-            </div>
-          </div>
-        {/each}
-      </div>
-    </div>
-  {/each}
+                {/each}
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/each}
+  {/if}
 </div>
 
 {#if detailModal}
-  <dialog bind:this={detailDialogEl} class="modal-dialog" onclose={closeModal}>
-    <div class="modal">
-      <div class="modal-header">
-        <h2>{detailModal.name ?? 'Unknown Device'}</h2>
-        <button class="modal-close" onclick={closeModal} aria-label="Close">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-        </button>
-      </div>
+  <Dialog bind:open={detailOpen} title={detailModal.name ?? 'Unknown device'} description={deviceTypeLabel(detailModal.device_type)} onclose={closeModal} width="lg">
+    <section class="detail-section">
+      <h3>Connection</h3>
+      <dl class="detail-grid">
+        <dt>ID</dt><dd class="data">{detailModal.id}</dd>
+        <dt>Transport</dt><dd>{detailModal.transport === 'Ble' ? 'Bluetooth LE' : 'ANT+'}</dd>
+        {#if detailModal.rssi != null}<dt>Signal</dt><dd class="data">{detailModal.rssi} dBm ({rssiLabel(detailModal.rssi)})</dd>{/if}
+        {#if detailModal.battery_level != null}<dt>Battery</dt><dd class="data">{detailModal.battery_level}%</dd>{/if}
+      </dl>
+    </section>
 
-      <div class="modal-body">
-        <div class="detail-section">
-          <h3>Connection</h3>
-          <div class="detail-grid">
-            <span class="detail-label">ID</span>
-            <span class="detail-value mono">{detailModal.id}</span>
-            <span class="detail-label">Transport</span>
-            <span class="detail-value">{detailModal.transport === 'Ble' ? 'Bluetooth LE' : 'ANT+'}</span>
-            <span class="detail-label">Type</span>
-            <span class="detail-value">{deviceTypeLabel(detailModal.device_type)}</span>
-            {#if detailModal.rssi != null}
-              <span class="detail-label">RSSI</span>
-              <span class="detail-value mono">{detailModal.rssi} dBm</span>
-            {/if}
-            {#if detailModal.battery_level != null}
-              <span class="detail-label">Battery</span>
-              <span class="detail-value">{detailModal.battery_level}%</span>
-            {/if}
-          </div>
-        </div>
+    {#if detailModal.manufacturer || detailModal.model_number || detailModal.serial_number || detailModal.firmware_revision || detailModal.hardware_revision || detailModal.software_revision}
+      <section class="detail-section">
+        <h3>Device information</h3>
+        <dl class="detail-grid">
+          {#if detailModal.manufacturer}<dt>Manufacturer</dt><dd>{detailModal.manufacturer}</dd>{/if}
+          {#if detailModal.model_number}<dt>Model</dt><dd>{detailModal.model_number}</dd>{/if}
+          {#if detailModal.serial_number}<dt>Serial</dt><dd class="data">{detailModal.serial_number}</dd>{/if}
+          {#if detailModal.firmware_revision}<dt>Firmware</dt><dd class="data">{detailModal.firmware_revision}</dd>{/if}
+          {#if detailModal.hardware_revision}<dt>Hardware</dt><dd class="data">{detailModal.hardware_revision}</dd>{/if}
+          {#if detailModal.software_revision}<dt>Software</dt><dd class="data">{detailModal.software_revision}</dd>{/if}
+        </dl>
+      </section>
+    {/if}
 
-        {#if detailModal.manufacturer || detailModal.model_number || detailModal.serial_number || detailModal.firmware_revision || detailModal.hardware_revision || detailModal.software_revision}
-          <div class="detail-section">
-            <h3>Device Information</h3>
-            <div class="detail-grid">
-              {#if detailModal.manufacturer}
-                <span class="detail-label">Manufacturer</span>
-                <span class="detail-value">{detailModal.manufacturer}</span>
+    {#if detailModal.services.length > 0}
+      <section class="detail-section">
+        <h3>GATT services</h3>
+        <ul class="services">
+          {#each detailModal.services as service (service.uuid)}
+            <li class="service">
+              <div class="service-head">
+                <span class="service-name">{service.name ?? 'Unknown service'}</span>
+                <span class="uuid data">{shortUuid(service.uuid)}</span>
+              </div>
+              {#if service.characteristics.length > 0}
+                <ul class="chars">
+                  {#each service.characteristics as char (char.uuid)}
+                    <li class="char">
+                      <span class="char-name">{char.name ?? shortUuid(char.uuid)}</span>
+                      <span class="uuid data">{shortUuid(char.uuid)}</span>
+                      <span class="props">
+                        {#each char.properties as prop}<span class="prop">{prop}</span>{/each}
+                      </span>
+                    </li>
+                  {/each}
+                </ul>
               {/if}
-              {#if detailModal.model_number}
-                <span class="detail-label">Model</span>
-                <span class="detail-value">{detailModal.model_number}</span>
-              {/if}
-              {#if detailModal.serial_number}
-                <span class="detail-label">Serial</span>
-                <span class="detail-value mono">{detailModal.serial_number}</span>
-              {/if}
-              {#if detailModal.firmware_revision}
-                <span class="detail-label">Firmware</span>
-                <span class="detail-value mono">{detailModal.firmware_revision}</span>
-              {/if}
-              {#if detailModal.hardware_revision}
-                <span class="detail-label">Hardware</span>
-                <span class="detail-value mono">{detailModal.hardware_revision}</span>
-              {/if}
-              {#if detailModal.software_revision}
-                <span class="detail-label">Software</span>
-                <span class="detail-value mono">{detailModal.software_revision}</span>
-              {/if}
-            </div>
-          </div>
-        {/if}
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
 
-        {#if detailModal.services.length > 0}
-          <div class="detail-section">
-            <h3>GATT Services</h3>
-            <div class="services-list">
-              {#each detailModal.services as service}
-                <div class="service-item">
-                  <div class="service-header">
-                    <span class="service-name">{service.name ?? 'Unknown Service'}</span>
-                    <span class="service-uuid">{shortUuid(service.uuid)}</span>
-                  </div>
-                  {#if service.characteristics.length > 0}
-                    <div class="chars-list">
-                      {#each service.characteristics as char}
-                        <div class="char-item">
-                          <span class="char-name">{char.name ?? shortUuid(char.uuid)}</span>
-                          <span class="char-uuid">{shortUuid(char.uuid)}</span>
-                          <div class="char-props">
-                            {#each char.properties as prop}
-                              <span class="char-prop">{prop}</span>
-                            {/each}
-                          </div>
-                        </div>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      </div>
-    </div>
-  </dialog>
+    {#snippet footer()}
+      <button type="button" class="btn btn-secondary" onclick={() => (detailOpen = false)}>Close</button>
+    {/snippet}
+  </Dialog>
 {/if}
 
 <style>
-  .page {
-    max-width: 100%;
+  .notice-slot {
+    margin-bottom: var(--space-lg);
   }
 
-  .page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--space-xl);
-  }
-
-  h1 {
-    margin: 0;
-    font-size: var(--text-2xl);
-    font-weight: 800;
-  }
-
-  .scan-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-sm) var(--space-lg);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-lg);
-    background: var(--bg-elevated);
-    color: var(--text-primary);
-    font-size: var(--text-base);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .scan-btn:hover {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .scan-btn:disabled {
-    opacity: 0.7;
-    cursor: not-allowed;
-  }
-
-  .scan-spinner {
-    display: inline-block;
+  .spinner {
     width: 14px;
     height: 14px;
-    border: 2px solid var(--border-strong);
-    border-top-color: var(--accent);
+    border: 2px solid currentColor;
+    border-right-color: transparent;
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
-  }
-
-  .btn-spinner {
-    display: inline-block;
-    width: 12px;
-    height: 12px;
-    border: 2px solid var(--border-strong);
-    border-top-color: currentColor;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    flex-shrink: 0;
-  }
-
-  .empty-state {
-    text-align: center;
-    padding: var(--space-2xl) var(--space-lg);
-    color: var(--text-muted);
-  }
-
-  .empty-icon {
-    margin-bottom: var(--space-md);
-    opacity: 0.4;
-  }
-
-  .empty-text {
-    font-size: var(--text-lg);
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin: 0 0 var(--space-xs);
-  }
-
-  .empty-hint {
-    font-size: var(--text-sm);
-    color: var(--text-muted);
-    margin: 0;
   }
 
   .device-group {
@@ -636,441 +523,251 @@
     display: flex;
     align-items: center;
     gap: var(--space-sm);
-    margin-bottom: var(--space-md);
+    margin: 0 0 var(--space-sm);
     padding-bottom: var(--space-sm);
     border-bottom: 1px solid var(--border-subtle);
+    font-size: var(--text-sm);
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
   }
 
   .group-icon {
     display: flex;
-    align-items: center;
-    color: var(--text-secondary);
-  }
-
-  .group-label {
-    font-size: var(--text-sm);
-    font-weight: 700;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    color: var(--text-muted);
   }
 
   .group-count {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: var(--text-muted);
-    background: var(--bg-elevated);
-    padding: 1px 6px;
+    min-width: 22px;
+    padding: 0 6px;
     border-radius: var(--radius-full);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    text-align: center;
+    letter-spacing: 0;
   }
 
   .device-list {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
     gap: var(--space-sm);
   }
 
-  .device-card {
+  .device-row {
     display: flex;
     align-items: center;
-    gap: var(--space-lg);
+    flex-wrap: wrap;
+    gap: var(--space-md) var(--space-xl);
     padding: var(--space-md) var(--space-lg);
-    background: var(--bg-surface);
-    border-radius: var(--radius-md);
     border: 1px solid var(--border-subtle);
-    transition: all var(--transition-fast);
-  }
-
-  .device-card:hover {
-    border-color: var(--border-default);
-    background: var(--bg-elevated);
-  }
-
-  .device-card.connected {
-    border-color: rgba(76, 175, 80, 0.15);
-  }
-
-  .device-card.out-of-range {
-    opacity: 0.45;
-    filter: grayscale(0.5);
-  }
-
-  .device-card.out-of-range:hover {
-    border-color: var(--border-subtle);
+    border-radius: var(--radius-lg);
     background: var(--bg-surface);
   }
 
-  .connected-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--success);
-    box-shadow: 0 0 4px var(--success-glow);
-    flex-shrink: 0;
+  .device-row.connected {
+    border-color: rgba(76, 175, 80, 0.3);
   }
 
-  .device-info {
-    flex: 1;
+  .device-main {
+    flex: 1 1 320px;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }
 
-  .device-header {
+  .device-title {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: var(--space-sm);
-    margin-bottom: 2px;
   }
 
   .device-name {
-    font-weight: 600;
     font-size: var(--text-base);
+    font-weight: 650;
     color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    overflow-wrap: anywhere;
   }
 
-  .transport-badge {
+  .badge {
     display: inline-flex;
     align-items: center;
-    flex-shrink: 0;
-    line-height: 0;
-    opacity: 0.4;
+    gap: 4px;
+    padding: 1px 8px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--border-default);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
   }
 
-  .transport-badge.transport-connected {
-    opacity: 1;
-  }
-
-  .linked-badge {
+  .badge.transport-on {
+    border-color: rgba(100, 181, 246, 0.45);
     color: var(--info);
-    font-weight: 600;
   }
 
-  .out-of-range-badge {
-    color: var(--text-faint);
-    font-weight: 600;
+  .badge.primary {
+    border-color: rgba(255, 183, 77, 0.45);
+    color: var(--warning);
   }
 
   .device-meta {
     display: flex;
     align-items: center;
-    gap: var(--space-sm);
-    font-size: var(--text-xs);
-    color: var(--text-faint);
+    flex-wrap: wrap;
+    gap: 4px var(--space-lg);
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
   }
 
-  .device-meta:empty {
-    display: none;
+  .meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
   }
 
-  .meta-item.battery {
-    color: var(--warning);
+  .meta svg {
+    color: var(--text-muted);
   }
 
-  .sensor-preview {
-    font-family: var(--font-data);
-    font-size: var(--text-lg);
-    font-weight: 700;
-    color: var(--info);
-    font-variant-numeric: tabular-nums;
-    flex-shrink: 0;
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-faint);
+  }
+
+  .status-on .dot {
+    background: var(--success);
+  }
+
+  .status-on {
+    color: var(--text-primary);
+  }
+
+  .status-busy .dot {
+    background: var(--warning);
+    animation: pulse-glow 1.2s ease infinite;
+  }
+
+  .live {
+    color: var(--text-primary);
+    font-weight: 600;
   }
 
   .device-actions {
     display: flex;
-    gap: var(--space-sm);
+    flex-wrap: wrap;
     align-items: center;
-    flex-shrink: 0;
-  }
-
-  .action-btn {
-    display: inline-flex;
-    align-items: center;
+    justify-content: flex-end;
     gap: var(--space-xs);
-    padding: var(--space-sm) var(--space-md);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-md);
-    background: var(--bg-elevated);
-    color: var(--text-primary);
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    white-space: nowrap;
+    margin-left: auto;
   }
 
-  .action-btn:hover:not(:disabled) {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .action-btn:disabled {
-    opacity: 0.7;
-    cursor: not-allowed;
-  }
-
-  .action-btn.danger {
-    border-color: rgba(244, 67, 54, 0.3);
-    color: var(--danger);
-  }
-
-  .action-btn.danger:hover:not(:disabled) {
-    background: rgba(244, 67, 54, 0.1);
-    border-color: var(--danger);
-  }
-
-  .action-btn.ghost {
-    background: transparent;
-    border-color: var(--border-default);
-    color: var(--text-muted);
-    font-size: var(--text-xs);
-    padding: 3px var(--space-sm);
-  }
-
-  .action-btn.ghost:hover {
-    border-color: var(--warning);
-    color: var(--warning);
-    background: rgba(255, 183, 77, 0.08);
-  }
-
-  .searching-hint {
-    align-self: center;
-    font-size: var(--text-xs);
-    color: var(--text-muted);
-  }
-
-  .primary-badge {
-    font-size: var(--text-xs);
-    font-weight: 700;
-    color: var(--warning);
-    padding: 1px 6px;
-    border: 1px solid rgba(255, 183, 77, 0.3);
-    border-radius: var(--radius-full);
-    background: rgba(255, 183, 77, 0.08);
-    flex-shrink: 0;
-  }
-
-  .pedal-label {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: var(--text-muted);
-    padding: 1px 6px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-full);
-    background: var(--bg-elevated);
-    flex-shrink: 0;
-  }
-
-  .info-btn {
-    padding: 4px 6px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .info-btn:hover {
-    border-color: var(--info) !important;
-    color: var(--info) !important;
-    background: rgba(100, 181, 246, 0.08) !important;
-  }
-
-  /* Modal */
-  .modal-dialog {
-    border: none;
-    background: transparent;
-    padding: 0;
-    max-width: none;
-    max-height: none;
-    overflow: visible;
-  }
-
-  .modal-dialog::backdrop {
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(4px);
-    animation: fade-in 150ms ease;
-  }
-
-  .modal {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-lg);
-    width: 560px;
-    max-width: 90vw;
-    max-height: 80vh;
-    display: flex;
-    flex-direction: column;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-    animation: slide-up 200ms ease;
-  }
-
-  .modal-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-lg) var(--space-xl);
-    border-bottom: 1px solid var(--border-subtle);
-    flex-shrink: 0;
-  }
-
-  .modal-header h2 {
-    margin: 0;
-    font-size: var(--text-lg);
-    font-weight: 700;
-    color: var(--text-primary);
-  }
-
-  .modal-close {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    border-radius: var(--radius-md);
-    transition: all var(--transition-fast);
-  }
-
-  .modal-close:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
-  }
-
-  .modal-body {
-    overflow-y: auto;
-    padding: var(--space-lg) var(--space-xl);
-  }
-
-  .detail-section {
-    margin-bottom: var(--space-xl);
-  }
-
-  .detail-section:last-child {
-    margin-bottom: 0;
+  /* ── Details dialog ── */
+  .detail-section + .detail-section {
+    margin-top: var(--space-xl);
   }
 
   .detail-section h3 {
-    margin: 0 0 var(--space-md);
-    font-size: var(--text-xs);
+    margin: 0 0 var(--space-sm);
+    font-size: var(--text-sm);
     font-weight: 700;
-    color: var(--text-muted);
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    color: var(--text-secondary);
   }
 
   .detail-grid {
     display: grid;
-    grid-template-columns: auto 1fr;
-    gap: var(--space-xs) var(--space-lg);
-    align-items: baseline;
+    grid-template-columns: max-content 1fr;
+    gap: 6px var(--space-xl);
+    margin: 0;
+    font-size: var(--text-sm);
   }
 
-  .detail-label {
-    font-size: var(--text-sm);
-    color: var(--text-faint);
-    font-weight: 500;
+  .detail-grid dt {
+    color: var(--text-muted);
   }
 
-  .detail-value {
-    font-size: var(--text-sm);
+  .detail-grid dd {
+    margin: 0;
     color: var(--text-primary);
-    font-weight: 500;
-    word-break: break-all;
+    overflow-wrap: anywhere;
   }
 
-  .detail-value.mono {
-    font-family: var(--font-data);
-    font-size: var(--text-xs);
+  .services,
+  .chars {
+    list-style: none;
+    margin: 0;
+    padding: 0;
   }
 
-  .services-list {
+  .services {
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
   }
 
-  .service-item {
-    background: var(--bg-body);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border-subtle);
-    overflow: hidden;
-  }
-
-  .service-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+  .service {
     padding: var(--space-sm) var(--space-md);
-    gap: var(--space-sm);
-  }
-
-  .service-name {
-    font-size: var(--text-sm);
-    font-weight: 600;
-    color: var(--text-secondary);
-  }
-
-  .service-uuid {
-    font-family: var(--font-data);
-    font-size: var(--text-xs);
-    color: var(--text-faint);
-    flex-shrink: 0;
-  }
-
-  .chars-list {
-    border-top: 1px solid var(--border-subtle);
-  }
-
-  .char-item {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-xs) var(--space-md) var(--space-xs) var(--space-xl);
-    font-size: var(--text-xs);
-  }
-
-  .char-item + .char-item {
-    border-top: 1px solid rgba(255, 255, 255, 0.03);
-  }
-
-  .char-name {
-    color: var(--text-secondary);
-    font-weight: 500;
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .char-uuid {
-    font-family: var(--font-data);
-    color: var(--text-faint);
-    flex-shrink: 0;
-  }
-
-  .char-props {
-    display: flex;
-    gap: 3px;
-    flex-shrink: 0;
-  }
-
-  .char-prop {
-    font-size: 0.625rem;
-    font-weight: 600;
-    color: var(--text-muted);
-    padding: 1px 4px;
     border: 1px solid var(--border-subtle);
-    border-radius: 3px;
+    border-radius: var(--radius-md);
     background: var(--bg-elevated);
   }
 
-  @keyframes fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
+  .service-head,
+  .char {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px var(--space-md);
+  }
+
+  .service-name {
+    font-weight: 600;
+    font-size: var(--text-sm);
+  }
+
+  .chars {
+    margin-top: 6px;
+    padding-left: var(--space-md);
+    border-left: 2px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .char-name {
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+  }
+
+  .uuid {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
+  .props {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .prop {
+    padding: 0 6px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-default);
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
   }
 </style>

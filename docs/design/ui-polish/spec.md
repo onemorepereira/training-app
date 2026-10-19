@@ -1,7 +1,7 @@
 # UI polish — Spec
 
 **Track:** Standard   **Product stage:** Growth (v0.8 beta, Homebrew + Linux packages)
-**Status:** Reviewed   **Last updated:** 2026-10-19
+**Status:** Built   **Last updated:** 2026-10-19
 **Evidence:** visual audit from a mocked-backend harness (Chromium 143 + WebKit 26, 800×600 / 1280×800 / 1920×1080, normal / empty / error / riding states); findings G1–G11, R1–R11, M1–M3, D1–D6, H1–H5, HD1–HD6, A1–A3, S1–S3, AB1 are summarized in [Appendix: audit findings](#appendix-audit-findings).
 
 ## Problem

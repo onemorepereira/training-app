@@ -13,7 +13,10 @@ const VALUE_MIN = {
   '1920x1080': { power: 112, primary: 88, secondary: 28 },
 };
 
-export function evaluateMetrics(metricsByPage, externalRequests = {}) {
+// Console errors that are expected in a mock state (not failures).
+const EXPECTED_CONSOLE = [{ state: 'error', re: /Session rehydration failed/ }];
+
+export function evaluateMetrics(metricsByPage, externalRequests = {}, consoleLog = {}) {
   const out = [];
   const fail = (rule, page, detail) => out.push({ rule, page, detail });
   for (const [page, m] of Object.entries(metricsByPage)) {
@@ -30,6 +33,9 @@ export function evaluateMetrics(metricsByPage, externalRequests = {}) {
     for (const f of m.controlFonts ?? []) if (SERIF_OR_UA.test(f.family)) fail('AC2 control font', page, `${f.el} "${f.text}" ${f.family}`);
     // AC6: no horizontal page scroll
     if (m.horizontalScroll) fail('AC6 horizontal scroll', page, `doc scrollWidth ${m.docScrollWidth}`);
+    for (const o of m.overflowScrollers ?? []) fail('AC6 horizontal overflow', page, `${o.el} ${o.scrollW} > ${o.clientW}`);
+    // Text cut off by ellipsis/overflow (intentional previews carry data-truncate-ok)
+    for (const c of m.clipped ?? []) fail('AC19/AC6 clipped text', page, `${c.el} "${c.text}" ${c.scroll} > ${c.client}`);
     // AC6: centred, <=30 % empty at 1920; review-page cards <= 360
     if (!m.contentBlock) fail('hook [data-page] missing', page, m.route);
     else if (vp === '1920x1080' && !m.interaction) {
@@ -55,6 +61,15 @@ export function evaluateMetrics(metricsByPage, externalRequests = {}) {
     }
     if (page.startsWith('ride-riding-fullscreen-1920x1080') && m.emptyBelowPct > 15) fail('AC12 empty below > 15%', page, `${m.emptyBelowPct}%`);
   }
+  // AC24: no unexpected console errors; a page the harness couldn't run fails
+  for (const [page, msgs] of Object.entries(consoleLog)) {
+    const state = metricsByPage[page]?.state ?? (page.includes('-error-') ? 'error' : '');
+    for (const msg of msgs) {
+      if (msg.startsWith('[warning]')) continue;
+      if (EXPECTED_CONSOLE.some((e) => e.state === state && e.re.test(msg))) continue;
+      fail(msg.startsWith('[harness]') ? 'harness could not run page' : 'AC24 console error', page, msg.slice(0, 200));
+    }
+  }
   // AC1: no external requests anywhere
   for (const [page, urls] of Object.entries(externalRequests))
     if (urls.length) fail('AC1 external request', page, [...new Set(urls)].slice(0, 3).join(', '));
@@ -77,7 +92,7 @@ export function summarize(engine, results) {
 }
 
 /*
- * Scripted scenarios: { name, route, state?, vp?, run(page) -> string[] failures }.
+ * Scripted scenarios: { name, route, state?, vp?, realClock?, run(page) -> string[] failures }.
  * The clock is installed (page.clock) before navigation; use page.clock.runFor() instead of sleeps.
  */
 const visibleOpacity = (loc) => loc.evaluate((el) => {
@@ -94,7 +109,198 @@ async function tabTo(page, predicate, max = 25, arg = null) {
   return false;
 }
 
+/** Commands the mock backend received since the last call (window.__mockCalls is [cmd, args][]). */
+async function callsSince(page, mark) {
+  return page.evaluate((m) => (window.__mockCalls || []).slice(m).map((c) => c[0]), mark);
+}
+const mark = (page) => page.evaluate(() => (window.__mockCalls || []).length);
+
+/** Run steps; each step clicks/acts then expects some backend commands. */
+async function walk(page, steps) {
+  const fails = [];
+  for (const step of steps) {
+    const m = await mark(page);
+    try {
+      await step.act(page);
+    } catch (e) {
+      fails.push(`${step.name}: ${e.message.split('\n')[0]}`);
+      break;
+    }
+    // Poll for the expected commands (up to `wait`, default 3 s) instead of a fixed sleep.
+    const deadline = Date.now() + (step.wait ?? 3000);
+    let got = await callsSince(page, m);
+    while ((step.expect ?? []).some((c) => !got.includes(c)) && Date.now() < deadline) {
+      await page.waitForTimeout(100);
+      got = await callsSince(page, m);
+    }
+    await page.waitForTimeout(300); // let the UI settle before step.check
+    for (const cmd of step.expect ?? []) if (!got.includes(cmd)) fails.push(`${step.name}: expected ${cmd}, got [${got.join(', ')}]`);
+    if (step.check) {
+      const extra = await step.check(page);
+      if (extra) fails.push(`${step.name}: ${extra}`);
+    }
+  }
+  return fails;
+}
+
 export const SCENARIOS = [
+  {
+    name: 'AC24 flow: start, pause, resume, stop, post-ride Done',
+    route: 'ride',
+    async run(page) {
+      const controls = page.locator('section[aria-label="Ride controls"]');
+      const btn = (name) => (name === 'Done' ? page : controls).getByRole('button', { name, exact: true });
+      return walk(page, [
+        { name: 'start', act: () => btn('Start').click(), expect: ['start_session'] },
+        { name: 'pause', act: () => btn('Pause').click(), expect: ['pause_session'] },
+        { name: 'resume', act: () => btn('Resume').click(), expect: ['resume_session'] },
+        {
+          name: 'stop',
+          act: () => btn('Stop').click(),
+          expect: ['stop_session'],
+          wait: 800,
+          check: async (p) => ((await p.getByRole('dialog', { name: 'Ride saved' }).isVisible()) ? null : 'post-ride dialog not shown'),
+        },
+        {
+          name: 'done',
+          act: () => btn('Done').click(),
+          check: async (p) => ((await p.locator('dialog[open]').count()) ? 'dialog still open after Done' : null),
+        },
+      ]);
+    },
+  },
+  {
+    name: 'AC24 flow: trainer mode and adjust',
+    route: 'ride',
+    async run(page) {
+      return walk(page, [
+        { name: 'SIM mode', act: (p) => p.getByRole('radio', { name: 'SIM', exact: true }).click(), expect: ['set_trainer_simulation'] },
+        { name: 'grade +1', act: (p) => p.getByRole('button', { name: 'Increase grade by 1 percent' }).click(), expect: ['set_trainer_simulation'] },
+        { name: 'ERG mode', act: (p) => p.getByRole('radio', { name: 'ERG', exact: true }).click(), expect: ['set_trainer_power'] },
+        { name: 'ERG +25', act: (p) => p.getByRole('button', { name: 'Increase target by 25 watts' }).click(), expect: ['set_trainer_power'] },
+      ]);
+    },
+  },
+  {
+    name: 'AC24 flow: zone ride start from the builder',
+    route: 'ride',
+    async run(page) {
+      return walk(page, [
+        {
+          name: 'open builder',
+          act: (p) => p.getByRole('button', { name: 'Zone ride', exact: true }).click(),
+          check: async (p) => ((await p.getByRole('dialog', { name: 'Start a zone ride' }).isVisible()) ? null : 'zone builder dialog not shown'),
+        },
+        { name: 'pick Z2', act: (p) => p.getByRole('radio', { name: /^Z2/ }).click() },
+        { name: 'start', act: (p) => p.getByRole('button', { name: 'Start zone ride', exact: true }).click(), expect: ['start_zone_control'], wait: 800 },
+      ]);
+    },
+  },
+  {
+    name: 'AC24 flow: devices scan, details, disconnect, connect',
+    route: 'devices',
+    async run(page) {
+      return walk(page, [
+        {
+          name: 'scan',
+          act: async (p) => {
+            // Wait for the initial load to finish so the button is the settled, enabled "Scan for devices".
+            const scan = p.getByRole('button', { name: 'Scan for devices', exact: true });
+            await scan.waitFor({ state: 'visible' });
+            await p.waitForFunction(() => [...document.querySelectorAll('button')].some((b) => b.textContent.trim() === 'Scan for devices' && !b.disabled));
+            await scan.click();
+          },
+          expect: ['scan_devices'],
+        },
+        {
+          name: 'details',
+          act: (p) => p.getByRole('button', { name: /^Details/ }).first().click(),
+          expect: ['get_device_details'],
+          wait: 800,
+          check: async (p) => ((await p.locator('dialog[open]').count()) ? null : 'details dialog not shown'),
+        },
+        { name: 'close details', act: (p) => p.keyboard.press('Escape') },
+        { name: 'disconnect', act: (p) => p.getByRole('button', { name: 'Disconnect', exact: true }).first().click(), expect: ['disconnect_device'], wait: 800 },
+        { name: 'connect', act: (p) => p.getByRole('button', { name: 'Connect', exact: true }).first().click(), expect: ['connect_device'], wait: 1200 },
+      ]);
+    },
+  },
+  {
+    name: 'AC24 flow: open a ride, edit and save, export',
+    route: 'history',
+    async run(page) {
+      return walk(page, [
+        {
+          name: 'open ride',
+          act: (p) => p.locator('main a[href^="/history/"]').first().click(),
+          expect: ['get_session'],
+          wait: 1500,
+          check: async (p) => (/\/history\/[^/]+$/.test(new URL(p.url()).pathname) ? null : `still at ${p.url()}`),
+        },
+        {
+          name: 'edit',
+          act: (p) => p.getByRole('button', { name: /^Edit/ }).click(),
+          check: async (p) => ((await p.getByRole('dialog', { name: 'Edit ride' }).isVisible()) ? null : 'edit dialog not shown'),
+        },
+        { name: 'rename', act: (p) => p.getByRole('dialog').getByRole('textbox').first().fill('Harness edit') },
+        { name: 'save', act: (p) => p.getByRole('dialog').getByRole('button', { name: 'Save', exact: true }).click(), expect: ['update_session_metadata'], wait: 800 },
+        { name: 'export', act: (p) => p.getByRole('button', { name: 'Export FIT', exact: true }).click(), expect: ['export_session_fit'], wait: 800 },
+      ]);
+    },
+  },
+  {
+    name: 'AC24/AC18 flow: settings save bar, discard and save',
+    route: 'settings',
+    vp: { w: 800, h: 600 },
+    async run(page) {
+      const bar = (p) => p.getByText('Unsaved changes');
+      return walk(page, [
+        {
+          name: 'clean form has no bar',
+          act: async () => {},
+          check: async (p) => ((await bar(p).isVisible()) ? 'save bar visible with no changes' : null),
+        },
+        {
+          name: 'change units',
+          act: (p) => p.getByRole('radio', { name: 'Imperial' }).click(),
+          check: async (p) => {
+            if (!(await bar(p).isVisible())) return 'save bar not shown after a change';
+            const b = await bar(p).boundingBox();
+            return b && b.y + b.height <= 600 ? null : 'save bar not inside the 800x600 viewport';
+          },
+        },
+        {
+          name: 'discard',
+          act: (p) => p.getByRole('button', { name: 'Discard', exact: true }).click(),
+          check: async (p) => ((await bar(p).isVisible()) ? 'save bar still shown after Discard' : null),
+        },
+        { name: 'change again', act: (p) => p.getByRole('radio', { name: 'Imperial' }).click() },
+        {
+          name: 'save',
+          act: (p) => p.getByRole('button', { name: 'Save', exact: true }).click(),
+          expect: ['save_user_config'],
+          wait: 800,
+          check: async (p) => ((await p.getByText('Settings saved').isVisible()) ? null : 'no "Settings saved" confirmation'),
+        },
+        {
+          name: 'confirmation hides',
+          act: (p) => p.clock.runFor(3200),
+          wait: 400,
+          check: async (p) => ((await p.getByText('Settings saved').isVisible()) ? 'confirmation still visible after 3 s' : null),
+        },
+      ]);
+    },
+  },
+  {
+    name: 'AC24 flow: stop a running zone ride',
+    route: 'ride',
+    state: 'riding-zone',
+    async run(page) {
+      return walk(page, [
+        { name: 'stop zone ride', act: (p) => p.getByRole('button', { name: 'Stop zone ride', exact: true }).click(), expect: ['stop_zone_control'], wait: 800 },
+      ]);
+    },
+  },
   {
     name: 'AC8 rail tooltips on keyboard focus',
     route: 'history',
@@ -199,6 +405,107 @@ export const SCENARIOS = [
       const texts = await page.evaluate(() => [...document.querySelectorAll('[data-metric-value]')].map((el) => ({ kind: el.dataset.metricValue, t: el.textContent.trim() })));
       if (!texts.length) return ['no metric values found'];
       return texts.filter((x) => x.t !== '--').map((x) => `${x.kind} shows "${x.t}" instead of --`);
+    },
+  },
+  {
+    name: 'AC1 hanging network: UI paints within 1 s, no external requests',
+    route: 'history-detail',
+    realClock: true, // paint timing entries need the real clock
+    async run(page) {
+      // Every non-local request hangs forever (captive portal / black-holed DNS).
+      const attempted = [];
+      await page.route((url) => !['localhost', '127.0.0.1'].includes(url.hostname), (route) => { attempted.push(route.request().url()); });
+      await page.reload({ waitUntil: 'commit' });
+      const ok = await page.locator('nav').waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false);
+      const fcp = await page.evaluate(() => performance.getEntriesByName('first-contentful-paint')[0]?.startTime ?? null);
+      const fails = [];
+      if (!ok) fails.push('nav not visible within 5 s');
+      if (fcp == null || fcp > 1000) fails.push(`first contentful paint ${fcp == null ? 'missing' : Math.round(fcp) + ' ms'} (> 1000 ms)`);
+      if (attempted.length) fails.push(`external requests: ${[...new Set(attempted)].slice(0, 3).join(', ')}`);
+      return fails;
+    },
+  },
+  {
+    name: 'AC20 history table fits 800x600 with a readable title and sort icon',
+    route: 'history',
+    vp: { w: 800, h: 600 },
+    async run(page) {
+      await page.getByRole('radio', { name: 'Table' }).click();
+      await page.waitForTimeout(400);
+      return page.evaluate(() => {
+        const fails = [];
+        const table = document.querySelector('main table');
+        if (!table) return ['no table'];
+        const wrap = table.parentElement;
+        if (wrap.scrollWidth > wrap.clientWidth + 1) fails.push(`table overflows ${wrap.scrollWidth} > ${wrap.clientWidth}`);
+        const title = table.querySelector('tbody tr td a[href^="/history/"]')?.closest('td');
+        if (!title) fails.push('no title cell');
+        else {
+          const ch = parseFloat(getComputedStyle(title).fontSize) * 0.5; // ~1ch for a proportional font
+          if (title.clientWidth < 24 * ch) fails.push(`title column ${title.clientWidth}px < 24ch`);
+        }
+        const icon = table.querySelector('thead svg');
+        if (!icon) fails.push('no sort icon');
+        else if (icon.getBoundingClientRect().width < 12) fails.push(`sort icon ${icon.getBoundingClientRect().width}px < 12px`);
+        return fails;
+      });
+    },
+  },
+  {
+    name: 'AC17 Esc closes the zone builder and the post-ride dialog',
+    route: 'ride',
+    async run(page) {
+      const fails = [];
+      await page.getByRole('button', { name: 'Zone ride', exact: true }).click();
+      await page.waitForTimeout(300);
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      if (await page.locator('dialog[open]').count()) fails.push('zone builder still open after Esc');
+      const controls = page.locator('section[aria-label="Ride controls"]');
+      await controls.getByRole('button', { name: 'Start', exact: true }).click();
+      await page.waitForTimeout(400);
+      await controls.getByRole('button', { name: 'Stop', exact: true }).click();
+      await page.waitForTimeout(800);
+      if (!(await page.locator('dialog[open]').count())) return [...fails, 'post-ride dialog did not open'];
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      if (await page.locator('dialog[open]').count()) fails.push('post-ride dialog still open after Esc');
+      if (!(await page.locator('nav').isVisible())) fails.push('nav hidden after Esc');
+      return fails;
+    },
+  },
+  {
+    name: 'Arrow keys on a segmented control do not change the trainer',
+    route: 'ride',
+    async run(page) {
+      return walk(page, [
+        {
+          name: 'arrow on view switcher',
+          act: async (p) => {
+            await p.getByRole('radio', { name: 'Gauges' }).focus();
+            p.__mark = await mark(p);
+            await p.keyboard.press('ArrowRight');
+            await p.keyboard.press('ArrowDown');
+          },
+          check: async (p) => {
+            const got = await callsSince(p, p.__mark);
+            return got.some((c) => c.startsWith('set_trainer')) ? `trainer command sent: ${got.join(', ')}` : null;
+          },
+        },
+        {
+          name: 'arrow on trainer mode',
+          act: async (p) => {
+            await p.getByRole('radio', { name: 'ERG', exact: true }).focus();
+            p.__mark = await mark(p);
+            await p.keyboard.press('ArrowUp');
+          },
+          check: async (p) => {
+            const calls = await callsSince(p, p.__mark);
+            // Changing mode sends one command for the new mode, but no extra adjust on top of it.
+            return calls.filter((c) => c.startsWith('set_trainer')).length > 1 ? `extra trainer adjust: ${calls.join(', ')}` : null;
+          },
+        },
+      ]);
     },
   },
   {

@@ -13,7 +13,11 @@
     onStart,
     onClose,
     trainerConnected = false,
+    starting = false,
+    startError = '',
   }: {
+    starting?: boolean;
+    startError?: string;
     open?: boolean;
     config: SessionConfig;
     onStart: (target: ZoneTarget) => void;
@@ -65,13 +69,22 @@
 
   let zoneColor = $derived(useCustom ? 'var(--accent)' : (colors[selectedZone - 1] ?? 'var(--accent)'));
 
+  // A start error describes the last attempt; hide it once the user changes the target.
+  let errorStale = $state(false);
+  $effect(() => {
+    void startError;
+    errorStale = false;
+  });
+
   function switchMode(m: ZoneMode) {
+    errorStale = true;
     mode = m;
     selectedZone = 3;
     useCustom = false;
   }
 
   function selectZone(z: number) {
+    errorStale = true;
     selectedZone = z;
     useCustom = false;
   }
@@ -153,6 +166,8 @@
 
     {#if resolved.lower >= resolved.upper}
       <p class="hint error">The lower bound must be below the upper bound.</p>
+    {:else if startError && !errorStale}
+      <p class="hint error" role="alert">Couldn't start the zone ride: {startError}</p>
     {:else if !trainerConnected}
       <p class="hint">Connect a smart trainer to start a zone ride.</p>
     {/if}
@@ -164,9 +179,9 @@
       type="button"
       class="btn btn-lg btn-primary"
       data-ride-control
-      disabled={!trainerConnected || resolved.lower >= resolved.upper}
+      disabled={starting || !trainerConnected || resolved.lower >= resolved.upper}
       onclick={handleStart}
-    >Start zone ride</button>
+    >{starting ? 'Starting…' : 'Start zone ride'}</button>
   {/snippet}
 </Dialog>
 

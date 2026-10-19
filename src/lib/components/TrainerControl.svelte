@@ -7,6 +7,7 @@
   import { zoneActive } from '$lib/stores/zoneRide';
   import { get } from 'svelte/store';
   import SegmentedControl from '$lib/ui/SegmentedControl.svelte';
+  import { isTypingTarget, overlayOpen } from '$lib/ui/keys';
 
   const MODES = [
     { value: 'erg', label: 'ERG', title: 'Hold a target power' },
@@ -123,7 +124,10 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+    // Keys already handled (e.g. arrows moving a radio group), typing in a field,
+    // or an open dialog must not also change the trainer load.
+    const target = e.target as Element | null;
+    if (e.defaultPrevented || target?.tagName === 'INPUT' || isTypingTarget(target) || overlayOpen(document)) return;
     // The zone controller owns the trainer during a zone ride.
     if (get(zoneActive)) return;
 

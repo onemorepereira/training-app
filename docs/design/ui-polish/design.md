@@ -1,6 +1,6 @@
 # UI polish — Design
 
-**Spec:** [spec.md](spec.md)   **Status:** Reviewed (design gate passed after 2 review passes)   **Last updated:** 2026-10-19
+**Spec:** [spec.md](spec.md)   **Status:** Current (design gate passed after 2 review passes; built and verified)   **Last updated:** 2026-10-19
 
 ## Overview
 This is a frontend-only overhaul in four layers:
@@ -460,6 +460,11 @@ Delivered as **three stacked PRs** so each one stays reviewable. Each slice ends
      - add a "UI" entry to the release notes draft;
      - CONTRIBUTING gets `npm run ui:check` and the shared UI building blocks (`src/lib/ui/`, `controls.css`, `charts/theme.ts`).
    - **AC23 check:** `rg -n --glob '*.svelte' -e '^\s*(button|\.btn[\w-]*|\.[\w-]*-btn|\.[\w-]*button[\w-]*)\s*[,{:]' src/routes src/lib/components` must return nothing. The allowed exceptions are listed in this section with a reason, and none are expected.
+     - *Result (S11):* the grep returns only these exceptions, which are allowed:
+       - **Layout modifiers on `.btn`:** `.adj-btn`, `.session-btn` and `.rpe-btn` set only min-width and padding.
+       - **`DevToolbar` `button`:** a dev-only build, under `data-dev-only`.
+       - **History `.sort-btn`:** a table-header button styled as header text, not a control button, 32 px tall.
+       - **Retro `.mute-btn`:** a 36 px overlay on the game canvas, which needs a translucent look.
     - AC23 grep: remove leftover per-file button styles and duplicated empty-state/spinner CSS;
     - the full `--check` in both engines;
     - AC24 flow walk in the harness;

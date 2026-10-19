@@ -103,11 +103,32 @@
   .state-details summary {
     display: inline-flex;
     align-items: center;
+    gap: 6px;
+    list-style: none;
     min-height: var(--control-h-sm);
     padding: 0 var(--space-sm);
     cursor: pointer;
     color: var(--text-secondary);
     font-size: var(--text-sm);
+  }
+
+  .state-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  /* Our own disclosure chevron: WebKit drops the native marker on an inline-flex summary */
+  .state-details summary::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform var(--transition-fast);
+  }
+
+  .state-details[open] summary::before {
+    transform: rotate(45deg);
   }
 
   .state-details code {
