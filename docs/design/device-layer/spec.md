@@ -1,7 +1,7 @@
 # Device layer (BLE / ANT+ / trainers) — Spec
 
 **Track:** Standard   **Product stage:** Introduction/early Growth
-**Status:** Agreed   **Last updated:** 2026-10-18
+**Status:** Built   **Last updated:** 2026-10-18
 **Findings:** C1–C17
 
 ## Problem

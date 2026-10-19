@@ -1561,6 +1561,25 @@ mod ant_lifecycle_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn lost_teardown_then_manual_connect_opens_single_channel() {
+        let dm = dm();
+        let tx = tx();
+        let io = connected(&dm).await;
+        io.set_link(ID, LinkState::Lost);
+        DeviceManager::watchdog_tick(&dm, &tx).await;
+        settle().await; // spawned teardown has run
+        let info = DeviceManager::connect_shared(&dm, ID, tx.clone()).await.unwrap();
+        settle().await;
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert_eq!(
+            io.events(),
+            vec![IoEvent::Connect(ID.into()), IoEvent::Disconnect(ID.into()), IoEvent::Connect(ID.into())],
+        );
+        assert_eq!(io.listeners_alive.load(Ordering::SeqCst), 1);
+        assert!(!dm.lock().await.reconnect.contains(ID), "manual connect cleared the target");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn ant_reconnect_yields_single_listener() {
         let dm = dm();
         let tx = tx();

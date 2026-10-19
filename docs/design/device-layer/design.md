@@ -1,6 +1,6 @@
 # Device layer (BLE / ANT+ / trainers) — Design
 
-**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 2, after design review 1)   **Status:** Draft (rev 3: NB1–NB3 + rulings folded in at build start)
+**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 2, after design review 1)   **Status:** Current (rev 3; built — see Verification)
 
 > **Rev 2 changes (review 1).**
 > - Lost-teardown and manual-connect-to-Reconnecting rules (ADR-2a/2b).
@@ -581,3 +581,41 @@ Each slice is one commit with its tests (failing first).
 - **Slice 9: Channel ID device type is masked to 7 bits** for the id (bit 7 is the pairing bit). Stored ids are unaffected, because sensors do not set it.
 - **Slice 9: common-page detection (0x50–0x52) is skipped for the combined sensor.** Type 121 has no page byte, so byte 0 is cadence time and could equal 0x50–0x52.
 - **Slice 9: a scan channel re-opened with an exclusion list gets a fresh sender.** The router drops a channel's sender on the close event (slice 4), so the scan re-registers after each re-open.
+
+## Verification
+
+Commands, all green at the final commit:
+- `cd src-tauri && cargo test` → 410 passed (lib). The baseline before this branch was 289.
+- `cd src-tauri && cargo check --features production` → clean apart from a pre-existing `pid.rs` warning.
+- `npm test` → 71 passed.
+- `npm run check` → 0 errors, 0 warnings.
+
+Run any group with `cargo test --lib <path>`. Paths below are relative to `device::`.
+
+| AC | Proving tests |
+|---|---|
+| AC1 (C1) | `fec::tests::fec_track_resistance_zero_grade_layout`, `fec_track_resistance_minus_3_percent`, `fec_track_resistance_plus_5_percent`, `fec_track_resistance_crr_0_004_is_raw_80`, `fec_wind_resistance_page_layout_cw_0_51`, `fec_wind_page_sent_only_when_cw_changes` |
+| AC2 (C10) | `fec::tests::fec_grade_2_3_rounds_to_raw_20230`, `fec_grade_extremes_do_not_overflow`, `fec_grade_nan_encodes_zero_percent`; `ftms::tests::ftms_grade_2_3_rounds_to_230`, `ftms_grade_clamped_to_plus_minus_100`, `ftms_grade_nan_encodes_zero`, `ftms_crr_rounds_to_nearest` |
+| AC3 (C5) | `ant::protocol::tests::fec_page_0x19_power_0xfff_yields_no_power_reading`, `fec_page_0x19_power_4094_is_valid` |
+| AC4 (C3) | `primary::tests::*` (16 tests: `admit_speed_only_and_cadence_only_pods_both_forwarded`, `admit_second_cadence_device_dominated`, `cadence_pod_outranks_power_meter_outranks_trainer`, `stale_primary_second_pod_outranks_power_meter`, `two_power_meters_cadence_never_interleave`, `reading_after_disconnect_cannot_reclaim_primary`, `primary_key_legacy_cadence_speed_sets_device_capabilities`, `primary_key_deserializes_legacy_and_metric_names`, `get_primaries_includes_legacy_and_metric_keys`, …); `manager::primary_lifecycle_tests::*` (5) |
+| AC5 (C2) | `ant::channel::tests::ant_connection_channel_search_config_bytes`, `wait_first_page_*` (3), `closed_channel_event_detects_search_timeout_and_close`; `manager::ant_lifecycle_tests::*` (10: stale → Reconnecting, recovery on the same channel, Lost teardown before reconnect, single listener, manual connect to Reconnecting with and without data, 10-minute give-up); `manager::lifecycle_tests::lost_teardown_*`, `connect_wins_gate_before_spawned_teardown_reopens_cleanly` |
+| AC6 (C4) | `manager::lifecycle_tests::connect_twice_spawns_one_listener`, `concurrent_connects_same_device_one_io_connect`, `manual_connect_clears_pending_reconnect`, `commit_aborts_existing_listener_handle`, `concurrent_connects_disconnect_cancels_owner_attempt`, `losing_attempt_cannot_remove_winner_token`, `disconnect_cancels_in_flight_connect_promptly`, `cancelled_connect_does_not_commit_listener` |
+| AC7 (C6) | `ant::channel::tests::ack_wait_*` (8), `ack_retry_skipped_when_trainer_stale` |
+| AC8 (C7) | `manager::lifecycle_tests::trainer_command_during_scan_completes_within_500ms`, `trainer_command_during_reconnect_completes_within_500ms`, `slow_reconnect_does_not_delay_next_tick`, `reconnects_bounded_to_two_concurrent`, `busy_gate_skips_reconnect_round`, `watchdog_tick_completes_within_50ms_during_scan`; `io::tests::ant_probe_returns_while_ant_slot_locked` |
+| AC9 (C8) | `ble::tests::disconnect_on_err_runs_cleanup_on_failure`, `disconnect_on_err_skips_cleanup_on_success`, `disconnect_on_err_returns_original_error_when_cleanup_fails` |
+| AC10 (C9) | `protocol::tests::csc_first_notification_emits_nothing`, `csc_second_notification_computes_cadence_60rpm`, `csc_new_state_after_reconnect_reinitialises`, `csc_zero_*`, `cadence_resumes_after_zero_on_new_event` |
+| AC11 (C11) | `protocol::tests::cps_crank_only_cadence_90rpm`, `cps_crank_offset_after_balance_torque_wheel`, `cps_crank_event_time_rollover`, `cps_crank_first_sample_initialises`, `cps_truncated_crank_field_still_yields_power`, `cps_zero_cadence_after_3s_without_crank_event`; `ant::protocol::tests::ant_power_page_cadence_byte3`, `ant_power_page_cadence_0xff_omitted`, `ant_power_page_cadence_only_on_new_event` |
+| AC12 (C12) | `ant::protocol::tests::combined_sc_first_page_initialises`, `combined_sc_speed_and_cadence_from_one_page`, `combined_sc_counter_rollover`; `ant::channel::tests::profile_speed_cadence_is_type_121_period_8086`, `scan_profiles_include_combined_sc` |
+| AC13 (C13) | `ftms::tests::resistance_range_parse_6_octet_layout`, `resistance_range_parse_3_octet_layout`, `resistance_range_parse_bad_length_is_none`, `resistance_50pct_scaled_into_range_with_increment`, `resistance_range_with_negative_min`, `resistance_without_range_uses_legacy_mapping` |
+| AC14 (C14) | `ant::listener::tests::hr_page2_ignored_before_toggle_seen`, `page_toggle_gate_opens_after_both_states`, `hr_page2_manufacturer_and_serial_with_toggle_bit_set`, `hr_page3_hw_sw_model`, `sc_page2_serial_combines_device_number` |
+| AC15 (C15) | `protocol::tests::cps_balance_unknown_reference_is_none`, `cps_balance_left_reference_inverted_rounded`; `ant::protocol::tests::ant_power_pedal_power_0xff_is_none` |
+| AC16 (C16) | `dedup::tests::name_number_requires_whole_token`, `name_number_matches_token_after_separator`, `name_number_leading_zero_token_matches` |
+| AC17 (C17) | `ant::channel::tests::exclusion_list_messages_bytes`, `exclusion_list_capped_at_four_entries`, `scan_channel_release_sends_close_reset_list_unassign_in_order`, `open_channel_resets_id_list_after_assign`, `reopen_excluding_closes_lists_then_opens`, `scan_channel_allocation_skips_connection_channels`, `scan_profiles_batched_when_channels_scarce` |
+| AC18 | Full suites above. Tests that assert behaviour on pre-existing functions were seen failing before their fix: `ftms_grade_2_3_rounds_to_230`, `ftms_crr_rounds_to_nearest`, `fec_page_0x19_power_0xfff_yields_no_power_reading`, and the replaced balance test. Tests on new APIs (FakeIo lifecycle, primary state, channel helpers) failed to compile before their slice. |
+
+**Not provable without hardware** (the user checks after merge):
+- Low-priority-only re-acquisition latency on a real stick.
+- Exclusion-list behaviour on ANT USB2 / USB-m.
+- The 3-octet 0x2AD6 scaling.
+- FE-C ack timing at 4 Hz.
+- BLE CPS crank data from real pedals.
