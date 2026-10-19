@@ -528,3 +528,20 @@ dark-only (`color-scheme: dark`); there is no light theme.
 - M-AC8: reload in the real WebKitGTK webview.
 - M-AC10: quick-navigation smoke test.
 - M-AC2 and M-AC6: these need a real trainer.
+
+### ADR-19 (Area B follow-up): Manual trainer controls during a zone ride
+- **Context.** Area B makes `set_trainer_power`, `set_trainer_resistance` and
+  `set_trainer_simulation` fail with "Zone ride active — stop it first" while a zone ride runs.
+- **Decision.**
+  - The latest-wins sender passes a rejected send to `onError`. `TrainerControl` maps that to
+    `trainerError`, which the dashboard shows inline with the backend text.
+  - While `$zoneActive`, `TrainerControl` wraps its controls in a disabled `<fieldset>` and shows
+    the hint "Zone ride active — stop it to adjust the trainer manually". Its arrow-key shortcuts
+    are ignored.
+- **Note.** The dashboard already swaps `TrainerControl` for `ZoneRideStatus` during a zone ride,
+  so the disabled state is defensive. It covers the poll gap before the swap and any future
+  placement.
+- **Test.** `latestWins.test.ts`: `rejected_send_surfaces_backend_error_text`. The disabled state
+  was checked by review only, because it needs a trainer to render.
+- **Verification.** After this change, `npm test` passes 204 tests and `npm run check` reports
+  0 errors.

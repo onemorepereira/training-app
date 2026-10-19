@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createLatestWinsSender } from './latestWins';
 import { deferred } from '$lib/test/fixtures';
+import { extractError } from '$lib/tauri';
 
 /** Send mock whose calls each return a promise the test resolves/rejects. */
 function controlledSend() {
@@ -61,6 +62,18 @@ describe('createLatestWinsSender', () => {
     await flush();
     expect(onError).toHaveBeenCalledWith({ message: 'timeout' });
     expect(send).toHaveBeenLastCalledWith(170);
+  });
+
+  it('rejected_send_surfaces_backend_error_text', async () => {
+    // Area B: manual trainer commands are rejected while a zone ride runs.
+    const { send, calls } = controlledSend();
+    const errors: string[] = [];
+    const sender = createLatestWinsSender(send, (e) => errors.push(extractError(e)));
+    sender.submit(150);
+    calls[0].d.reject({ code: 'Session', message: 'Zone ride active — stop it first' });
+    await flush();
+    expect(errors).toEqual(['Zone ride active — stop it first']);
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it('submit_after_idle_sends_again', async () => {

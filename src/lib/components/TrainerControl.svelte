@@ -4,6 +4,8 @@
   import { currentPower } from '$lib/stores/sensor';
   import { api, extractError } from '$lib/tauri';
   import { createLatestWinsSender } from '$lib/utils/latestWins';
+  import { zoneActive } from '$lib/stores/zoneRide';
+  import { get } from 'svelte/store';
 
   let local: TrainerState = $state({
     mode: 'erg',
@@ -88,6 +90,8 @@
 
   function handleKeydown(e: KeyboardEvent) {
     if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+    // The zone controller owns the trainer during a zone ride.
+    if (get(zoneActive)) return;
 
     const big = e.shiftKey;
     if (e.key === 'ArrowUp') {
@@ -110,6 +114,10 @@
 </script>
 
 <div class="trainer-strip">
+  {#if $zoneActive}
+    <p class="zone-lock-hint">Zone ride active — stop it to adjust the trainer manually</p>
+  {/if}
+  <fieldset class="strip-fieldset" disabled={$zoneActive}>
   <div class="strip-row">
     <div class="mode-tabs">
       <button class="tab" class:active={local.mode === 'erg'} onclick={() => setMode('erg')}>ERG</button>
@@ -155,9 +163,29 @@
     {/if}
 
   </div>
+</fieldset>
 </div>
 
 <style>
+  .strip-fieldset {
+    display: contents;
+    border: 0;
+    margin: 0;
+    padding: 0;
+    min-width: 0;
+  }
+
+  .strip-fieldset:disabled button {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .zone-lock-hint {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
   .trainer-strip {
     display: contents;
   }
