@@ -269,3 +269,77 @@ Note: this reverses #38's "file first" delete order. The spec requires the DB to
   - A must not use `PRAGMA user_version`.
 - **Area D (frontend).** After a stop error, `requestStop` (`src/lib/stores/session.ts`) leaves `sessionActive = true` although the backend already dropped the session, and `autoSession.ts` swallows the error with `.catch(() => {})`. D should reset the session stores on error and surface the backend message (toast or banner). E only guarantees the backend `Err` text.
 - **Area C (device).** None. `prerequisites.rs` is E's.
+
+## Amendments (design review, 2026-10-18)
+
+The spec owner reviewed the design and these changes are binding. Earlier ADR text is kept for history. Where an amendment contradicts it, the amendment wins.
+
+### ADR-4 note — approved
+Approved: a constant script via `pkexec /bin/sh -c` with allowlisted positional args and the rule on stdin. The UX cost of `/bin/sh` appearing in the prompt is accepted. Additions:
+- `stdin = Stdio::null()` when there is no `udev` token.
+- When writing the rule to the child's stdin, a `BrokenPipe` is not an error of its own. The outcome comes from the exit status: 126 means dismissed, 127 means denied. pkexec exits before reading stdin when auth fails.
+- Package-manager lines are non-interactive and are set inside the script: `DEBIAN_FRONTEND=noninteractive apt-get install -y bluez`, `dnf install -y bluez`, `pacman -S --noconfirm bluez bluez-utils`.
+
+### ADR-1 amendment 1 — existence guards, not error tolerance
+- Every `ALTER TABLE <t> ADD COLUMN <c> …` statement, in **any** step, is preceded by `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`. The statement is skipped when the column exists.
+- All other statement errors propagate and roll the step back. We no longer rely on continuing a transaction after an error, and `run_alter_ignore_duplicate` is deleted.
+- The SQL-file constraints are: statements end in `;`; no `;` inside literals or inline comments; `--` comments only on their own lines; ADD COLUMN must spell out `COLUMN` and use unquoted identifiers. Tests pin these constraints.
+
+### ADR-1 amendment 2 — column sets, not column order
+- Legacy DBs created by v0.6.10-beta (before `zone_config` existed) end with `distance_km` **before** `zone_config`. A fresh DB has the opposite order.
+- Upgrade tests therefore compare column **sets** (name, declared type, notnull, default) per table.
+- Rule (CONTRIBUTING): no code may depend on column order. No `SELECT *` and no positional `INSERT … VALUES` without a column list. A grep of `src-tauri/src` found none today.
+
+### ADR-1 amendment 3 — pinned checksums
+- A test pins the SHA-256 of every shipped migration file, after CRLF→LF normalization, in a constant table (`sha2` 0.10.9 as a dev-dependency; it is already in `Cargo.lock` via sqlx).
+- Editing a shipped step fails CI. Adding a new step requires adding its hash.
+
+### ADR-1 amendment 4 — backup before upgrade steps
+- Before the first pending step ≥ 2 in a run, the runner executes `VACUUM INTO '<data>/training.db.pre-v<N>'`, where N is that step's version.
+- An existing backup file is never overwritten.
+- The backup is skipped when the DB had no user tables at the start of the run (a fresh install), so new users don't get a pointless file.
+- If the backup fails, the step is not applied and startup errors. This is safer than upgrading without a copy.
+
+### ADR-1 amendment 5 — Area A's `app_meta` and `sessions.zones`
+- Rule when **A lands first**: its inline DDL moves into `0001_baseline.sql` (ADD COLUMN guarded by amendment 1). The `main` fixture is regenerated and must populate `zones` and an `app_meta` row.
+- Rule when **E lands first** (current state; A is not on `main` at 3b10a73): E ships them as new steps, `0002_session_zones.sql` (`ALTER TABLE sessions ADD COLUMN zones TEXT;`) and `0003_app_meta.sql` (`CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT);`, exact DDL). A then drops its inline DDL on rebase.
+- Either way the final schema is identical, and every step is exercised by the fixture tests.
+
+### ADR-6 amendment — fixtures
+These are dumps (`sqlite3.iterdump`) of DBs seeded with every column populated, including a note containing `'`, `"` and `;`:
+- `testdata/legacy_initial_e0d85f4.sql`: the first commit's `Storage::new`.
+- `testdata/legacy_v0_6_10.sql`: tag `v0.6.10-beta`, no `zone_config`.
+- `testdata/main_3b10a73.sql`: built by running the unmodified `main` `Storage::new` and storage API in a throwaway test, with raw paths normalized to `/legacy/sessions/…`.
+
+How they were made: the two legacy fixtures come from `testdata/genfx.py`. It replays, in source order, the SQL literals a tagged `Storage::new` executes, with the same duplicate-column handling. Its replay of `main` was checked to produce a `sqlite_master` identical to the Rust-built DB.
+
+The partial-005 fixture is dropped, because no shipped tag ever had that state: the first commit already ran 002–006.
+
+**Rule (CONTRIBUTING + harness):** every new step must run against all legacy fixtures plus the `main` fixture. The upgrade tests iterate a single `FIXTURES` table, so a new step is covered automatically.
+
+### ADR-2/3 amendment — invariant: a row's summary always describes the raw file on disk
+The ordering is **raw file durable first, then row**. A single function, `save_session(summary, raw)`, serves both stop and recovery:
+
+| Row | Raw file | Action | Outcome |
+|---|---|---|---|
+| exists | exists | nothing | `AlreadyExisted` |
+| exists | absent (legacy crash: old code inserted first) | write raw durably, then UPDATE the row's metric columns from `summary` (user metadata kept) | `RepairedRaw` |
+| absent | absent | write raw durably, INSERT row | `Inserted` |
+| absent | exists, bytes == `raw` | INSERT row | `Inserted` |
+| absent | exists, bytes differ | rename existing to `<id>.bin.orphan-<unix_ms>` (kept, `warn!`), write raw durably, INSERT row | `Inserted` |
+
+- **Durable write:** tmp file `write_all` + `sync_all`, then `rename`, then `sync_all` on the parent directory (unix; a no-op elsewhere). The autosave writer uses the same helper.
+- **Ordering in `finalize_session`:** the final autosave is durable before any raw or row write, and the raw file plus the committed row are durable before `remove_autosave`. SQLite commit is durable with sqlx's defaults: rollback journal, `synchronous=FULL`, since sqlx-sqlite 0.8.6 sets neither unless asked.
+- **Stray tmp files:** recovery removes `<id>.bin.tmp` and `.autosave_<id>.tmp` with an `info!` line.
+- **Crash-point tests:**
+  - `crash_after_final_autosave_before_raw_recovers_full_ride`
+  - `crash_after_raw_before_row_inserts_row_and_keeps_raw`
+  - `crash_after_raw_before_row_with_stale_autosave_keeps_orphan_and_consistent_pair`
+  - `crash_after_row_before_autosave_removal_keeps_final_raw`
+  - `legacy_row_without_raw_is_repaired_from_autosave`
+
+### Rulings recorded
+- Migrations are additive only: no DROP, no RENAME, no NOT NULL without a default (CONTRIBUTING).
+- AC2: a backend `Err` with clear text is enough for E. Area D surfaces it.
+- The README, CONTRIBUTING and CLAUDE.md "schema changes" guidance is updated.
+- Area B adds the tokio `test-util` dev-dependency on its own branch. E does not add it, so expect a trivial `Cargo.toml` conflict.
