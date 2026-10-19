@@ -5,8 +5,10 @@ import {
   computeRampRate,
   computeWeeklyTrends,
   extractFtpProgression,
-  toDateKey,
-  weekMonday,
+  localDateKey,
+  addDaysToKey,
+  weekStartKey,
+  currentWeekTss,
 } from './analytics';
 import type { PmcDay } from './analytics';
 
@@ -38,39 +40,53 @@ function assertApprox(actual: number, expected: number, epsilon: number, msg?: s
   ).toBeLessThanOrEqual(epsilon);
 }
 
-describe('toDateKey', () => {
-  it('extracts date from ISO datetime', () => {
-    expect(toDateKey('2025-03-15T14:30:00Z')).toBe('2025-03-15');
+// Tests run with TZ=America/Chicago (vite.config.ts): CST = UTC−6, CDT = UTC−5.
+// DST 2025: starts Sun 2025-03-09, ends Sun 2025-11-02.
+
+describe('localDateKey', () => {
+  it('local_date_key_uses_local_calendar_day', () => {
+    // 2025-06-16T02:00Z = Sun 2025-06-15 21:00 CDT
+    expect(localDateKey('2025-06-16T02:00:00Z')).toBe('2025-06-15');
   });
 
-  it('extracts date from ISO with timezone offset', () => {
-    expect(toDateKey('2025-03-15T14:30:00+02:00')).toBe('2025-03-15');
+  it('local_date_key_midday_utc_is_same_day', () => {
+    expect(localDateKey('2025-03-15T14:30:00Z')).toBe('2025-03-15');
+  });
+
+  it('local_date_key_accepts_offset_iso', () => {
+    // 2025-03-15T01:30+02:00 = 2025-03-14T23:30Z = 2025-03-14 18:30 CDT
+    expect(localDateKey('2025-03-15T01:30:00+02:00')).toBe('2025-03-14');
+  });
+
+  it('today_key_is_local', () => {
+    // 03:00Z on Jan 6 is still Jan 5 21:00 CST
+    expect(localDateKey(new Date('2025-01-06T03:00:00Z'))).toBe('2025-01-05');
   });
 });
 
-describe('weekMonday', () => {
-  it('returns same day for a Monday', () => {
-    // 2025-01-06 is a Monday
-    const result = weekMonday(new Date('2025-01-06T12:00:00Z'));
-    expect(toDateKey(result.toISOString())).toBe('2025-01-06');
+describe('addDaysToKey', () => {
+  it('add_days_crosses_month_and_year', () => {
+    expect(addDaysToKey('2024-12-31', 1)).toBe('2025-01-01');
+    expect(addDaysToKey('2024-02-28', 1)).toBe('2024-02-29');
   });
 
-  it('returns previous Monday for a Wednesday', () => {
-    // 2025-01-08 is a Wednesday → Monday is 2025-01-06
-    const result = weekMonday(new Date('2025-01-08T12:00:00Z'));
-    expect(toDateKey(result.toISOString())).toBe('2025-01-06');
+  it('add_days_across_spring_forward_is_one_calendar_day', () => {
+    expect(addDaysToKey('2025-03-08', 1)).toBe('2025-03-09');
+    expect(addDaysToKey('2025-03-09', 1)).toBe('2025-03-10');
+  });
+});
+
+describe('weekStartKey', () => {
+  it('monday_is_its_own_week_start', () => {
+    expect(weekStartKey('2025-01-06')).toBe('2025-01-06');
   });
 
-  it('returns previous Monday for a Saturday', () => {
-    // 2025-01-11 is a Saturday → Monday is 2025-01-06
-    const result = weekMonday(new Date('2025-01-11T12:00:00Z'));
-    expect(toDateKey(result.toISOString())).toBe('2025-01-06');
+  it('wednesday_maps_to_previous_monday', () => {
+    expect(weekStartKey('2025-01-08')).toBe('2025-01-06');
   });
 
-  it('returns previous Monday for a Sunday', () => {
-    // 2025-01-12 is a Sunday → Monday is 2025-01-06
-    const result = weekMonday(new Date('2025-01-12T12:00:00Z'));
-    expect(toDateKey(result.toISOString())).toBe('2025-01-06');
+  it('sunday_maps_to_previous_monday', () => {
+    expect(weekStartKey('2025-01-12')).toBe('2025-01-06');
   });
 });
 
@@ -80,69 +96,64 @@ describe('computePmc', () => {
   });
 
   it('computes single-session PMC correctly', () => {
-    // TSS=100 on day 0
-    // CTL = 0 + (100 - 0) / 42 = 100/42 ≈ 2.381
-    // ATL = 0 + (100 - 0) / 7  = 100/7  ≈ 14.286
-    // TSB = CTL - ATL ≈ 2.381 - 14.286 ≈ -11.905
-    const sessions = [session({ start_time: new Date().toISOString(), tss: 100 })];
-    const pmc = computePmc(sessions);
+    // TSS=100 on day 0 → CTL = 100/42, ATL = 100/7, TSB = CTL − ATL
+    const now = new Date('2025-06-15T18:00:00Z');
+    const pmc = computePmc([session({ start_time: '2025-06-15T15:00:00Z', tss: 100 })], now);
     const last = pmc[pmc.length - 1];
-
+    expect(pmc).toHaveLength(1);
     assertApprox(last.ctl, 100 / 42, 0.01, 'CTL');
     assertApprox(last.atl, 100 / 7, 0.01, 'ATL');
     assertApprox(last.tsb, 100 / 42 - 100 / 7, 0.01, 'TSB');
   });
 
   it('sums TSS from two sessions on the same day', () => {
-    const today = new Date().toISOString();
-    const sessions = [
-      session({ id: 'a', start_time: today, tss: 60 }),
-      session({ id: 'b', start_time: today, tss: 40 }),
-    ];
-    const pmc = computePmc(sessions);
-    const last = pmc[pmc.length - 1];
-
-    // Combined TSS = 100, same result as single 100-TSS session
-    assertApprox(last.ctl, 100 / 42, 0.01, 'CTL');
-    assertApprox(last.atl, 100 / 7, 0.01, 'ATL');
+    const now = new Date('2025-06-15T23:00:00Z');
+    const pmc = computePmc([
+      session({ id: 'a', start_time: '2025-06-15T13:00:00Z', tss: 60 }),
+      session({ id: 'b', start_time: '2025-06-15T22:00:00Z', tss: 40 }),
+    ], now);
+    expect(pmc).toHaveLength(1);
+    assertApprox(pmc[0].ctl, 100 / 42, 0.01, 'CTL');
+    assertApprox(pmc[0].atl, 100 / 7, 0.01, 'ATL');
   });
 
   it('all-null TSS keeps CTL/ATL/TSB at zero', () => {
-    const sessions = [
-      session({ start_time: new Date().toISOString(), tss: null }),
-    ];
-    const pmc = computePmc(sessions);
-    const last = pmc[pmc.length - 1];
-
-    expect(last.ctl).toBe(0);
-    expect(last.atl).toBe(0);
-    expect(last.tsb).toBe(0);
+    const now = new Date('2025-06-15T18:00:00Z');
+    const pmc = computePmc([session({ start_time: '2025-06-15T15:00:00Z', tss: null })], now);
+    expect(pmc[0].ctl).toBe(0);
+    expect(pmc[0].atl).toBe(0);
+    expect(pmc[0].tsb).toBe(0);
   });
 
   it('multi-day PMC accumulates correctly', () => {
-    // Day 0: TSS=100 → CTL = 100/42, ATL = 100/7
-    // Day 1: TSS=0   → CTL = CTL_0 + (0 - CTL_0)/42 = CTL_0 * (41/42)
-    //                   ATL = ATL_0 + (0 - ATL_0)/7  = ATL_0 * (6/7)
-    const yesterday = new Date();
-    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-    const sessions = [
-      session({ start_time: yesterday.toISOString(), tss: 100 }),
-    ];
-    const pmc = computePmc(sessions);
-
-    // Should have 2 days
-    expect(pmc.length).toBe(2);
-
-    const ctl0 = 100 / 42;
-    const atl0 = 100 / 7;
-    const ctl1 = ctl0 * (41 / 42);
-    const atl1 = atl0 * (6 / 7);
-
-    assertApprox(pmc[0].ctl, ctl0, 0.01, 'day 0 CTL');
-    assertApprox(pmc[0].atl, atl0, 0.01, 'day 0 ATL');
+    // Day 0: TSS=100 → CTL0 = 100/42, ATL0 = 100/7; Day 1: TSS=0 → CTL0·41/42, ATL0·6/7
+    const now = new Date('2025-06-16T18:00:00Z');
+    const pmc = computePmc([session({ start_time: '2025-06-15T15:00:00Z', tss: 100 })], now);
+    expect(pmc.map((d) => d.date)).toEqual(['2025-06-15', '2025-06-16']);
+    const ctl1 = (100 / 42) * (41 / 42);
+    const atl1 = (100 / 7) * (6 / 7);
     assertApprox(pmc[1].ctl, ctl1, 0.01, 'day 1 CTL');
     assertApprox(pmc[1].atl, atl1, 0.01, 'day 1 ATL');
     assertApprox(pmc[1].tsb, ctl1 - atl1, 0.01, 'day 1 TSB');
+  });
+
+  it('evening_ride_counts_on_local_day', () => {
+    // Sun 2025-06-15 21:00 CDT = 2025-06-16T02:00Z
+    const now = new Date('2025-06-16T03:00:00Z'); // still Sun 22:00 local
+    const pmc = computePmc([session({ start_time: '2025-06-16T02:00:00Z', tss: 80 })], now);
+    expect(pmc).toEqual([expect.objectContaining({ date: '2025-06-15', tss: 80 })]);
+  });
+
+  it('pmc_spring_forward_has_no_skipped_day', () => {
+    const now = new Date('2025-03-10T18:00:00Z');
+    const pmc = computePmc([session({ start_time: '2025-03-08T18:00:00Z', tss: 50 })], now);
+    expect(pmc.map((d) => d.date)).toEqual(['2025-03-08', '2025-03-09', '2025-03-10']);
+  });
+
+  it('pmc_fall_back_has_no_duplicate_day', () => {
+    const now = new Date('2025-11-03T18:00:00Z');
+    const pmc = computePmc([session({ start_time: '2025-11-01T18:00:00Z', tss: 50 })], now);
+    expect(pmc.map((d) => d.date)).toEqual(['2025-11-01', '2025-11-02', '2025-11-03']);
   });
 });
 
@@ -152,78 +163,114 @@ describe('computeWeeklyTrends', () => {
   });
 
   it('groups sessions into correct week buckets', () => {
-    // Week 1: Mon 2025-01-06
-    //   Session A: TSS=50, power=200, hr=140, duration=3600
-    //   Session B: TSS=70, power=220, hr=null, duration=5400
-    // Week 2: Mon 2025-01-13
-    //   Session C: TSS=80, power=null, hr=150, duration=7200
     const sessions = [
-      session({
-        id: 'a',
-        start_time: '2025-01-07T10:00:00Z', // Tuesday wk1
-        tss: 50,
-        avg_power: 200,
-        avg_hr: 140,
-        duration_secs: 3600,
-      }),
-      session({
-        id: 'b',
-        start_time: '2025-01-09T10:00:00Z', // Thursday wk1
-        tss: 70,
-        avg_power: 220,
-        avg_hr: null,
-        duration_secs: 5400,
-      }),
-      session({
-        id: 'c',
-        start_time: '2025-01-14T10:00:00Z', // Tuesday wk2
-        tss: 80,
-        avg_power: null,
-        avg_hr: 150,
-        duration_secs: 7200,
-      }),
+      session({ id: 'a', start_time: '2025-01-07T16:00:00Z', tss: 50, avg_power: 200, avg_hr: 140, duration_secs: 3600 }),
+      session({ id: 'b', start_time: '2025-01-09T16:00:00Z', tss: 70, avg_power: 220, avg_hr: null, duration_secs: 5400 }),
+      session({ id: 'c', start_time: '2025-01-14T16:00:00Z', tss: 80, avg_power: null, avg_hr: 150, duration_secs: 7200 }),
     ];
-
-    const weeks = computeWeeklyTrends(sessions);
-    expect(weeks.length).toBe(2);
-
-    // Week 1
-    expect(weeks[0].weekStart).toBe('2025-01-06');
-    expect(weeks[0].totalTss).toBe(120); // 50+70
-    assertApprox(weeks[0].avgPower!, 210, 0.1, 'wk1 avgPower'); // (200+220)/2
-    assertApprox(weeks[0].avgHr!, 140, 0.1, 'wk1 avgHr'); // only 1 non-null
+    const weeks = computeWeeklyTrends(sessions, new Date('2025-01-15T18:00:00Z'));
+    expect(weeks.map((w) => w.weekStart)).toEqual(['2025-01-06', '2025-01-13']);
+    expect(weeks[0].totalTss).toBe(120);
+    // Duration-weighted: (200·3600 + 220·5400) / 9000 = 212.0
+    assertApprox(weeks[0].avgPower!, 212, 0.1, 'wk1 avgPower');
+    assertApprox(weeks[0].avgHr!, 140, 0.1, 'wk1 avgHr');
     expect(weeks[0].sessionCount).toBe(2);
-    expect(weeks[0].totalDurationSecs).toBe(9000); // 3600+5400
-
-    // Week 2
-    expect(weeks[1].weekStart).toBe('2025-01-13');
+    expect(weeks[0].totalDurationSecs).toBe(9000);
     expect(weeks[1].totalTss).toBe(80);
     expect(weeks[1].avgPower).toBeNull();
     assertApprox(weeks[1].avgHr!, 150, 0.1, 'wk2 avgHr');
-    expect(weeks[1].sessionCount).toBe(1);
-    expect(weeks[1].totalDurationSecs).toBe(7200);
+  });
+
+  it('sunday_2100_cdt_ride_counts_toward_that_sunday_week', () => {
+    // Sun 2025-06-15 21:00 CDT = Mon 2025-06-16T02:00Z (UTC would say next week)
+    const weeks = computeWeeklyTrends(
+      [session({ start_time: '2025-06-16T02:00:00Z', tss: 90 })],
+      new Date('2025-06-16T03:00:00Z'),
+    );
+    expect(weeks).toHaveLength(1);
+    expect(weeks[0].weekStart).toBe('2025-06-09');
+    expect(weeks[0].totalTss).toBe(90);
+  });
+
+  it('weekly_avg_power_is_duration_weighted', () => {
+    // (200·3600 + 110·1800) / 5400 = 170.0 (unweighted mean would be 155)
+    const weeks = computeWeeklyTrends([
+      session({ id: 'a', start_time: '2025-06-10T16:00:00Z', avg_power: 200, duration_secs: 3600 }),
+      session({ id: 'b', start_time: '2025-06-11T16:00:00Z', avg_power: 110, duration_secs: 1800 }),
+    ], new Date('2025-06-12T16:00:00Z'));
+    assertApprox(weeks[0].avgPower!, 170, 0.1, 'weighted power');
+  });
+
+  it('weekly_avg_hr_is_duration_weighted', () => {
+    // (150·1200 + 130·3600) / 4800 = 135.0
+    const weeks = computeWeeklyTrends([
+      session({ id: 'a', start_time: '2025-06-10T16:00:00Z', avg_hr: 150, duration_secs: 1200 }),
+      session({ id: 'b', start_time: '2025-06-11T16:00:00Z', avg_hr: 130, duration_secs: 3600 }),
+    ], new Date('2025-06-12T16:00:00Z'));
+    assertApprox(weeks[0].avgHr!, 135, 0.1, 'weighted hr');
   });
 
   it('excludes null metrics from averages (not counted as 0)', () => {
-    const sessions = [
-      session({
-        id: 'a',
-        start_time: '2025-01-07T10:00:00Z',
-        avg_power: 200,
-        avg_hr: null,
-      }),
-      session({
-        id: 'b',
-        start_time: '2025-01-08T10:00:00Z',
-        avg_power: null,
-        avg_hr: null,
-      }),
-    ];
-
-    const weeks = computeWeeklyTrends(sessions);
-    // avg_power should be 200 (only one valid), not 100 (200+0)/2
+    const weeks = computeWeeklyTrends([
+      session({ id: 'a', start_time: '2025-01-07T16:00:00Z', avg_power: 200, avg_hr: null }),
+      session({ id: 'b', start_time: '2025-01-08T16:00:00Z', avg_power: null, avg_hr: null }),
+    ], new Date('2025-01-08T18:00:00Z'));
     assertApprox(weeks[0].avgPower!, 200, 0.1, 'power average excludes nulls');
     expect(weeks[0].avgHr).toBeNull();
+  });
+
+  it('zero_duration_sessions_give_null_average', () => {
+    const weeks = computeWeeklyTrends(
+      [session({ start_time: '2025-06-10T16:00:00Z', avg_power: 250, avg_hr: 160, duration_secs: 0 })],
+      new Date('2025-06-10T18:00:00Z'),
+    );
+    expect(weeks[0].avgPower).toBeNull();
+    expect(weeks[0].avgHr).toBeNull();
+  });
+
+  it('empty_week_between_rides_has_zero_volume', () => {
+    const weeks = computeWeeklyTrends([
+      session({ id: 'a', start_time: '2025-06-03T16:00:00Z', tss: 40, avg_power: 180 }),
+      session({ id: 'b', start_time: '2025-06-17T16:00:00Z', tss: 60, avg_power: 190 }),
+    ], new Date('2025-06-18T16:00:00Z'));
+    expect(weeks.map((w) => w.weekStart)).toEqual(['2025-06-02', '2025-06-09', '2025-06-16']);
+    expect(weeks[1]).toEqual({
+      weekStart: '2025-06-09',
+      totalTss: 0,
+      avgPower: null,
+      avgHr: null,
+      sessionCount: 0,
+      totalDurationSecs: 0,
+    });
+  });
+
+  it('weeks_filled_through_current_week', () => {
+    const weeks = computeWeeklyTrends(
+      [session({ start_time: '2025-06-03T16:00:00Z', tss: 40 })],
+      new Date('2025-06-25T16:00:00Z'), // Wed of week 2025-06-23
+    );
+    expect(weeks.map((w) => w.weekStart)).toEqual(['2025-06-02', '2025-06-09', '2025-06-16', '2025-06-23']);
+    expect(weeks[3].sessionCount).toBe(0);
+  });
+});
+
+describe('currentWeekTss', () => {
+  it('current_week_tss_uses_local_monday', () => {
+    // Ride Mon 2025-06-16 08:00 CDT; "now" Sun 2025-06-22 22:00 CDT = 2025-06-23T03:00Z
+    // (in UTC that is already Monday of the next week, which would report 0)
+    const now = new Date('2025-06-23T03:00:00Z');
+    const weeks = computeWeeklyTrends([session({ start_time: '2025-06-16T13:00:00Z', tss: 75 })], now);
+    expect(currentWeekTss(weeks, now)).toBe(75);
+  });
+
+  it('current_week_tss_zero_when_no_ride_this_week', () => {
+    const now = new Date('2025-06-25T16:00:00Z');
+    const weeks = computeWeeklyTrends([session({ start_time: '2025-06-03T16:00:00Z', tss: 40 })], now);
+    expect(currentWeekTss(weeks, now)).toBe(0);
+  });
+
+  it('current_week_tss_null_without_data', () => {
+    expect(currentWeekTss([], new Date())).toBeNull();
   });
 });
 
@@ -234,18 +281,18 @@ describe('extractFtpProgression', () => {
 
   it('returns empty when all FTP are null', () => {
     const sessions = [
-      session({ start_time: '2025-01-01T00:00:00Z', ftp: null }),
+      session({ start_time: '2025-01-01T17:00:00Z', ftp: null }),
     ];
     expect(extractFtpProgression(sessions)).toEqual([]);
   });
 
   it('emits change points only', () => {
     const sessions = [
-      session({ id: 'a', start_time: '2025-01-01T00:00:00Z', ftp: 200 }),
-      session({ id: 'b', start_time: '2025-02-01T00:00:00Z', ftp: 200 }),
-      session({ id: 'c', start_time: '2025-03-01T00:00:00Z', ftp: 220 }),
-      session({ id: 'd', start_time: '2025-04-01T00:00:00Z', ftp: 220 }),
-      session({ id: 'e', start_time: '2025-05-01T00:00:00Z', ftp: 210 }),
+      session({ id: 'a', start_time: '2025-01-01T17:00:00Z', ftp: 200 }),
+      session({ id: 'b', start_time: '2025-02-01T17:00:00Z', ftp: 200 }),
+      session({ id: 'c', start_time: '2025-03-01T17:00:00Z', ftp: 220 }),
+      session({ id: 'd', start_time: '2025-04-01T17:00:00Z', ftp: 220 }),
+      session({ id: 'e', start_time: '2025-05-01T17:00:00Z', ftp: 210 }),
     ];
 
     const points = extractFtpProgression(sessions);
@@ -260,8 +307,8 @@ describe('extractFtpProgression', () => {
 
   it('always includes last session even if FTP unchanged', () => {
     const sessions = [
-      session({ id: 'a', start_time: '2025-01-01T00:00:00Z', ftp: 200 }),
-      session({ id: 'b', start_time: '2025-06-01T00:00:00Z', ftp: 200 }),
+      session({ id: 'a', start_time: '2025-01-01T17:00:00Z', ftp: 200 }),
+      session({ id: 'b', start_time: '2025-06-01T17:00:00Z', ftp: 200 }),
     ];
 
     const points = extractFtpProgression(sessions);

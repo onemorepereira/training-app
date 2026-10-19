@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import type { SessionSummary } from '$lib/tauri';
   import { api, extractError } from '$lib/tauri';
-  import { computePmc, computeWeeklyTrends, extractFtpProgression, computeRampRate } from '$lib/utils/analytics';
+  import { computePmc, computeWeeklyTrends, extractFtpProgression, computeRampRate, currentWeekTss } from '$lib/utils/analytics';
   import MetricCard from '$lib/components/MetricCard.svelte';
   import PmcChart from '$lib/components/PmcChart.svelte';
   import TrendChart from '$lib/components/TrendChart.svelte';
@@ -45,19 +45,7 @@
     }
   });
 
-  let thisWeekTss = $derived.by(() => {
-    if (weeklyData.length === 0) return null;
-    const lastBucket = weeklyData[weeklyData.length - 1];
-    // Check if the last bucket is this week
-    const now = new Date();
-    const day = now.getUTCDay();
-    const offset = day === 0 ? 6 : day - 1;
-    const monday = new Date(now);
-    monday.setUTCDate(monday.getUTCDate() - offset);
-    monday.setUTCHours(0, 0, 0, 0);
-    const thisMonday = monday.toISOString().slice(0, 10);
-    return lastBucket.weekStart === thisMonday ? Math.round(lastBucket.totalTss) : 0;
-  });
+  let thisWeekTss = $derived(currentWeekTss(weeklyData));
 </script>
 
 <div class="page">
