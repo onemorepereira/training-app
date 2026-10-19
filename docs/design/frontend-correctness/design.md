@@ -545,3 +545,32 @@ dark-only (`color-scheme: dark`); there is no light theme.
   was checked by review only, because it needs a trainer to render.
 - **Verification.** After this change, `npm test` passes 204 tests and `npm run check` reports
   0 errors.
+
+### ADR-20 (Area C follow-up): Device actions, primary keys, cancelled connects
+- **Device actions.** `deviceAction(status, {connecting, disconnecting, inRange})` in
+  `src/lib/utils/deviceActions.ts` chooses the Devices page button:
+
+  | State | Button | Notes |
+  |---|---|---|
+  | Disconnected | Connect | disabled when out of range |
+  | Connected | Disconnect | |
+  | Reconnecting | Stop | shows a "Searching…" hint; calls `disconnect_device` |
+  | Connecting, or a local connect in flight | Cancel | calls `disconnect_device`, which cancels the connect |
+  | A disconnect in flight | Disconnect | disabled |
+
+  Before this change, any status other than Connected meant "connect".
+- **Primary indicator.** `isPrimaryDevice`: for a CadenceSpeed device, the new `Cadence`/`Speed`
+  keys are used when present (primary if either matches). The legacy `CadenceSpeed` key is used
+  only when neither new key exists. Other types use their own key. The `PrimaryDevices` TS type
+  makes every key optional. After "Set Primary", the map is re-read from the backend instead of
+  patched locally.
+- **Cancelled connects.** `isConnectCancelled(e)` (`code === 'connect_cancelled'`). The Devices
+  page and ConnectionHealth don't show it as an error, because the user started it.
+- **Tests.** `deviceActions.test.ts`: 7 `deviceAction` cases, 6 `isPrimaryDevice` cases,
+  2 `isConnectCancelled` cases.
+- **Manual check (Playwright + mock IPC).**
+  - A Reconnecting, out-of-range CSC showed "Searching…" with a Stop button. Stop called
+    `disconnect_device('csc-1')`.
+  - Connect → Cancel on a hanging connect produced no error banner, and the button returned to
+    Connect.
+  - The Power device showed its Primary badge.

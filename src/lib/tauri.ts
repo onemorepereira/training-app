@@ -67,6 +67,14 @@ export interface SessionSummary {
   zones?: ZoneSnapshot | null;
 }
 
+/**
+ * Primary device id per metric, from get_primary_devices. Cadence/speed sensors
+ * use `Cadence` and `Speed` (newer backends) or the legacy `CadenceSpeed` key.
+ */
+export type PrimaryDevices = Partial<
+  Record<'HeartRate' | 'Power' | 'Cadence' | 'Speed' | 'CadenceSpeed' | 'FitnessTrainer', string>
+>;
+
 /** In-progress session as reported by `get_session_status`. */
 export interface ActiveSessionStatus {
   session_id: string;
@@ -232,6 +240,11 @@ export function extractError(e: unknown): string {
   return String(e);
 }
 
+/** True for the error connect_device returns when a user disconnect cancelled it. */
+export function isConnectCancelled(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as { code?: unknown }).code === 'connect_cancelled';
+}
+
 export const api = {
   getKnownDevices: () => invoke<DeviceInfo[]>('get_known_devices'),
   scanDevices: () => invoke<DeviceInfo[]>('scan_devices'),
@@ -257,7 +270,7 @@ export const api = {
   exportSessionFit: (sessionId: string) => invoke<string>('export_session_fit', { sessionId }),
   setPrimaryDevice: (deviceType: string, deviceId: string) =>
     invoke<void>('set_primary_device', { deviceType, deviceId }),
-  getPrimaryDevices: () => invoke<Record<string, string>>('get_primary_devices'),
+  getPrimaryDevices: () => invoke<PrimaryDevices>('get_primary_devices'),
   unlinkDevices: (deviceId: string) => invoke<void>('unlink_devices', { deviceId }),
   /** Full-replace: all fields are written; null clears a field. */
   updateSessionMetadata: (

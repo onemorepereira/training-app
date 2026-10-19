@@ -1,6 +1,6 @@
 <script lang="ts">
   import { reconnectingDevices, reconnectDevice } from '$lib/stores/devices';
-  import { extractError } from '$lib/tauri';
+  import { extractError, isConnectCancelled } from '$lib/tauri';
 
   function deviceTypeLabel(type: string): string {
     switch (type) {
@@ -19,7 +19,8 @@
     try {
       await reconnectDevice(deviceId);
     } catch (e) {
-      reconnectError = extractError(e);
+      // A connect cancelled by the user's own disconnect is not an error.
+      if (!isConnectCancelled(e)) reconnectError = extractError(e);
     }
   }
 
