@@ -7,6 +7,26 @@ usage: genfx.py build <storage_src.rs> <001_init.sql> <out.db>
 (ALTER TABLE ... and CREATE TABLE IF NOT EXISTS ...), runs 001_init.sql then
 each statement (ignoring 'duplicate column name' exactly like the Rust code),
 then seeds rows using only columns that exist in that schema.
+
+Every fixture in this directory is produced by this script. To (re)generate one
+from a git ref, from the repo root (W = an empty scratch dir of your choice):
+
+    REF=v0.6.10-beta NAME=legacy_v0_6_10       # or e0d85f4 / legacy_initial_e0d85f4,
+                                               #    3b10a73 / main_3b10a73
+    SRC=src-tauri/src/session/storage/mod.rs   # refs before the storage split:
+                                               #    src-tauri/src/session/storage.rs
+    git show "$REF:$SRC" > "$W/storage.rs"
+    git show "$REF:src-tauri/migrations/001_init.sql" > "$W/001_init.sql"
+    python3 -I src-tauri/src/session/storage/testdata/genfx.py \
+        build "$W/storage.rs" "$W/001_init.sql" "$W/training.db"
+    python3 -I src-tauri/src/session/storage/testdata/genfx.py \
+        dump "$W/training.db" src-tauri/src/session/storage/testdata/$NAME.sql
+
+Then add the file to FIXTURES in ../schema.rs. Replaying main@3b10a73 this way
+was checked to give a sqlite_master identical to the DB built by running that
+commit's Rust Storage::new. Refs that already use the migration runner
+(user_version >= 1) have no inline SQL to replay; they need no fixture because
+their state is exactly a prefix of MIGRATIONS.
 """
 import re
 import sqlite3

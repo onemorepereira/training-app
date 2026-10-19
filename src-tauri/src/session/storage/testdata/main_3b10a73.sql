@@ -34,8 +34,8 @@ CREATE TABLE sessions (
     avg_speed REAL,
     raw_file_path TEXT
 , ftp INTEGER, title TEXT, activity_type TEXT, rpe INTEGER, notes TEXT, zone_config TEXT, work_kj REAL, variability_index REAL, distance_km REAL);
-INSERT INTO "sessions" VALUES('11111111-1111-4111-8111-111111111111','2026-01-15T07:30:00+00:00',3600,180,650,195,6.079999923706054687e+01,7.799999713897705079e-01,142,171,88.5,31.25,'/legacy/sessions/11111111-1111-4111-8111-111111111111.bin',250,'Ride 1','endurance',6,'it''s "quoted"; with semicolon','{"mode":"power","zone":2}',648.0,1.080000042915344239e+00,31.25);
-INSERT INTO "sessions" VALUES('22222222-2222-4222-8222-222222222222','2026-02-15T07:30:00+00:00',3601,181,650,195,6.079999923706054687e+01,7.799999713897705079e-01,142,171,88.5,31.25,'/legacy/sessions/22222222-2222-4222-8222-222222222222.bin',250,'Ride 2','endurance',6,'it''s "quoted"; with semicolon','{"mode":"power","zone":2}',648.0,1.080000042915344239e+00,31.25);
+INSERT INTO "sessions" VALUES('11111111-1111-4111-8111-111111111111','2026-01-15T07:30:00+00:00',3600,180,650,195,60.8,0.78,142,171,88.5,31.25,'/legacy/sessions/11111111-1111-4111-8111-111111111111.bin',250,'Ride 1','endurance',6,'it''s "quoted"; with semicolon','{"mode":"power","zone":2}',648.0,1.08,31.25);
+INSERT INTO "sessions" VALUES('22222222-2222-4222-8222-222222222222','2026-02-15T07:30:00+00:00',3601,181,650,195,60.8,0.78,142,171,88.5,31.25,'/legacy/sessions/22222222-2222-4222-8222-222222222222.bin',250,'Ride 2','endurance',6,'it''s "quoted"; with semicolon','{"mode":"power","zone":2}',648.0,1.08,31.25);
 CREATE TABLE user_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     ftp INTEGER NOT NULL DEFAULT 200,
