@@ -33,3 +33,33 @@ pub const RECONNECT_BACKOFF_MULTIPLIER: u64 = 2;
 /// Highest target power ever sent to a trainer (watts). Every target-power
 /// command is clamped to [0, MAX_TRAINER_WATTS] in `DeviceManager::set_target_power`.
 pub const MAX_TRAINER_WATTS: u16 = 2000;
+
+/// Clamp a requested target power to [0, MAX_TRAINER_WATTS]. Takes i32 so
+/// callers never need a wrapping `as i16` cast.
+pub fn clamp_trainer_watts(watts: i32) -> i16 {
+    watts.clamp(0, MAX_TRAINER_WATTS as i32) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_trainer_watts_caps_at_2000() {
+        assert_eq!(clamp_trainer_watts(2001), 2000);
+        assert_eq!(clamp_trainer_watts(2000), 2000);
+        assert_eq!(clamp_trainer_watts(250), 250);
+    }
+
+    #[test]
+    fn clamp_trainer_watts_negative_is_zero() {
+        assert_eq!(clamp_trainer_watts(-50), 0);
+    }
+
+    #[test]
+    fn clamp_trainer_watts_u16_max_does_not_wrap() {
+        // 65535 as i16 would be -1; 40000 as i16 would be -25536
+        assert_eq!(clamp_trainer_watts(u16::MAX as i32), 2000);
+        assert_eq!(clamp_trainer_watts(40000), 2000);
+    }
+}

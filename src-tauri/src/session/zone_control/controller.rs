@@ -164,7 +164,7 @@ impl ZoneController {
         {
             let mut dm = device_manager.lock().await;
             if let Some(trainer_id) = dm.connected_trainer_id() {
-                if let Err(e) = dm.set_target_power(&trainer_id, initial_power as i16).await {
+                if let Err(e) = dm.set_target_power(&trainer_id, crate::config::clamp_trainer_watts(initial_power as i32)).await {
                     warn!("Initial trainer power command failed: {}", e);
                 }
             }
@@ -292,7 +292,7 @@ async fn command_trainer(
     let trainer_id = dm
         .connected_trainer_id()
         .ok_or_else(|| AppError::Session("Trainer disconnected".into()))?;
-    dm.set_target_power(&trainer_id, watts as i16).await?;
+    dm.set_target_power(&trainer_id, crate::config::clamp_trainer_watts(watts as i32)).await?;
     drop(dm);
 
     let _ = sensor_tx.send(SensorReading::TrainerCommand {
