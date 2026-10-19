@@ -2,25 +2,42 @@ use super::Storage;
 use crate::error::AppError;
 use crate::session::analysis::PowerCurvePoint;
 
+/// Replace a session's cached curve inside an open transaction: delete every
+/// old row first so durations absent from the new curve can't keep stale bests.
+pub(super) async fn replace_power_curve_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    curve: &[PowerCurvePoint],
+) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM session_power_curves WHERE session_id = ?")
+        .bind(session_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(AppError::Database)?;
+    for point in curve {
+        sqlx::query(
+            "INSERT INTO session_power_curves (session_id, duration_secs, watts) VALUES (?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(point.duration_secs as i32)
+        .bind(point.watts as i32)
+        .execute(&mut **tx)
+        .await
+        .map_err(AppError::Database)?;
+    }
+    Ok(())
+}
+
 impl Storage {
+    /// Atomically replace the session's power-curve cache (delete + insert in
+    /// one transaction, so concurrent writers can't interleave rows).
     pub async fn save_power_curve(
         &self,
         session_id: &str,
         curve: &[PowerCurvePoint],
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
-        for point in curve {
-            sqlx::query(
-                "INSERT OR REPLACE INTO session_power_curves (session_id, duration_secs, watts) \
-                 VALUES (?, ?, ?)",
-            )
-            .bind(session_id)
-            .bind(point.duration_secs as i32)
-            .bind(point.watts as i32)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
-        }
+        replace_power_curve_in_tx(&mut tx, session_id, curve).await?;
         tx.commit().await.map_err(AppError::Database)?;
         Ok(())
     }

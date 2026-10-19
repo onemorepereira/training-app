@@ -377,7 +377,7 @@ async fn estimate_power_from_history(
         let mut all_points: Vec<TimeseriesPoint> = Vec::new();
         for session in &recent {
             if let Ok(readings) = storage_clone.load_sensor_data(&session.id) {
-                let ts = crate::session::analysis::build_timeseries_from_readings(&readings, session.duration_secs);
+                let ts = crate::session::analysis::build_timeseries_from_readings(&readings);
                 all_points.extend(ts);
             }
         }

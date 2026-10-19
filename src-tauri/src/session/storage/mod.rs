@@ -604,6 +604,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_power_curve_replaces_stale_durations() {
+        let (storage, _tmp) = test_storage().await;
+        storage.save_session(&make_summary("pc-re-1"), b"raw").await.unwrap();
+        // Old (fabricated) curve had a 20-min point; the recomputed one does not.
+        storage.save_power_curve("pc-re-1", &[
+            PowerCurvePoint { duration_secs: 1, watts: 400 },
+            PowerCurvePoint { duration_secs: 1200, watts: 300 },
+        ]).await.unwrap();
+        storage.save_power_curve("pc-re-1", &[
+            PowerCurvePoint { duration_secs: 1, watts: 380 },
+        ]).await.unwrap();
+
+        let best = storage.get_best_power_curve(None).await.unwrap();
+        assert_eq!(best.len(), 1, "stale 1200 s point must be gone: {:?}", best.iter().map(|p| p.duration_secs).collect::<Vec<_>>());
+        assert_eq!(best[0].watts, 380);
+    }
+
+    #[tokio::test]
     async fn best_power_curve_takes_max_across_sessions() {
         let (storage, _tmp) = test_storage().await;
 
