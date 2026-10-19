@@ -558,3 +558,12 @@ Each slice is one commit with its tests (failing first).
 
 - Bluetooth SIG: Cycling Power Service v1.1 §3.2.1; Cycling Speed and Cadence Service v1.0 §3.1–3.2; Fitness Machine Service v1.0 §4.13, §4.16, Tables 4.1/4.15/4.20; Errata Service Release 11 (E8991, E9135); GATT Specification Supplement (2026-09-09) §3.75, §3.70–3.71, §3.231.
 - ANT: ANT Message Protocol and Usage D00000652 Rev 5.1 §5.2.1.4.2, §5.3, §5.7, §9.4, §9.5.2.5, §9.5.2.10, §9.5.2.12, §9.5.2.15, §9.5.5.2, §9.5.6.1; ANT+ Fitness Equipment D00001231 Rev 5.0 Tables 8-25, 8-36, 8-37, 8-38, 8-42; ANT+ Bicycle Power D00001086 Rev 5.0 Tables 8-1, 10-1; ANT+ Heart Rate Monitor D00000693 Rev 1.13 §5.3, Tables 6–7; ANT `ant-nrfconnect/sdk-ant` `ant_bsc` (BSC pages, combined-sensor layout). ANT+ profile PDFs are adopter-only; they are cited here, not vendored.
+
+## Build notes (deviations recorded during Phase 2)
+
+- **Slice 3, ADR-1b amendment: disconnect epoch.** A connect queued on the gate *behind* a disconnect would otherwise run after it (tokio mutexes are FIFO) and reconnect the device the user just disconnected. `disconnect_shared` bumps `disconnect_epoch[id]`. Every connect captures the epoch in its prepare phase; if it changed by the post-gate re-check, the connect returns `Err(Cancelled)`. Test: `concurrent_connects_disconnect_cancels_owner_attempt`.
+- **Slice 3: `AppError::Cancelled`** (`src-tauri/src/error.rs`, serialised code `connect_cancelled`) is a new variant, additive. It is returned to a connect cancelled by a disconnect.
+- **Slice 3: `tokio` dev-dependency with `test-util`** (`src-tauri/Cargo.toml`, `[dev-dependencies]` only) enables `start_paused` tests. `ReconnectManager` now uses `tokio::time::Instant`, which is identical to std `Instant` in production.
+- **Slice 3: `device_reconnecting` timing.** The event is emitted when a spawned attempt fails, reported on the next tick, rather than on every tick before the attempt. Payload is unchanged.
+- **Slice 3: failed manual connect of a Reconnecting device** removes its live record. The user took over (the reconnect target was already cleared), so the device shows as Disconnected instead of staying Reconnecting with no retry pending. Test: `manual_connect_failure_drops_reconnecting_record`.
+- **Slice 3: `disconnect_shared`** clears reconnect target and primaries both before and after taking the gate. A watchdog Lost transition that ran while the disconnect waited cannot leave a target behind.

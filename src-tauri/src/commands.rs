@@ -94,8 +94,7 @@ pub async fn scan_devices(
     app: tauri::AppHandle,
 ) -> Result<Vec<DeviceInfo>, AppError> {
     info!("Scanning for devices");
-    let mut dm = state.device_manager.lock().await;
-    let devices = dm.scan_all().await?;
+    let devices = DeviceManager::scan_shared(&state.device_manager).await?;
     let _ = app.emit("device_list_updated", &devices);
     Ok(devices)
 }
@@ -108,10 +107,9 @@ pub async fn connect_device(
 ) -> Result<DeviceInfo, AppError> {
     info!("Connecting device: {}", device_id);
     let tx = state.sensor_tx.clone();
-    let mut dm = state.device_manager.lock().await;
-    let info = dm.connect(&device_id, tx).await?;
+    let info = DeviceManager::connect_shared(&state.device_manager, &device_id, tx).await?;
 
-    let all = dm.list_current().await;
+    let all = state.device_manager.lock().await.list_current().await;
     let _ = app.emit("device_list_updated", &all);
 
     Ok(info)
@@ -124,11 +122,9 @@ pub async fn disconnect_device(
     device_id: String,
 ) -> Result<(), AppError> {
     info!("Disconnecting device: {}", device_id);
-    let mut dm = state.device_manager.lock().await;
-    dm.clear_reconnect_target(&device_id);
-    dm.disconnect(&device_id).await?;
+    DeviceManager::disconnect_shared(&state.device_manager, &device_id).await?;
 
-    let all = dm.list_current().await;
+    let all = state.device_manager.lock().await.list_current().await;
     let _ = app.emit("device_list_updated", &all);
 
     Ok(())
@@ -250,8 +246,7 @@ pub async fn get_device_details(
     state: State<'_, AppState>,
     device_id: String,
 ) -> Result<DeviceDetails, AppError> {
-    let dm = state.device_manager.lock().await;
-    dm.get_device_details(&device_id).await
+    DeviceManager::device_details_shared(&state.device_manager, &device_id).await
 }
 
 #[tauri::command]

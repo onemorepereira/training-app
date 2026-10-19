@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use super::channel::*;
 use super::listener::listen_ant_channel;
 use super::usb::*;
+use crate::device::io::{AntLink, AntLinks};
 use crate::device::types::*;
 use crate::error::{AntError, AppError};
 
@@ -28,6 +29,9 @@ struct ActiveConnection {
     device_number: u16,
     stop_flag: Arc<AtomicBool>,
     listener_handle: Option<JoinHandle<()>>,
+    /// Set when the channel/listener has stopped delivering for good.
+    closed: Arc<AtomicBool>,
+    info: DeviceInfo,
 }
 
 /// Maximum channels on an ANT+ USB stick
@@ -46,16 +50,18 @@ pub struct AntManager {
     connected: HashMap<String, ActiveConnection>,
     /// Metadata from ANT+ Common Data Pages, keyed by device_id
     device_metadata: Arc<Mutex<HashMap<String, AntDeviceMetadata>>>,
-    /// Lock-free last-data-received timestamps for the connection watchdog.
-    /// Each device gets an Arc<AtomicI64> storing nanos since Instant epoch.
-    /// Written by listeners on every ANT+ page without locking.
-    last_seen: Arc<Mutex<HashMap<String, Arc<AtomicI64>>>>,
+    /// Per-device link handles (last-seen timestamp + closed flag) shared with the
+    /// watchdog outside the AntSlot lock. Written by listeners without locking.
+    links: AntLinks,
 }
 
 impl AntManager {
     /// Try to initialize ANT+ (returns None if no USB stick found).
     /// Opens the USB stick, initializes it, and starts the router thread.
-    pub fn try_new() -> Option<Self> {
+    pub fn try_new(
+        device_metadata: Arc<Mutex<HashMap<String, AntDeviceMetadata>>>,
+        links: AntLinks,
+    ) -> Option<Self> {
         if !AntUsb::is_available() {
             info!("No ANT+ USB stick detected");
             return None;
@@ -102,8 +108,8 @@ impl AntManager {
             response_queue,
             discovered: HashMap::new(),
             connected: HashMap::new(),
-            device_metadata: Arc::new(Mutex::new(HashMap::new())),
-            last_seen: Arc::new(Mutex::new(HashMap::new())),
+            device_metadata,
+            links,
         })
     }
 
@@ -291,6 +297,16 @@ impl AntManager {
         tx: broadcast::Sender<SensorReading>,
         primaries: Option<Arc<std::sync::RwLock<HashMap<DeviceType, String>>>>,
     ) -> Result<DeviceInfo, AppError> {
+        // Idempotent: never open a second channel for a device that is still live.
+        // A connection whose channel has closed is torn down and reopened.
+        if let Some(conn) = self.connected.get(device_id) {
+            if !conn.closed.load(Ordering::SeqCst) {
+                return Ok(conn.info.clone());
+            }
+            log::info!("[{}] Previous ANT+ channel closed; reopening", device_id);
+            self.disconnect(device_id)?;
+        }
+
         let discovered = self
             .discovered
             .get(device_id)
@@ -321,15 +337,21 @@ impl AntManager {
         let did = device_id.to_string();
         let metadata = self.device_metadata.clone();
 
-        // Create lock-free timestamp for this device's watchdog heartbeat
+        // Lock-free link handles for the watchdog heartbeat
         let last_seen_ts = Arc::new(AtomicI64::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
         {
-            let mut ls = self.last_seen.lock().unwrap_or_else(|e| e.into_inner());
-            ls.insert(device_id.to_string(), last_seen_ts.clone());
+            let mut links = self.links.lock().unwrap_or_else(|e| e.into_inner());
+            links.insert(
+                device_id.to_string(),
+                AntLink { last_seen: last_seen_ts.clone(), closed: closed.clone() },
+            );
         }
+        let closed_clone = closed.clone();
 
         let listener_handle = tokio::task::spawn_blocking(move || {
             listen_ant_channel(data_rx, device_type, tx, stop_clone, did, metadata, dtype_id, last_seen_ts, primaries);
+            closed_clone.store(true, Ordering::SeqCst);
         });
 
         let info = DeviceInfo {
@@ -359,6 +381,8 @@ impl AntManager {
                 device_number: discovered.device_number,
                 stop_flag,
                 listener_handle: Some(listener_handle),
+                closed,
+                info: info.clone(),
             },
         );
 
@@ -380,29 +404,21 @@ impl AntManager {
             if let Some(handle) = conn.listener_handle.take() {
                 handle.abort();
             }
-            close_channel(&self.usb, conn.channel_number, &self.response_queue)?;
+            {
+                let mut links = self.links.lock().unwrap_or_else(|e| e.into_inner());
+                links.remove(device_id);
+            }
+            // Tolerate a channel the radio already closed (search timeout, stick reset):
+            // the bookkeeping above is what matters for a clean reopen.
+            if let Err(e) = close_channel(&self.usb, conn.channel_number, &self.response_queue) {
+                warn!("[{}] Closing ANT+ channel {} failed (treated as closed): {}", device_id, conn.channel_number, e);
+            }
         }
         Ok(())
     }
 
     pub fn is_discovered(&self, device_id: &str) -> bool {
         self.discovered.contains_key(device_id)
-    }
-
-    /// Get decoded common-page metadata for a connected ANT+ device
-    pub fn get_metadata(&self, device_id: &str) -> Option<AntDeviceMetadata> {
-        let meta = self.device_metadata.lock().unwrap_or_else(|e| e.into_inner());
-        meta.get(device_id).cloned()
-    }
-
-    /// Get a clone of the metadata store Arc (for the connection watchdog)
-    pub fn metadata_store(&self) -> Arc<Mutex<HashMap<String, AntDeviceMetadata>>> {
-        self.device_metadata.clone()
-    }
-
-    /// Get a clone of the lock-free last-seen timestamp store (for the connection watchdog)
-    pub fn last_seen_store(&self) -> Arc<Mutex<HashMap<String, Arc<AtomicI64>>>> {
-        self.last_seen.clone()
     }
 
     /// Get the USB handle and channel number for a connected FE-C device (for trainer control)

@@ -277,48 +277,30 @@ pub fn run() {
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_secs(config::CONNECTION_CHECK_INTERVAL_SECS)).await;
 
-                            let disconnected = {
-                                let mut dm = dm.lock().await;
-                                dm.check_connections().await
-                            };
+                            // Probe + transitions only; teardowns and reconnect attempts
+                            // are spawned and report through the next tick.
+                            let report =
+                                DeviceManager::watchdog_tick(&dm, &sensor_tx_clone).await;
 
-                            if !disconnected.is_empty() {
-                                // Emit disconnect events to frontend
-                                for info in &disconnected {
-                                    let _ = handle.emit("device_disconnected", &info.id);
-                                }
-
-                                // Push updated device list
-                                {
-                                    let dm = dm.lock().await;
-                                    let all = dm.list_current().await;
-                                    let _ = handle.emit("device_list_updated", &all);
-                                }
+                            for id in &report.disconnected {
+                                let _ = handle.emit("device_disconnected", id);
                             }
-
-                            // Attempt reconnects for devices due for retry
-                            let (reconnected, trying) = {
-                                let mut dm = dm.lock().await;
-                                dm.attempt_reconnects(&sensor_tx_clone).await
-                            };
-
-                            for info in &reconnected {
-                                let _ = handle.emit("device_reconnected", &info.id);
+                            for id in &report.reconnected {
+                                let _ = handle.emit("device_reconnected", id);
                             }
-
-                            if !reconnected.is_empty() {
-                                let dm = dm.lock().await;
-                                let all = dm.list_current().await;
+                            if report.list_changed() {
+                                let all = dm.lock().await.list_current().await;
                                 let _ = handle.emit("device_list_updated", &all);
                             }
-
-                            for (info, attempt) in &trying {
-                                let _ =
-                                    handle.emit("device_reconnecting", &serde_json::json!({
+                            for (info, attempt) in &report.reconnecting {
+                                let _ = handle.emit(
+                                    "device_reconnecting",
+                                    &serde_json::json!({
                                         "device_id": info.id,
                                         "device_type": info.device_type.as_str(),
                                         "attempt": attempt,
-                                    }));
+                                    }),
+                                );
                             }
                         }
                     });

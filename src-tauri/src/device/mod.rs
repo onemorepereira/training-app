@@ -3,6 +3,7 @@ pub mod ble;
 pub mod dedup;
 pub mod fec;
 pub mod ftms;
+pub mod io;
 pub mod listener;
 pub mod manager;
 pub mod protocol;

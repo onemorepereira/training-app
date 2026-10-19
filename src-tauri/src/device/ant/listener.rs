@@ -29,6 +29,14 @@ pub fn atomic_elapsed(ts: &AtomicI64) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_nanos(elapsed_nanos))
 }
 
+/// Test helper: make `ts` read as having been set `age` ago.
+#[cfg(test)]
+pub fn atomic_set_age(ts: &AtomicI64, age: std::time::Duration) {
+    let nanos = EPOCH.elapsed().as_nanos() as i64 - age.as_nanos() as i64;
+    // 0 means "never set"; nudge an exact zero so the value stays meaningful.
+    ts.store(if nanos == 0 { -1 } else { nanos }, Ordering::Relaxed);
+}
+
 /// Decode ANT+ Common Data Page 80: Manufacturer's Information
 /// Byte 3: HW revision
 /// Bytes 4-5: Manufacturer ID (u16 LE)

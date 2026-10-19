@@ -42,5 +42,5 @@ tempfile = "3"
 sha2 = "0.10.9"
 # Independent FIT decoder used only to verify fit_export output (generated from the FIT SDK profile).
 fitparser = "=0.11.0"
-# test-util enables tokio::time::pause / start_paused for deterministic controller tests
+# test-util enables tokio::time::pause / start_paused for deterministic controller and device lifecycle tests
 tokio = { version = "1", features = ["full", "test-util"] }

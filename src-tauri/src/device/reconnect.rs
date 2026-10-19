@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// tokio Instant: identical to std in production, controllable in paused-time tests.
+use tokio::time::Instant;
 
 use super::types::DeviceInfo;
 use crate::config;
@@ -47,6 +49,7 @@ impl ReconnectManager {
     }
 
     /// Return devices due for a retry attempt and bump their backoff
+    #[cfg(test)]
     pub fn due_for_retry(&mut self) -> Vec<DeviceInfo> {
         let now = Instant::now();
         let mut due = Vec::new();
@@ -60,6 +63,34 @@ impl ReconnectManager {
             }
         }
         due
+    }
+
+    /// Devices whose retry time has come, without consuming the retry.
+    /// Callers that actually start an attempt call `record_attempt`.
+    pub fn peek_due(&self) -> Vec<DeviceInfo> {
+        let now = Instant::now();
+        self.targets
+            .values()
+            .filter(|t| now >= t.next_retry)
+            .map(|t| t.info.clone())
+            .collect()
+    }
+
+    /// Count an attempt and push the next retry out by the (growing) backoff.
+    /// Returns the attempt number. No-op (0) if the device is not a target.
+    pub fn record_attempt(&mut self, device_id: &str) -> u32 {
+        let Some(target) = self.targets.get_mut(device_id) else {
+            return 0;
+        };
+        target.attempts += 1;
+        target.backoff_ms =
+            (target.backoff_ms * config::RECONNECT_BACKOFF_MULTIPLIER).min(config::RECONNECT_MAX_BACKOFF_MS);
+        target.next_retry = Instant::now() + Duration::from_millis(target.backoff_ms);
+        target.attempts
+    }
+
+    pub fn contains(&self, device_id: &str) -> bool {
+        self.targets.contains_key(device_id)
     }
 
     pub fn attempt_count(&self, device_id: &str) -> u32 {
