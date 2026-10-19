@@ -44,6 +44,15 @@ An independent review found three blocking issues and several gaps in the harnes
 
 **After the fixes:** `--check --no-shots` passes in Chromium and WebKit with 0 failures each, and `--check --only=-normal` with screenshots passes in both too.
 
+**Second verify pass:** it confirmed all three blockers are resolved and regression-tested. It saw one Chromium flake in the devices flow: Scan was clicked while the button was still settling.
+- **Harness fix:** flow steps now poll for the expected backend commands (up to 3 s) instead of sleeping, and the scan step waits for a settled, enabled "Scan for devices".
+- **Minor fixes from that pass:**
+  - "Ride not found" matches only the missing-ride errors;
+  - a scan after a load error reloads the page state, including primaries;
+  - a zone-start error hides once the target changes;
+  - the trainer shortcut ignores every `<input>`, as it did before.
+- **Stability:** three consecutive full `--check` runs pass in both engines, 6 of 6 green.
+
 ## Acceptance criteria
 | AC | Status | How it's proven |
 |---|---|---|

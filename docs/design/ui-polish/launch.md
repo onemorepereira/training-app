@@ -26,7 +26,7 @@ There are no backend behaviour, data or schema changes. Only these non-frontend 
 |---|---|---|---|
 | 1 | `feat/ui-polish-1-foundations` | `e21f984`..`013735b` | Harness and baseline, spec and design; fonts and tokens; shared components and chart theme; navigation, Esc and fullscreen |
 | 2 | `feat/ui-polish-2-ride` | `1748f1a`..`747caef` | Post-ride and edit dialog; ride screen |
-| 3 | `feat/ui-polish-3-screens` | `1ef200f`..`9bcd1c8` (plus launch) | Devices, History and detail, Analytics, Settings and About; docs; verification |
+| 3 | `feat/ui-polish-3-screens` | `1ef200f`..branch head | Devices, History and detail, Analytics, Settings and About; docs; verification |
 
 - PR 1 targets `main`, and each later PR targets the one before it.
 - After each squash merge, rebase the next PR onto `main` and retarget it, as was done for #191–#195.

@@ -126,7 +126,8 @@
   function handleKeydown(e: KeyboardEvent) {
     // Keys already handled (e.g. arrows moving a radio group), typing in a field,
     // or an open dialog must not also change the trainer load.
-    if (e.defaultPrevented || isTypingTarget(e.target as Element | null) || overlayOpen(document)) return;
+    const target = e.target as Element | null;
+    if (e.defaultPrevented || target?.tagName === 'INPUT' || isTypingTarget(target) || overlayOpen(document)) return;
     // The zone controller owns the trainer during a zone ride.
     if (get(zoneActive)) return;
 

@@ -126,8 +126,14 @@ async function walk(page, steps) {
       fails.push(`${step.name}: ${e.message.split('\n')[0]}`);
       break;
     }
-    await page.waitForTimeout(step.wait ?? 400);
-    const got = await callsSince(page, m);
+    // Poll for the expected commands (up to `wait`, default 3 s) instead of a fixed sleep.
+    const deadline = Date.now() + (step.wait ?? 3000);
+    let got = await callsSince(page, m);
+    while ((step.expect ?? []).some((c) => !got.includes(c)) && Date.now() < deadline) {
+      await page.waitForTimeout(100);
+      got = await callsSince(page, m);
+    }
+    await page.waitForTimeout(300); // let the UI settle before step.check
     for (const cmd of step.expect ?? []) if (!got.includes(cmd)) fails.push(`${step.name}: expected ${cmd}, got [${got.join(', ')}]`);
     if (step.check) {
       const extra = await step.check(page);
@@ -195,7 +201,17 @@ export const SCENARIOS = [
     route: 'devices',
     async run(page) {
       return walk(page, [
-        { name: 'scan', act: (p) => p.getByRole('button', { name: /^Scan/ }).first().click(), expect: ['scan_devices'], wait: 1500 },
+        {
+          name: 'scan',
+          act: async (p) => {
+            // Wait for the initial load to finish so the button is the settled, enabled "Scan for devices".
+            const scan = p.getByRole('button', { name: 'Scan for devices', exact: true });
+            await scan.waitFor({ state: 'visible' });
+            await p.waitForFunction(() => [...document.querySelectorAll('button')].some((b) => b.textContent.trim() === 'Scan for devices' && !b.disabled));
+            await scan.click();
+          },
+          expect: ['scan_devices'],
+        },
         {
           name: 'details',
           act: (p) => p.getByRole('button', { name: /^Details/ }).first().click(),
@@ -465,17 +481,26 @@ export const SCENARIOS = [
       return walk(page, [
         {
           name: 'arrow on view switcher',
-          act: async (p) => { await p.getByRole('radio', { name: 'Gauges' }).focus(); await p.keyboard.press('ArrowRight'); await p.keyboard.press('ArrowDown'); },
+          act: async (p) => {
+            await p.getByRole('radio', { name: 'Gauges' }).focus();
+            p.__mark = await mark(p);
+            await p.keyboard.press('ArrowRight');
+            await p.keyboard.press('ArrowDown');
+          },
           check: async (p) => {
-            const got = await p.evaluate(() => (window.__mockCalls || []).slice(-10).map((c) => c[0]));
+            const got = await callsSince(p, p.__mark);
             return got.some((c) => c.startsWith('set_trainer')) ? `trainer command sent: ${got.join(', ')}` : null;
           },
         },
         {
           name: 'arrow on trainer mode',
-          act: async (p) => { await p.getByRole('radio', { name: 'ERG', exact: true }).focus(); await p.keyboard.press('ArrowUp'); },
+          act: async (p) => {
+            await p.getByRole('radio', { name: 'ERG', exact: true }).focus();
+            p.__mark = await mark(p);
+            await p.keyboard.press('ArrowUp');
+          },
           check: async (p) => {
-            const calls = await p.evaluate(() => (window.__mockCalls || []).slice(-4).map((c) => c[0]));
+            const calls = await callsSince(p, p.__mark);
             // Changing mode sends one command for the new mode, but no extra adjust on top of it.
             return calls.filter((c) => c.startsWith('set_trainer')).length > 1 ? `extra trainer adjust: ${calls.join(', ')}` : null;
           },

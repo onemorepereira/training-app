@@ -87,8 +87,8 @@
     error = '';
     try {
       await storeScan();
-      // A scan that works means the device list is readable again.
-      if (loadState === 'error') loadState = 'ready';
+      // A scan that works means the device list is readable again: reload it fully (incl. primaries).
+      if (loadState === 'error') await load();
     } catch (e) {
       error = extractError(e);
     } finally {

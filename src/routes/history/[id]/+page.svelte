@@ -54,8 +54,8 @@
   let error = $state('');
   /** Bumped by Retry to re-run the loads. */
   let reloadToken = $state(0);
-  // The backend reports a missing ride as sqlx's "no rows returned".
-  let notFound = $derived(/not found|no rows/i.test(loadError));
+  // A missing ride: sqlx's "no rows returned" from the backend, or "session … not found".
+  let notFound = $derived(/no rows returned|session\b.*\bnot found/i.test(loadError));
   let editSession = $state<SessionSummary | null>(null);
   let exportingFit = $state(false);
   let smoothing = $state(10);

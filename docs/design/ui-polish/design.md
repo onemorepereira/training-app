@@ -1,6 +1,6 @@
 # UI polish — Design
 
-**Spec:** [spec.md](spec.md)   **Status:** Reviewed (design gate passed after 2 review passes)   **Last updated:** 2026-10-19
+**Spec:** [spec.md](spec.md)   **Status:** Current (design gate passed after 2 review passes; built and verified)   **Last updated:** 2026-10-19
 
 ## Overview
 This is a frontend-only overhaul in four layers:
