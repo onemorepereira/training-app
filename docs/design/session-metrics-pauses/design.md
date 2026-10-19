@@ -54,7 +54,7 @@ Existing patterns followed: inline `run_alter_ignore_duplicate` / `CREATE TABLE 
 
 **SQLite (idempotent, inline in `Storage::new`, after the existing ALTERs):**
 ```sql
-CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT);
 ALTER TABLE sessions ADD COLUMN zones TEXT;   -- via run_alter_ignore_duplicate; NULL = unknown (pre-change)
 ```
 - `app_meta('metrics_version')`: missing means legacy (version 1). `'2'` means the repair has completed. Area E's consolidation must include both objects (the spec already agrees this).
@@ -162,6 +162,15 @@ ALTER TABLE sessions ADD COLUMN zones TEXT;   -- via run_alter_ignore_duplicate;
 - Why: at 1 Hz, a 3 s window then holds exactly 3 samples (t-2, t-1, t). The test `avg_power_window_boundary_is_inclusive` is renamed `avg_power_window_excludes_sample_exactly_window_old` and asserts 200.0 (only the 10000 ms sample).
 - Reversibility: easy.
 
+### Review rulings (2026-10-18) — amendments to the ADRs above
+- **ADR-8 note A (FTP for NULL-ftp rows, supersedes the "current config FTP" default):** when `session.ftp` is NULL, derive `ftp = round(stored NP / stored IF)` when both are present and IF > 0; use it for IF/TSS but never write it to the `ftp` column. If not derivable, the repair leaves the stored IF and TSS unchanged for that session (other metrics are still recomputed). Tests: `repair_null_ftp_derives_ftp_from_stored_np_and_if`, `repair_null_ftp_without_if_keeps_stored_if_and_tss`.
+- **ADR-8 note B (max_hr):** the repair recomputes and writes **all** `SummaryMetrics` fields, including `max_hr`. Untouched list is therefore `duration_secs`, `ftp`, title/type/RPE/notes, `zones`, `zone_config`.
+- **ADR-8 note C (power-curve writes):** `save_power_curve` itself does delete-then-insert inside one transaction, so every writer (stop-time save, `backfill_power_curves`, repair) gets the same atomic replace; `replace_session_metrics` does the same delete+insert inside its own transaction.
+- **ADR-8 note D (retry cap):** `app_meta.metrics_repair_attempts` is incremented at the start of each run. If a run ends with `failed > 0` and attempts ≥ 3, `metrics_version` is set anyway and the failing session ids are logged at warn. Test: `repair_gives_up_after_three_failed_attempts`.
+- **ADR-5 note (short pauses):** pauses ≤ 5 s are indistinguishable from sensor holes in the raw log, so they produce **no** FIT timer stop/start events (records just skip those seconds; values are held/invalidated per the 5 s rule).
+- **Schema note (Area E):** `app_meta` is exactly `CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)` (nullable `value`). `PRAGMA user_version` is never used. `sessions.zones` stays an inline idempotent ALTER; Area E absorbs it (or Area A converts it to a migration file later if E lands first).
+- **Cross-area:** CI/release `npm test` step comes from Area E (E7); this branch does not edit workflows. Frontend touches in `tauri.ts`, `history/[id]/+page.svelte`, `ZoneRideAnalysis.svelte` stay minimal (Area D edits nearby).
+
 ## Failure modes
 
 | Failure | Detection | Behavior | Recovery |
@@ -174,6 +183,8 @@ ALTER TABLE sessions ADD COLUMN zones TEXT;   -- via run_alter_ignore_duplicate;
 | Corrupt epoch_ms (e.g. 0) in a log | n/a | Sparse timeseries and segmented curve avoid huge allocations; FIT emits records at that timestamp | n/a |
 | Old autosave JSON without `zones` | serde default | `zones = None`, falls back to current zones | n/a |
 | User edits metadata during repair | n/a | Repair updates only metric columns, so there is no lost update | n/a |
+| Two writers replace the same session's power curve concurrently (stop-time save vs backfill vs repair) | n/a | `save_power_curve`/`replace_session_metrics` delete+insert in one transaction; SQLite serialises write transactions, so the last commit wins with a complete curve and no interleaved rows | n/a |
+| Repair keeps failing on the same session(s) | `metrics_repair_attempts` ≥ 3 with failed > 0 | Marker set anyway; failing ids logged at warn | Manual: clear the marker after fixing |
 | `fitparser` rejects a file we believe is valid | test failure | Investigate against the SDK profile; fitdecode cross-check | Fix exporter or document the decoder bug |
 
 ## Migration and rollback
@@ -181,6 +192,7 @@ ALTER TABLE sessions ADD COLUMN zones TEXT;   -- via run_alter_ignore_duplicate;
 - Data: one-time repair, guarded by the marker, with the backup at `training.db.bak-metrics-v2`.
 - Rollback of the app version: an older build ignores the new table and column and reads the repaired numbers (same columns, same types).
 - Rollback of the data: quit the app, then replace `training.db` with the `.bak-metrics-v2` file. This will be documented in the PR description.
+- Downgrade-then-reupgrade (sessions recorded by an older build after the repair ran) is **unsupported during beta**: the marker is not re-checked per session and no finer-grained marker is kept.
 - Future algorithm changes: bump `CURRENT_METRICS_VERSION` and use a new backup suffix. The repair is written generically for this.
 
 ## Traceability

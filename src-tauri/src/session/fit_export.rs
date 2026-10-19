@@ -111,10 +111,12 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
     w.write_data(0, &file_id_data);
 
     // --- device_info message (local 1, global 23) ---
+    // Field numbers per Garmin FIT SDK Profile 21.217 (@garmin/fitsdk profile.js):
+    // 2 = manufacturer (uint16); 3 is serial_number (uint32z), not manufacturer.
     w.write_definition(1, 23, &[
         (253, 4, 134), // timestamp: uint32
         (0, 1, 2),     // device_index: uint8
-        (3, 2, 132),   // manufacturer: uint16
+        (2, 2, 132),   // manufacturer: uint16
         (4, 2, 132),   // product: uint16
         (5, 2, 132),   // software_version: uint16
         (27, 16, 7),   // product_name: string (16 bytes)
@@ -271,7 +273,9 @@ pub fn export_fit(summary: &SessionSummary, readings: &[SensorReading]) -> Resul
         (34, 2, 132),  // normalized_power: uint16
         (35, 2, 132),  // tss: uint16 (* 10)
         (36, 2, 132),  // intensity_factor: uint16 (* 1000)
-        (38, 2, 132),  // threshold_power: uint16
+        // Per FIT SDK Profile 21.217: threshold_power is session field 45 (uint16, W).
+        // Field 38 is end_position_lat (sint32) and must not be used here.
+        (45, 2, 132),  // threshold_power: uint16
     ]);
     let mut sess_data = Vec::new();
     sess_data.extend_from_slice(&end_ts.to_le_bytes());
@@ -553,7 +557,7 @@ mod tests {
         let data = export_fit(&make_summary(), &[]).unwrap();
         let msgs = parse_fit_messages(&data);
         let dev = msgs.iter().find(|m| m.global_msg == 23).expect("no device_info message");
-        assert_eq!(dev.field_u16(3), Some(255), "manufacturer should be 255 (development)");
+        assert_eq!(dev.field_u16(2), Some(255), "manufacturer should be 255 (development)");
         assert_eq!(
             dev.field_string(27).as_deref(),
             Some("My Training App"),
@@ -629,7 +633,7 @@ mod tests {
         assert_eq!(session.field_u8(18), Some(90), "avg_cadence");
         assert_eq!(session.field_u16(35), Some(750), "tss * 10");
         assert_eq!(session.field_u16(36), Some(950), "intensity_factor * 1000");
-        assert_eq!(session.field_u16(38), Some(200), "threshold_power (ftp)");
+        assert_eq!(session.field_u16(45), Some(200), "threshold_power (ftp)");
         assert_eq!(session.field_u16(11), Some(648), "total_calories");
         // 30 km * 100_000 = 3_000_000
         assert_eq!(session.field_u32(9), Some(3_000_000), "total_distance");
@@ -647,5 +651,62 @@ mod tests {
         // Second event: stop_all
         assert_eq!(events[1].field_u8(0), Some(0), "second event should be timer (0)");
         assert_eq!(events[1].field_u8(1), Some(4), "second event_type should be stop_all (4)");
+    }
+
+    #[test]
+    fn fit_session_threshold_power_is_field_45() {
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let session = msgs.iter().find(|m| m.global_msg == 18).expect("no session");
+        assert_eq!(session.field_u16(45), Some(200), "threshold_power (field 45) = FTP");
+        assert!(
+            session.field_bytes.iter().all(|(n, _)| *n != 38),
+            "field 38 is end_position_lat and must not be written"
+        );
+    }
+
+    #[test]
+    fn fit_device_info_manufacturer_is_field_2() {
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let msgs = parse_fit_messages(&data);
+        let dev = msgs.iter().find(|m| m.global_msg == 23).expect("no device_info");
+        assert_eq!(dev.field_u16(2), Some(255), "manufacturer (field 2) = development");
+        assert!(
+            dev.field_bytes.iter().all(|(n, _)| *n != 3),
+            "field 3 is serial_number (uint32z) and must not carry the manufacturer"
+        );
+    }
+
+    // --- Independent decoder (fitparser, generated from the FIT SDK profile) ---
+
+    fn decode(data: &[u8]) -> Vec<fitparser::FitDataRecord> {
+        fitparser::from_bytes(data).expect("fitparser failed to decode exported FIT file")
+    }
+
+    fn named<'a>(rec: &'a fitparser::FitDataRecord, name: &str) -> Option<&'a fitparser::Value> {
+        rec.fields().iter().find(|f| f.name() == name).map(|f| f.value())
+    }
+
+    fn first_of(
+        recs: &[fitparser::FitDataRecord],
+        kind: fitparser::profile::MesgNum,
+    ) -> &fitparser::FitDataRecord {
+        recs.iter().find(|r| r.kind() == kind).expect("message kind missing")
+    }
+
+    #[test]
+    fn fit_export_decodes_with_fitparser() {
+        use fitparser::profile::MesgNum;
+        use fitparser::Value;
+        let data = export_fit(&make_summary(), &[]).unwrap();
+        let recs = decode(&data);
+        let session = first_of(&recs, MesgNum::Session);
+        assert_eq!(named(session, "threshold_power"), Some(&Value::UInt16(200)));
+        assert_eq!(named(session, "end_position_lat"), None);
+        assert_eq!(named(session, "normalized_power"), Some(&Value::UInt16(190)));
+        assert_eq!(named(session, "training_stress_score"), Some(&Value::Float64(75.0)));
+        let dev = first_of(&recs, MesgNum::DeviceInfo);
+        assert_eq!(named(dev, "manufacturer"), Some(&Value::String("development".into())));
+        assert_eq!(named(dev, "serial_number"), None);
     }
 }
