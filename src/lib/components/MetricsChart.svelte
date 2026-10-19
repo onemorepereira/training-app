@@ -4,6 +4,7 @@
   import { metricHistory } from '$lib/stores/sensor';
   import { get } from 'svelte/store';
   import { unitSystem, kmhToMph, speedUnit } from '$lib/stores/units';
+  import { zoneMarkArea } from '$lib/utils/liveChart';
 
   let {
     zoneBand = null,
@@ -202,12 +203,8 @@
     const units = $unitSystem;
     if (!chart || history.length === 0) return;
 
-    // Ensure echarts knows the container's current size (handles cases where
-    // the chart was initialised before the container had its final dimensions).
-    const w = chartEl?.clientWidth ?? 0;
-    const h = chartEl?.clientHeight ?? 0;
-    if (w === 0 || h === 0) return;
-    chart.resize({ width: w, height: h });
+    // Sizing is handled by the ResizeObserver (its first observation fires once
+    // the container has a size), so no per-update resize() here.
 
     const now = history[history.length - 1].t;
     const labels = history.map((e) => formatRelativeTime(e.t, now));
@@ -219,16 +216,8 @@
     const maxPower = Math.max(200, ...history.map((e) => e.power ?? 0), ...history.map((e) => e.hr ?? 0));
     const maxRight = Math.max(120, ...history.map((e) => e.cadence ?? 0), ...speedData.map((v) => v ?? 0));
 
-    const powerSeriesOpt: Record<string, unknown> = { data: history.map((e) => e.power) };
-    if (zoneBand) {
-      powerSeriesOpt.markArea = {
-        silent: true,
-        data: [[
-          { yAxis: zoneBand.lower, itemStyle: { color: 'rgba(76, 175, 80, 0.08)' } },
-          { yAxis: zoneBand.upper },
-        ]],
-      };
-    }
+    // Always send markArea: omitting it would keep a stale band under merge mode.
+    const powerSeriesOpt = { data: history.map((e) => e.power), markArea: zoneMarkArea(zoneBand) };
 
     const cmdData = commandedPowerSeries && commandedPowerSeries.length > 0
       ? commandedPowerSeries

@@ -2,6 +2,9 @@ import { writable, get } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { SensorReading, LiveMetrics } from '$lib/tauri';
 import { sessionActive, sessionPaused } from '$lib/stores/session';
+import { appendSample, buildSample, type MetricHistoryEntry } from '$lib/utils/metricHistory';
+
+export type { MetricHistoryEntry };
 
 export const currentPower = writable<number | null>(null);
 export const currentHR = writable<number | null>(null);
@@ -9,15 +12,9 @@ export const currentCadence = writable<number | null>(null);
 export const currentSpeed = writable<number | null>(null);
 export const liveMetrics = writable<LiveMetrics | null>(null);
 
-export interface MetricHistoryEntry {
-  t: number;
-  power: number | null;
-  hr: number | null;
-  cadence: number | null;
-  speed: number | null;
-}
-
-const MAX_HISTORY = 600;
+/** Live chart history: one sample per second, 10 minutes. */
+export const MAX_HISTORY = 600;
+const SAMPLE_INTERVAL_MS = 1000;
 export const metricHistory = writable<MetricHistoryEntry[]>([]);
 
 let latestPower: number | null = null;
@@ -59,6 +56,7 @@ export function getSensorSnapshot(now: number = Date.now()): SensorSnapshot {
 
 let unlistenSensor: (() => void) | null = null;
 let unlistenMetrics: (() => void) | null = null;
+let sampleTimer: ReturnType<typeof setInterval> | null = null;
 let generation = 0;
 
 export async function startSensorListening() {
@@ -74,13 +72,6 @@ export async function startSensorListening() {
       if (reading.HeartRate) { latestHR = reading.HeartRate.bpm; lastSeenAt.hr = now; currentHR.set(latestHR); }
       if (reading.Cadence) { latestCadence = reading.Cadence.rpm; lastSeenAt.cadence = now; currentCadence.set(latestCadence); }
       if (reading.Speed) { latestSpeed = reading.Speed.kmh; lastSeenAt.speed = now; currentSpeed.set(latestSpeed); }
-
-      if (get(sessionActive) && !get(sessionPaused)) {
-        metricHistory.update((h) => {
-          const next = [...h, { t: Date.now(), power: latestPower, hr: latestHR, cadence: latestCadence, speed: latestSpeed }];
-          return next.length > MAX_HISTORY ? next.slice(next.length - MAX_HISTORY) : next;
-        });
-      }
     }),
     listen<LiveMetrics>('live_metrics', (event) => {
       liveMetrics.set(event.payload);
@@ -97,10 +88,27 @@ export async function startSensorListening() {
 
   unlistenSensor = sensorUn;
   unlistenMetrics = metricsUn;
+  sampleTimer = setInterval(sampleHistory, SAMPLE_INTERVAL_MS);
+}
+
+/** Append one chart sample per second while a session is running (not paused). */
+function sampleHistory() {
+  if (!get(sessionActive) || get(sessionPaused)) return;
+  const sample = buildSample(
+    { power: latestPower, hr: latestHR, cadence: latestCadence, speed: latestSpeed },
+    lastSeenAt,
+    Date.now(),
+    SENSOR_FRESHNESS_MS,
+  );
+  metricHistory.update((h) => appendSample(h, sample, MAX_HISTORY));
 }
 
 export function stopSensorListening() {
   generation++; // Invalidate any in-flight startSensorListening
+  if (sampleTimer) {
+    clearInterval(sampleTimer);
+    sampleTimer = null;
+  }
   if (unlistenSensor) {
     unlistenSensor();
     unlistenSensor = null;
