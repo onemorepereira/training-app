@@ -54,7 +54,8 @@
   let error = $state('');
   /** Bumped by Retry to re-run the loads. */
   let reloadToken = $state(0);
-  let notFound = $derived(/not found/i.test(loadError));
+  // The backend reports a missing ride as sqlx's "no rows returned".
+  let notFound = $derived(/not found|no rows/i.test(loadError));
   let editSession = $state<SessionSummary | null>(null);
   let exportingFit = $state(false);
   let smoothing = $state(10);
@@ -591,13 +592,13 @@
 
   .two-col {
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 0 var(--space-xl);
   }
 
   @media (min-width: 1200px) {
     .two-col {
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     }
 
     .two-col > :only-child {

@@ -13,7 +13,11 @@
     onStart,
     onClose,
     trainerConnected = false,
+    starting = false,
+    startError = '',
   }: {
+    starting?: boolean;
+    startError?: string;
     open?: boolean;
     config: SessionConfig;
     onStart: (target: ZoneTarget) => void;
@@ -151,7 +155,9 @@
       </label>
     </div>
 
-    {#if resolved.lower >= resolved.upper}
+    {#if startError}
+      <p class="hint error" role="alert">Couldn't start the zone ride: {startError}</p>
+    {:else if resolved.lower >= resolved.upper}
       <p class="hint error">The lower bound must be below the upper bound.</p>
     {:else if !trainerConnected}
       <p class="hint">Connect a smart trainer to start a zone ride.</p>
@@ -164,9 +170,9 @@
       type="button"
       class="btn btn-lg btn-primary"
       data-ride-control
-      disabled={!trainerConnected || resolved.lower >= resolved.upper}
+      disabled={starting || !trainerConnected || resolved.lower >= resolved.upper}
       onclick={handleStart}
-    >Start zone ride</button>
+    >{starting ? 'Starting…' : 'Start zone ride'}</button>
   {/snippet}
 </Dialog>
 

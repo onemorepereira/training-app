@@ -103,13 +103,21 @@
     }
   }
 
+  let zoneStarting = $state(false);
+  let zoneStartError = $state('');
+
   async function handleStartZoneRide(target: ZoneTarget) {
-    error = '';
+    if (zoneStarting) return;
+    zoneStarting = true;
+    zoneStartError = '';
     try {
       await startZoneRide(target);
       showZoneBuilder = false;
     } catch (e) {
-      error = extractError(e);
+      // Shown inside the builder, which stays open, rather than behind it.
+      zoneStartError = extractError(e);
+    } finally {
+      zoneStarting = false;
     }
   }
 
@@ -260,8 +268,10 @@
     bind:open={showZoneBuilder}
     config={userConfig}
     trainerConnected={$trainerConnected}
+    starting={zoneStarting}
+    startError={zoneStartError}
     onStart={handleStartZoneRide}
-    onClose={() => { showZoneBuilder = false; }}
+    onClose={() => { showZoneBuilder = false; zoneStartError = ''; }}
   />
 {/if}
 

@@ -68,6 +68,7 @@ const MATRIX = [
   ['history', 'error'],
   ['history-detail', 'error'],
   ['analytics', 'error'],
+  ['settings', 'error'],
 ];
 
 // Interactive surfaces: [name, routeSlug, state, async (page) => void]
@@ -211,8 +212,18 @@ function measure() {
   for (const el of all) {
     if (!visible(el) || el.closest('svg') || el.tagName === 'CANVAS') continue;
     const cs = getComputedStyle(el);
+    if (el.closest('[data-truncate-ok], .sr-only')) continue; // intentional previews (e.g. notes) that open in full elsewhere
     if (el.scrollWidth > el.clientWidth + 1 && (cs.overflowX === 'hidden' || cs.textOverflow === 'ellipsis') && el.clientWidth > 0)
-      clipped.push({ el: desc(el), text: text(el), client: el.clientWidth, scroll: el.scrollWidth });
+      if ([...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim()))
+        clipped.push({ el: desc(el), text: text(el), client: el.clientWidth, scroll: el.scrollWidth });
+  }
+  // Any container that scrolls sideways (the page scrolls inside main.content, not the document)
+  const overflowScrollers = [];
+  for (const el of all) {
+    if (!visible(el) || el.closest('svg')) continue;
+    const cs = getComputedStyle(el);
+    if (/(auto|scroll)/.test(cs.overflowX) && el.scrollWidth > el.clientWidth + 1)
+      overflowScrollers.push({ el: desc(el), clientW: el.clientWidth, scrollW: el.scrollWidth });
   }
   const scrollers = [];
   for (const el of all) {
@@ -282,7 +293,7 @@ function measure() {
     overflowX: overflowX.slice(0, 20), clipped: clipped.slice(0, 20), scrollers,
     main: mainR ? { width: Math.round(mainR.width), contentKids: kids } : null,
     tokens, fontsLoaded,
-    controlFonts, rideControlsOut, rideControlCount, rideControlsShort, metricValues, metricCards, contentBlock, emptyBelowPct, navVisible, noticeVisible,
+    overflowScrollers, controlFonts, rideControlsOut, rideControlCount, rideControlsShort, metricValues, metricCards, contentBlock, emptyBelowPct, navVisible, noticeVisible,
   };
 }
 
@@ -395,7 +406,7 @@ async function runEngine(engine, base) {
       const vp = sc.vp ?? { w: 1280, h: 800 };
       const { ctx, page } = await newPage(vp, `scenario:${sc.name}`);
       try {
-        await page.clock.install();
+        if (!sc.realClock) await page.clock.install();
         await page.goto(urlFor(base, sc.route, sc.state ?? 'normal'), { waitUntil: 'domcontentloaded' });
         await settle(page, sc.state ?? 'normal');
         const fails = await sc.run(page);
@@ -490,7 +501,7 @@ if (CHECK) {
       failed = true;
       continue;
     }
-    const res = evaluateMetrics(r.metricsByPage, r.externalRequests);
+    const res = evaluateMetrics(r.metricsByPage, r.externalRequests, r.consoleLog);
     for (const [name, fails] of Object.entries(r.scenarioFailures)) res.push(...fails.map((f) => ({ rule: `scenario:${name}`, page: name, detail: f })));
     console.log(summarize(r.engine, res));
     fs.writeFileSync(path.join(r.engine === 'chromium' ? OUT : path.join(OUT, r.engine), 'check.json'), JSON.stringify(res, null, 1));

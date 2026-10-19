@@ -106,7 +106,7 @@
 
   .bar-row {
     display: grid;
-    grid-template-columns: minmax(150px, 1.1fr) 2fr 4.5rem 3.75rem;
+    grid-template-columns: minmax(13.5rem, 1.3fr) minmax(60px, 2fr) 4.5rem 3.75rem;
     align-items: center;
     gap: var(--space-sm);
     min-height: 28px;

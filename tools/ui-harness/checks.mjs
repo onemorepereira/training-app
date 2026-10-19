@@ -13,7 +13,10 @@ const VALUE_MIN = {
   '1920x1080': { power: 112, primary: 88, secondary: 28 },
 };
 
-export function evaluateMetrics(metricsByPage, externalRequests = {}) {
+// Console errors that are expected in a mock state (not failures).
+const EXPECTED_CONSOLE = [{ state: 'error', re: /Session rehydration failed/ }];
+
+export function evaluateMetrics(metricsByPage, externalRequests = {}, consoleLog = {}) {
   const out = [];
   const fail = (rule, page, detail) => out.push({ rule, page, detail });
   for (const [page, m] of Object.entries(metricsByPage)) {
@@ -30,6 +33,9 @@ export function evaluateMetrics(metricsByPage, externalRequests = {}) {
     for (const f of m.controlFonts ?? []) if (SERIF_OR_UA.test(f.family)) fail('AC2 control font', page, `${f.el} "${f.text}" ${f.family}`);
     // AC6: no horizontal page scroll
     if (m.horizontalScroll) fail('AC6 horizontal scroll', page, `doc scrollWidth ${m.docScrollWidth}`);
+    for (const o of m.overflowScrollers ?? []) fail('AC6 horizontal overflow', page, `${o.el} ${o.scrollW} > ${o.clientW}`);
+    // Text cut off by ellipsis/overflow (intentional previews carry data-truncate-ok)
+    for (const c of m.clipped ?? []) fail('AC19/AC6 clipped text', page, `${c.el} "${c.text}" ${c.scroll} > ${c.client}`);
     // AC6: centred, <=30 % empty at 1920; review-page cards <= 360
     if (!m.contentBlock) fail('hook [data-page] missing', page, m.route);
     else if (vp === '1920x1080' && !m.interaction) {
@@ -55,6 +61,15 @@ export function evaluateMetrics(metricsByPage, externalRequests = {}) {
     }
     if (page.startsWith('ride-riding-fullscreen-1920x1080') && m.emptyBelowPct > 15) fail('AC12 empty below > 15%', page, `${m.emptyBelowPct}%`);
   }
+  // AC24: no unexpected console errors; a page the harness couldn't run fails
+  for (const [page, msgs] of Object.entries(consoleLog)) {
+    const state = metricsByPage[page]?.state ?? (page.includes('-error-') ? 'error' : '');
+    for (const msg of msgs) {
+      if (msg.startsWith('[warning]')) continue;
+      if (EXPECTED_CONSOLE.some((e) => e.state === state && e.re.test(msg))) continue;
+      fail(msg.startsWith('[harness]') ? 'harness could not run page' : 'AC24 console error', page, msg.slice(0, 200));
+    }
+  }
   // AC1: no external requests anywhere
   for (const [page, urls] of Object.entries(externalRequests))
     if (urls.length) fail('AC1 external request', page, [...new Set(urls)].slice(0, 3).join(', '));
@@ -77,7 +92,7 @@ export function summarize(engine, results) {
 }
 
 /*
- * Scripted scenarios: { name, route, state?, vp?, run(page) -> string[] failures }.
+ * Scripted scenarios: { name, route, state?, vp?, realClock?, run(page) -> string[] failures }.
  * The clock is installed (page.clock) before navigation; use page.clock.runFor() instead of sleeps.
  */
 const visibleOpacity = (loc) => loc.evaluate((el) => {
@@ -374,6 +389,98 @@ export const SCENARIOS = [
       const texts = await page.evaluate(() => [...document.querySelectorAll('[data-metric-value]')].map((el) => ({ kind: el.dataset.metricValue, t: el.textContent.trim() })));
       if (!texts.length) return ['no metric values found'];
       return texts.filter((x) => x.t !== '--').map((x) => `${x.kind} shows "${x.t}" instead of --`);
+    },
+  },
+  {
+    name: 'AC1 hanging network: UI paints within 1 s, no external requests',
+    route: 'history-detail',
+    realClock: true, // paint timing entries need the real clock
+    async run(page) {
+      // Every non-local request hangs forever (captive portal / black-holed DNS).
+      const attempted = [];
+      await page.route((url) => !['localhost', '127.0.0.1'].includes(url.hostname), (route) => { attempted.push(route.request().url()); });
+      await page.reload({ waitUntil: 'commit' });
+      const ok = await page.locator('nav').waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false);
+      const fcp = await page.evaluate(() => performance.getEntriesByName('first-contentful-paint')[0]?.startTime ?? null);
+      const fails = [];
+      if (!ok) fails.push('nav not visible within 5 s');
+      if (fcp == null || fcp > 1000) fails.push(`first contentful paint ${fcp == null ? 'missing' : Math.round(fcp) + ' ms'} (> 1000 ms)`);
+      if (attempted.length) fails.push(`external requests: ${[...new Set(attempted)].slice(0, 3).join(', ')}`);
+      return fails;
+    },
+  },
+  {
+    name: 'AC20 history table fits 800x600 with a readable title and sort icon',
+    route: 'history',
+    vp: { w: 800, h: 600 },
+    async run(page) {
+      await page.getByRole('radio', { name: 'Table' }).click();
+      await page.waitForTimeout(400);
+      return page.evaluate(() => {
+        const fails = [];
+        const table = document.querySelector('main table');
+        if (!table) return ['no table'];
+        const wrap = table.parentElement;
+        if (wrap.scrollWidth > wrap.clientWidth + 1) fails.push(`table overflows ${wrap.scrollWidth} > ${wrap.clientWidth}`);
+        const title = table.querySelector('tbody tr td a[href^="/history/"]')?.closest('td');
+        if (!title) fails.push('no title cell');
+        else {
+          const ch = parseFloat(getComputedStyle(title).fontSize) * 0.5; // ~1ch for a proportional font
+          if (title.clientWidth < 24 * ch) fails.push(`title column ${title.clientWidth}px < 24ch`);
+        }
+        const icon = table.querySelector('thead svg');
+        if (!icon) fails.push('no sort icon');
+        else if (icon.getBoundingClientRect().width < 12) fails.push(`sort icon ${icon.getBoundingClientRect().width}px < 12px`);
+        return fails;
+      });
+    },
+  },
+  {
+    name: 'AC17 Esc closes the zone builder and the post-ride dialog',
+    route: 'ride',
+    async run(page) {
+      const fails = [];
+      await page.getByRole('button', { name: 'Zone ride', exact: true }).click();
+      await page.waitForTimeout(300);
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      if (await page.locator('dialog[open]').count()) fails.push('zone builder still open after Esc');
+      const controls = page.locator('section[aria-label="Ride controls"]');
+      await controls.getByRole('button', { name: 'Start', exact: true }).click();
+      await page.waitForTimeout(400);
+      await controls.getByRole('button', { name: 'Stop', exact: true }).click();
+      await page.waitForTimeout(800);
+      if (!(await page.locator('dialog[open]').count())) return [...fails, 'post-ride dialog did not open'];
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      if (await page.locator('dialog[open]').count()) fails.push('post-ride dialog still open after Esc');
+      if (!(await page.locator('nav').isVisible())) fails.push('nav hidden after Esc');
+      return fails;
+    },
+  },
+  {
+    name: 'Arrow keys on a segmented control do not change the trainer',
+    route: 'ride',
+    async run(page) {
+      return walk(page, [
+        {
+          name: 'arrow on view switcher',
+          act: async (p) => { await p.getByRole('radio', { name: 'Gauges' }).focus(); await p.keyboard.press('ArrowRight'); await p.keyboard.press('ArrowDown'); },
+          check: async (p) => {
+            const got = await p.evaluate(() => (window.__mockCalls || []).slice(-10).map((c) => c[0]));
+            return got.some((c) => c.startsWith('set_trainer')) ? `trainer command sent: ${got.join(', ')}` : null;
+          },
+        },
+        {
+          name: 'arrow on trainer mode',
+          act: async (p) => { await p.getByRole('radio', { name: 'ERG', exact: true }).focus(); await p.keyboard.press('ArrowUp'); },
+          check: async (p) => {
+            const calls = await p.evaluate(() => (window.__mockCalls || []).slice(-4).map((c) => c[0]));
+            // Changing mode sends one command for the new mode, but no extra adjust on top of it.
+            return calls.filter((c) => c.startsWith('set_trainer')).length > 1 ? `extra trainer adjust: ${calls.join(', ')}` : null;
+          },
+        },
+      ]);
     },
   },
   {

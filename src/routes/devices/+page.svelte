@@ -87,6 +87,8 @@
     error = '';
     try {
       await storeScan();
+      // A scan that works means the device list is readable again.
+      if (loadState === 'error') loadState = 'ready';
     } catch (e) {
       error = extractError(e);
     } finally {

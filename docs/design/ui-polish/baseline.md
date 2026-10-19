@@ -19,5 +19,12 @@ A page lists at most 40 contrast failures, so the contrast counts are lower boun
 
 The only console error appears in the `error` mock state: `Session rehydration failed: ... database is locked`. That is expected.
 
-## After
-*(This section is filled in at the end of the work.)*
+## After (`feat/ui-polish`, 2026-10-19)
+| Rule | Chromium | WebKit |
+|---|---:|---:|
+| Every rule above | 0 | 0 |
+| Rules added later (container overflow, clipped text, console errors, ride controls < 44 px) | 0 | 0 |
+| Scripted scenarios (AC1, AC8–AC11, AC13, AC17, AC18, AC20, AC24 flows, the arrow-key regression) | all pass | all pass |
+| **Total failures** | **0** | **0** |
+
+First paint on a hanging network went from about 28 s to under 0.8 s.
