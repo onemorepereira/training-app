@@ -175,8 +175,11 @@ export interface ZoneControlStatus {
   elapsed_secs: number;
   duration_secs: number | null;
   paused: boolean;
+  /** 'idle' | 'ramping' | 'adjusting' | 'in_zone' | 'paused' | 'trainer_lost' | 'stopped' */
   phase: string;
   safety_note: string | null;
+  /** Why the controller stopped; set once inactive. Optional until Area B's backend lands. */
+  stop_reason?: StopReason | null;
 }
 
 export type StopReason =
@@ -184,7 +187,11 @@ export type StopReason =
   | 'DurationComplete'
   | 'SafetyStop'
   | 'TrainerDisconnected'
-  | 'SensorLost';
+  | 'SensorLost'
+  | 'SessionStopped'
+  | 'AppClosing'
+  | 'ControllerFault'
+  | 'TrainerUnresponsive';
 
 export interface ZoneRideConfig {
   mode: ZoneMode;

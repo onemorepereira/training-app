@@ -102,6 +102,29 @@ describe('zone ride completion', () => {
     expect(describeZoneStop(result)).toBe('Zone ride stopped: sensor lost (HR sensor lost)');
   });
 
+  it('status_stop_reason_takes_precedence_over_stop_command_reply', async () => {
+    // Area B backend: status carries stop_reason once the controller finalizes itself.
+    api.stopZoneControl.mockResolvedValue('UserStopped');
+    api.getZoneControlStatus.mockResolvedValueOnce(activeZoneStatus());
+    api.getZoneControlStatus.mockResolvedValueOnce(selfStoppedZoneStatus({ stop_reason: 'TrainerUnresponsive', phase: 'trainer_lost' }));
+    await startZoneRide({ mode: 'Power', zone: 3, lower_bound: 150, upper_bound: 180, duration_secs: 600 });
+    await pollTick();
+    await pollTick();
+
+    expect(get(zoneRideResult)?.reason).toBe('TrainerUnresponsive');
+  });
+
+  it('status_with_active_true_during_finalize_is_not_completion', async () => {
+    api.getZoneControlStatus.mockResolvedValueOnce(activeZoneStatus());
+    api.getZoneControlStatus.mockResolvedValueOnce(activeZoneStatus({ phase: 'stopped' }));
+    await startZoneRide({ mode: 'Power', zone: 3, lower_bound: 150, upper_bound: 180, duration_secs: 600 });
+    await pollTick();
+    await pollTick();
+
+    expect(api.stopZoneControl).not.toHaveBeenCalled();
+    expect(get(zoneRideResult)).toBeNull();
+  });
+
   it('zone_ride_result_kept_when_stop_fails', async () => {
     api.stopZoneControl.mockRejectedValue({ message: 'lock poisoned' });
     api.getZoneControlStatus.mockResolvedValueOnce(activeZoneStatus());
@@ -177,6 +200,10 @@ describe('describeZoneStop', () => {
     ['SafetyStop', 'Zone ride stopped: safety stop'],
     ['SensorLost', 'Zone ride stopped: sensor lost'],
     ['TrainerDisconnected', 'Zone ride stopped: trainer disconnected'],
+    ['TrainerUnresponsive', 'Trainer stopped responding — zone ride ended for safety'],
+    ['ControllerFault', 'Zone ride ended: controller fault'],
+    ['SessionStopped', 'Zone ride ended with the session'],
+    ['AppClosing', 'Zone ride ended: app closing'],
     ['UserStopped', 'Zone ride stopped'],
     [null, 'Zone ride stopped'],
   ] as const)('describe_zone_stop_%s', (reason, text) => {

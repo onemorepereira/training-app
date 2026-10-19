@@ -96,6 +96,7 @@ export function completionSnapshot(
     paused: next.paused,
     phase: next.phase,
     safety_note: next.safety_note ?? prev.safety_note,
+    stop_reason: next.stop_reason ?? null,
   };
 }
 
@@ -126,8 +127,11 @@ export function finishZoneRide(snap: ZoneControlStatus): Promise<void> {
     let reason: StopReason | null = null;
     let error: string | null = null;
     try {
-      reason = await api.stopZoneControl();
+      const stopped = await api.stopZoneControl();
+      // Prefer the reason the backend recorded when it stopped on its own.
+      reason = snap.stop_reason ?? stopped;
     } catch (e) {
+      reason = snap.stop_reason ?? null;
       error = `Zone control stop failed: ${extractError(e)}`;
     }
     stopZonePolling();
@@ -149,6 +153,10 @@ export function describeZoneStop(result: Pick<ZoneRideResult, 'reason' | 'safety
     case 'SafetyStop': text = 'Zone ride stopped: safety stop'; break;
     case 'SensorLost': text = 'Zone ride stopped: sensor lost'; break;
     case 'TrainerDisconnected': text = 'Zone ride stopped: trainer disconnected'; break;
+    case 'TrainerUnresponsive': text = 'Trainer stopped responding — zone ride ended for safety'; break;
+    case 'ControllerFault': text = 'Zone ride ended: controller fault'; break;
+    case 'SessionStopped': text = 'Zone ride ended with the session'; break;
+    case 'AppClosing': text = 'Zone ride ended: app closing'; break;
     default: text = 'Zone ride stopped';
   }
   if (result.safetyNote) text += ` (${result.safetyNote})`;

@@ -300,6 +300,20 @@ dashboard zone-ride area (`dash-controls`). They are dismissible and use existin
 (`--accent`, `--danger`, `--bg-elevated`, …). They get a manual check in `npm run tauri dev` for
 each state reachable without hardware, in both themes if the app has themes.
 
+### ADR-16 (Area B alignment): extended zone stop contract
+Area B's revised design adds `SessionStopped`, `AppClosing`, `ControllerFault` and
+`TrainerUnresponsive` to `StopReason`, and an optional `stop_reason` to `ZoneControlStatus`. The
+phase may also be `paused`, `trainer_lost` or `stopped`. During finalize the status stays
+`active: true`, then flips to inactive with `stop_reason` set. The frontend changes are:
+- The TS types gain these as optional fields. They are absent on main until B merges.
+- Completion is still the active→inactive transition.
+- `completionSnapshot` carries `next.stop_reason`. `finishZoneRide` prefers it over the
+  `stop_zone_control` reply, so a later "UserStopped" reply can't mask the real reason.
+- `describeZoneStop` has a message for every reason.
+- Tests: `status_stop_reason_takes_precedence_over_stop_command_reply`,
+  `status_with_active_true_during_finalize_is_not_completion`, and `describe_zone_stop_*` for the
+  new reasons.
+
 ## Failure modes
 | Failure | Detection | Behavior | Recovery |
 |---|---|---|---|
