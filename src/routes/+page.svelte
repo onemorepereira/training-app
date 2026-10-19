@@ -21,7 +21,7 @@
 
   let error = $state('');
   /** Zone-ride notice the user dismissed (the result itself is kept until saved). */
-  let dismissedZoneResult = $state<ZoneRideResult | null>(null);
+  let dismissedZoneResult = $state.raw<ZoneRideResult | null>(null);
   let zoneNotice = $derived($zoneRideResult && $zoneRideResult !== dismissedZoneResult ? $zoneRideResult : null);
   let showZoneBuilder = $state(false);
   let userConfig = $state<SessionConfig | null>(null);
