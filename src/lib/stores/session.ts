@@ -39,21 +39,28 @@ export async function requestStart(): Promise<string> {
 /**
  * Request a session stop. If a stop is already in-flight, piggybacks on
  * that request. If no session is active, returns null.
- * Updates sessionActive/sessionId/sessionPaused atomically on success.
+ * Resets sessionActive/sessionId/sessionPaused whether the stop succeeds or
+ * fails; errors are rethrown for the caller to surface.
  */
 export async function requestStop(): Promise<SessionSummary | null> {
   if (!get(sessionActive)) return null;
 
   if (stopInflight) return stopInflight;
 
-  const promise = api.stopSession();
+  const promise = (async () => {
+    try {
+      return (await api.stopSession()) ?? null;
+    } finally {
+      // On error the backend has still ended the session (its data is kept on
+      // disk), so the UI must not stay in an "active" state it can't stop.
+      sessionActive.set(false);
+      sessionId.set(null);
+      sessionPaused.set(false);
+    }
+  })();
   stopInflight = promise;
   try {
-    const result = await promise;
-    sessionActive.set(false);
-    sessionId.set(null);
-    sessionPaused.set(false);
-    return result ?? null;
+    return await promise;
   } finally {
     stopInflight = null;
   }

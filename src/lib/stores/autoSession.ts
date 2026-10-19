@@ -1,6 +1,8 @@
 import { writable, get } from 'svelte/store';
 import { currentCadence, currentSpeed, liveMetrics } from '$lib/stores/sensor';
-import { sessionActive, requestStart, requestStop } from '$lib/stores/session';
+import { sessionActive } from '$lib/stores/session';
+import { startSession, endSession, lifecycleError } from '$lib/stores/sessionLifecycle';
+import { extractError } from '$lib/tauri';
 
 export const autoSessionEnabled = writable(false);
 export const autoSessionCountdown = writable<number | null>(null);
@@ -33,7 +35,7 @@ function tick() {
       } else {
         autoSessionCountdown.set(null);
         cadenceAboveZeroTicks = 0;
-        requestStart().catch(() => {});
+        startSession().catch((e) => lifecycleError.set(extractError(e)));
       }
     } else {
       cadenceAboveZeroTicks = 0;
@@ -49,7 +51,7 @@ function tick() {
       speedZeroTicks++;
       if (speedZeroTicks >= AUTO_STOP_THRESHOLD_SECS) {
         speedZeroTicks = 0;
-        requestStop().catch(() => {});
+        void endSession(); // surfaces errors via lifecycleError
       }
     } else {
       speedZeroTicks = 0;

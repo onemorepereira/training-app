@@ -122,8 +122,8 @@ cross-component state, and typed `api` wrappers in `tauri.ts`.
   - Every path still shares the same finalisation code, so the spec goal "every way a session
     ends goes through one stop path" holds.
   - C would need a new storage path for a session that is not yet saved, which belongs to Area E.
-- **Spec deviation.** AC2 lists zone-ride completion as a caller of `endSession()`; this design
-  does not. Needs agreement.
+- **Agreed.** The spec owner agreed in design review: zone-ride self-completion finishes the zone
+  ride and does not end the session. AC2 in spec.md has been amended to match.
 - **Consequences.**
   - The held result is lost on webview reload or crash before Stop.
   - There is one `zone_config` column, so if a session has several zone rides the last one wins.
@@ -183,7 +183,8 @@ cross-component state, and typed `api` wrappers in `tauri.ts`.
     though the host was CDT. Node re-reads `process.env.TZ` at runtime.
   - The dev machine runs CDT and CI runs UTC. A guard test asserts
     `new Date('2025-01-15T12:00:00Z').getTimezoneOffset() === 360`, so a missing pin fails loudly
-    in CI.
+    in CI once Area E's E7 (adds `npm test` to ci.yml/release.yml) lands. Today CI does not run
+    vitest.
 - **Weekly trends** fill weeks from the first ride's week to the current local week (or the last
   ride's week if later):
   - Empty weeks have `sessionCount: 0`, `totalTss: 0`, `totalDurationSecs: 0` and null averages.
@@ -235,15 +236,11 @@ cross-component state, and typed `api` wrappers in `tauri.ts`.
 - **Cleanup.** This replaces the `sending` early-returns and removes the unused `throttledSend`.
 - **Reversibility:** easy.
 
-### ADR-8: Auto-stop rule
-- **Decision.** Pure function
-  `isRiderIdle({ speed, speedFresh, cadence, cadenceFresh }): boolean | null`:
-  - Speed source present (`speed != null`): idle when `speed === 0 || !speedFresh`.
-  - Otherwise, cadence source present: idle when `cadence === 0 || !cadenceFresh`.
-  - Neither source: `null`, meaning auto-stop never fires.
-  - "Fresh" comes from frontend `lastSeenAt` within 5 s (`getSensorSnapshot()`), not
-    `liveMetrics.stale_*`. Backend staleness needs at least one in-session reading
-    (manager.rs `is_stale` requires `Some`) and goes stale during pause.
+### ADR-8: Auto-stop rule (superseded in part by ADR-13)
+- **Decision.** Pure function `isRiderIdle(snapshot)` → `boolean | null`. "Fresh" comes from
+  frontend `lastSeenAt` within 5 s (`getSensorSnapshot()`), not `liveMetrics.stale_*`. Backend
+  staleness needs at least one in-session reading (manager.rs `is_stale` requires `Some`) and goes
+  stale during pause. See ADR-13 for the agreed rule.
 - **Tick.** While `sessionPaused` the idle counter resets and nothing fires. After 3 consecutive
   idle ticks, the tick calls `endSession()`. Errors surface through `lifecycleError` and are no
   longer swallowed.
@@ -261,12 +258,54 @@ cross-component state, and typed `api` wrappers in `tauri.ts`.
   a connected trainer (controller.rs:137-142). Zone-ride manual checks (AC2, AC7) therefore need
   real hardware; their logic is covered by store tests.
 
+### ADR-10 (design review): Known limitation, multiple zone rides per session
+Stopping a zone ride manually saves its result too (intended). There is a single `zone_config`
+column, so the last zone ride in a session wins. Follow-up: a per-session list of zone rides
+(storage change, Area E territory).
+
+### ADR-11 (design review): `zoneRideResult` lifecycle
+- Set by `finishZoneRide()` (self-completion, manual zone stop, or inside `endSession()`).
+- A new zone ride's result replaces the previous one.
+- Cleared after a successful `save_zone_ride_config`.
+- If the save or the session stop fails: kept, the error is shown, and it is cleared at the next
+  session start.
+- Cleared on session start. `startSession()` in `sessionLifecycle.ts` wraps `requestStart()` and
+  resets `zoneRideResult` and `metricHistory` on success. Callers (dashboard, auto-start) use it.
+  This avoids a `session.ts` ↔ `sensor.ts` import cycle.
+- Tests: `zone_ride_result_cleared_after_successful_save`, `zone_ride_result_cleared_on_session_start`,
+  `new_zone_ride_result_replaces_previous`, `zone_ride_result_kept_when_save_fails`,
+  `zone_ride_result_kept_when_stop_fails`.
+
+### ADR-12 (design review): `completionSnapshot` sources
+`commanded_power` comes from `prev` (the last active status), because the backend reports
+`commanded_power: None` once inactive (controller.rs `status()`). Mode, zone, bounds and duration
+also come from `prev`. `time_in_zone_secs`, `elapsed_secs` and `safety_note` come from `next` when
+present. Test: `self_completed_ride_saves_non_empty_commanded_power_series`.
+
+### ADR-13 (design review): Auto-stop rule (supersedes spec AC1 wording; spec amended)
+A channel is fresh if it had a reading within the last 5 s, from frontend last-seen timestamps.
+- Speed fresh → idle when `speed === 0`.
+- Else cadence fresh → idle when `cadence === 0`.
+- Else (nothing fresh: no sensors or a sensor dropout) → never auto-stop.
+- Auto-stop after 3 consecutive idle ticks; never while paused.
+
+### ADR-14 (design review): `stop_session` failure
+On a `stop_session` error, `requestStop()` resets `sessionActive`, `sessionPaused` and `sessionId`
+and rethrows. `endSession()` puts the backend error text into `lifecycleError`. `autoSession.ts` no
+longer swallows errors.
+
+### ADR-15 (design review): New UI states
+The zone-stop notice, `lifecycleError` and "Zone ride not saved" render inline in the existing
+dashboard zone-ride area (`dash-controls`). They are dismissible and use existing CSS variables
+(`--accent`, `--danger`, `--bg-elevated`, …). They get a manual check in `npm run tauri dev` for
+each state reachable without hardware, in both themes if the app has themes.
+
 ## Failure modes
 | Failure | Detection | Behavior | Recovery |
 |---|---|---|---|
 | `stop_zone_control` errors inside `endSession` | caught in `finishZoneRide` | reason = null, config still held, session stop proceeds | error shown via `lifecycleError` |
-| `stop_session` errors | caught in `endSession` | session stays active in UI, `lifecycleError` set, zone result kept | user presses Stop again |
-| `save_zone_ride_config` errors | caught | post-ride modal still opens; error "Zone ride not saved: …" | none (best effort, visible) |
+| `stop_session` errors | caught in `endSession` | per Area E's contract the backend has ended the session and kept data on disk: `requestStop` resets `sessionActive`/`sessionPaused`/`sessionId` and rethrows; `lifecycleError` shows the backend error text; zone result kept until next start (ADR-11) | rider starts a new session |
+| `save_zone_ride_config` errors | caught | post-ride modal still opens; inline "Zone ride not saved: …" notice; result kept until next session start | none (best effort, visible) |
 | Stop button and auto-stop at the same time | single-flight `ending` promise | one stop | n/a |
 | Polling sees completion while `endSession` is finishing | single-flight in `finishZoneRide` | one `stop_zone_control` call | n/a |
 | Webview reload with zone result held but not saved | — | result lost (ADR-1) | documented limitation |
@@ -343,6 +382,10 @@ and speed; there is no trainer. Results are recorded in `## Verification` at bui
   - `storage/sessions.rs` and `storage/mod.rs` tests (E).
   - Each diff is kept additive and minimal.
 - **Cross-area dependencies.**
+  - E (E7): adds `npm test` to ci.yml and release.yml. Until that lands, vitest (including the TZ
+    guard) runs only locally. This area does not edit workflows.
+  - E: on a `stop_session` error the backend keeps the data on disk and ends the session; the
+    frontend resets its session stores (ADR-14).
   - B: the controller contract above. B also makes `stop_session` stop zone control; this is
     compatible, since the frontend stops it first anyway.
   - A: owns `src/lib/utils/zoneAnalysis.ts`; this area does not touch it.
