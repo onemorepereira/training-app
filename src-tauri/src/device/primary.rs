@@ -140,6 +140,7 @@ impl PrimaryState {
         self.primaries.entry(metric).or_insert_with(|| device_id.to_string());
     }
 
+    #[cfg(test)]
     pub fn primary(&self, metric: Metric) -> Option<&str> {
         self.primaries.get(&metric).map(String::as_str)
     }
