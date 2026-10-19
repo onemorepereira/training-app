@@ -1,5 +1,41 @@
+use log::warn;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::ConnectOptions;
+use std::path::Path;
+
 use super::Storage;
 use crate::error::AppError;
+
+/// True when `path` is a readable SQLite database that passes
+/// `PRAGMA quick_check`. Opens it read-only; any error counts as a failure.
+pub async fn verify_sqlite_file(path: &Path) -> bool {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false)
+        .disable_statement_logging();
+    let pool = match SqlitePoolOptions::new().max_connections(1).connect_with(options).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Backup check: cannot open {}: {}", path.display(), e);
+            return false;
+        }
+    };
+    let result: Result<Vec<(String,)>, _> =
+        sqlx::query_as("PRAGMA quick_check").fetch_all(&pool).await;
+    pool.close().await;
+    match result {
+        Ok(rows) if rows.len() == 1 && rows[0].0 == "ok" => true,
+        Ok(rows) => {
+            warn!("Backup check: quick_check failed for {}: {:?}", path.display(), rows);
+            false
+        }
+        Err(e) => {
+            warn!("Backup check: quick_check error for {}: {}", path.display(), e);
+            false
+        }
+    }
+}
 
 impl Storage {
     /// Read an `app_meta` value; `None` when the key is absent.

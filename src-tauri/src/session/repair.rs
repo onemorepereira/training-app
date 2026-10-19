@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::error::AppError;
 use crate::session::analysis;
 use crate::session::metrics;
-use crate::session::storage::Storage;
+use crate::session::storage::{verify_sqlite_file, Storage};
 use crate::session::types::SessionSummary;
 
 /// Version of the stored-metrics algorithms. Missing marker = 1 (legacy).
@@ -49,6 +49,47 @@ fn effective_ftp(session: &SessionSummary) -> (u16, bool) {
     }
 }
 
+/// Make sure `training.db.bak-metrics-v<N>` exists and passes `quick_check`.
+/// An existing verified backup is kept (a resumed run keeps the original
+/// pre-repair copy). A corrupt one is moved aside to `.corrupt-<ms>` and
+/// redone. New backups are written to `.tmp`, verified, then renamed, so the
+/// final name only ever holds a verified copy.
+async fn ensure_verified_backup(storage: &Storage) -> Result<(), AppError> {
+    let dir = Path::new(storage.data_dir());
+    let backup = dir.join(backup_file_name());
+    let tmp = dir.join(format!("{}.tmp", backup_file_name()));
+    let io_err = |what: &str, e: std::io::Error| {
+        AppError::Session(format!("Metrics repair backup: {}: {}", what, e))
+    };
+
+    if tmp.exists() {
+        std::fs::remove_file(&tmp).map_err(|e| io_err("remove stale tmp", e))?;
+    }
+    if backup.exists() {
+        if verify_sqlite_file(&backup).await {
+            return Ok(());
+        }
+        let aside = dir.join(format!(
+            "{}.corrupt-{}",
+            backup_file_name(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        warn!("Metrics repair: existing backup failed verification; moving it to {}", aside.display());
+        std::fs::rename(&backup, &aside).map_err(|e| io_err("move corrupt backup aside", e))?;
+    }
+
+    storage.backup_db_to(&tmp).await?;
+    if !verify_sqlite_file(&tmp).await {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AppError::Session(
+            "Metrics repair backup: new backup failed quick_check".into(),
+        ));
+    }
+    std::fs::rename(&tmp, &backup).map_err(|e| io_err("rename verified backup", e))?;
+    info!("Metrics repair: backed up database to {}", backup.display());
+    Ok(())
+}
+
 /// Run the repair if it hasn't completed yet. Never panics; errors abort the
 /// run without setting the marker so it is retried on the next launch.
 pub async fn run_metrics_repair(storage: Arc<Storage>) -> Result<RepairReport, AppError> {
@@ -77,12 +118,8 @@ pub async fn run_metrics_repair(storage: Arc<Storage>) -> Result<RepairReport, A
         + 1;
     storage.set_meta(REPAIR_ATTEMPTS_KEY, &attempts.to_string()).await?;
 
-    // Back up once; a resumed run keeps the original pre-repair copy.
-    let backup = Path::new(storage.data_dir()).join(backup_file_name());
-    if !backup.exists() {
-        storage.backup_db_to(&backup).await?;
-        info!("Metrics repair: backed up database to {}", backup.display());
-    }
+    // Never rewrite sessions without a verified backup.
+    ensure_verified_backup(&storage).await?;
 
     info!(
         "Metrics repair v{}: recomputing {} session(s) (attempt {})",
@@ -333,6 +370,41 @@ mod tests {
 
         assert_eq!(backup_avg_power(tmp.path(), "r5").await, Some(150), "pre-repair value");
         assert_eq!(s.get_session("r5").await.unwrap().avg_power, Some(200));
+    }
+
+    #[tokio::test]
+    async fn repair_replaces_corrupt_existing_backup_with_verified_one() {
+        let (s, tmp) = storage().await;
+        save(&s, &stale_summary("rb1"), &ride()).await;
+        // Truncated/garbage backup left by an earlier crashed run
+        std::fs::write(tmp.path().join(backup_file_name()), b"SQLite format 3\0garbage").unwrap();
+
+        let report = run_metrics_repair(s.clone()).await.unwrap();
+
+        assert_eq!(report.repaired, 1);
+        assert!(
+            crate::session::storage::verify_sqlite_file(&tmp.path().join(backup_file_name())).await,
+            "final backup passes quick_check"
+        );
+        assert_eq!(backup_avg_power(tmp.path(), "rb1").await, Some(150), "pre-repair value");
+        let moved_aside = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(&format!("{}.corrupt-", backup_file_name())));
+        assert!(moved_aside, "corrupt backup is kept aside, not deleted");
+    }
+
+    #[tokio::test]
+    async fn repair_removes_stale_tmp_backup() {
+        let (s, tmp) = storage().await;
+        save(&s, &stale_summary("rb2"), &ride()).await;
+        let tmp_backup = tmp.path().join(format!("{}.tmp", backup_file_name()));
+        std::fs::write(&tmp_backup, b"partial").unwrap();
+
+        run_metrics_repair(s.clone()).await.unwrap();
+
+        assert!(!tmp_backup.exists());
+        assert_eq!(backup_avg_power(tmp.path(), "rb2").await, Some(150));
     }
 
     #[tokio::test]

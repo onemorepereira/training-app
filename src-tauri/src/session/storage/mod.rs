@@ -7,6 +7,7 @@ mod power_curves;
 mod schema;
 mod sessions;
 
+pub use meta::verify_sqlite_file;
 pub use sessions::SaveOutcome;
 
 use log::info;
