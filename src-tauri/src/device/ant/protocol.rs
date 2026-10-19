@@ -2,6 +2,9 @@ use log::debug;
 
 use crate::device::types::SensorReading;
 
+/// FE-C page 0x19 instantaneous power sentinel (12 bits all set).
+const FEC_POWER_INVALID: u16 = 0x0FFF;
+
 /// Default wheel circumference in mm (700x25c)
 pub const DEFAULT_WHEEL_CIRCUMFERENCE_MM: u32 = 2105;
 
@@ -219,14 +222,17 @@ impl AntDecoder {
                 });
             }
 
+            // 12-bit power; 0xFFF = invalid (FE-C Rev 5.0 Table 8-25)
             let instant_power = u16::from_le_bytes([data[5], data[6]]) & 0x0FFF;
-            readings.push(SensorReading::Power {
-                watts: instant_power,
-                timestamp,
-                epoch_ms,
-                device_id: did,
-                pedal_balance: None,
-            });
+            if instant_power != FEC_POWER_INVALID {
+                readings.push(SensorReading::Power {
+                    watts: instant_power,
+                    timestamp,
+                    epoch_ms,
+                    device_id: did,
+                    pedal_balance: None,
+                });
+            }
         } else if page == 0x10 {
             // General FE Data
             let speed_raw = u16::from_le_bytes([data[4], data[5]]);
@@ -364,18 +370,29 @@ mod tests {
         }
     }
 
+    // FE-C D00001231 Rev 5.0 Table 8-25: instantaneous power is 12 bits (byte 5 + byte 6
+    // bits 0-3), range 0-4094 W; 0xFFF means instantaneous and accumulated power are invalid.
+    // Byte 6 bits 4-7 carry trainer status and must be masked off.
+
     #[test]
-    fn decode_fec_trainer_page_0x19_power_12bit_mask() {
+    fn fec_page_0x19_power_0xfff_yields_no_power_reading() {
         let decoder = AntDecoder::new();
-        // Test that upper 4 bits of byte[6] are masked off
-        // bytes [5..6] LE: [0xFF, 0xFF] → 0xFFFF & 0x0FFF = 4095W
+        // power bits 0xFFF; byte 6 upper nibble = trainer status 0xF
         let data: [u8; 8] = [0x19, 5, 80, 0, 0, 0xFF, 0xFF, 0x00];
         let readings = decoder.decode_fec_trainer(&data, "test");
-        assert_eq!(readings.len(), 2);
-        match &readings[1] {
-            SensorReading::Power { watts, .. } => {
-                assert_eq!(*watts, 4095, "12-bit mask should cap at 4095");
-            }
+        assert_eq!(readings.len(), 1, "only cadence should remain");
+        assert!(matches!(readings[0], SensorReading::Cadence { .. }));
+    }
+
+    #[test]
+    fn fec_page_0x19_power_4094_is_valid() {
+        let decoder = AntDecoder::new();
+        // bytes 5..6 = [0xFE, 0x3F]: power bits 0xFFE = 4094 W, status nibble 0x3 masked off
+        let data: [u8; 8] = [0x19, 5, 0xFF, 0, 0, 0xFE, 0x3F, 0x00];
+        let readings = decoder.decode_fec_trainer(&data, "test");
+        assert_eq!(readings.len(), 1);
+        match &readings[0] {
+            SensorReading::Power { watts, .. } => assert_eq!(*watts, 4094),
             other => panic!("expected Power, got {:?}", other),
         }
     }
