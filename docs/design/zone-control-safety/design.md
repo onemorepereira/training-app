@@ -1,16 +1,17 @@
 # Zone control & trainer safety — Design
-**Spec:** ./spec.md   **Last updated:** 2026-10-18   **Status:** Draft
+**Spec:** ./spec.md   **Last updated:** 2026-10-18 (rev 2, after design review 1)   **Status:** Draft
 
 ## Overview
 
 The HR controller is rewritten as a **positional PID around a base power**, with the integral kept in watts and **conditional integration** (clamping) for anti-windup. Today's code adds a full P+I+D output to the commanded power on every tick, so it behaves like a double integrator. A Python prototype of the same plant shows today's law overshooting by 23 bpm and swinging 98–158 bpm (±150 W) forever. With the new law and retuned gains it settles with ≤ 1 bpm overshoot on 27 plant variants (see Risks).
 
-The control task gets three changes:
-1. A **supervisor task** catches every way the task can end: panic, error, duration complete, sensor lost, or a stop request. Every ending goes through one `finalize()` that sets the status and puts the trainer in a **safe state**.
-2. **Trainer I/O goes through a `TrainerSink` trait.** Each command has a 2 s timeout, and tests can swap in a fake trainer.
-3. **A single "send if different" step.** On every tick the loop compares the power it wants with the power it last confirmed sending, and sends again when they differ. This one rule handles power restore after the cadence cut, resend after a reconnect, and restore on resume.
+The control task gets four changes:
+1. **Each run is scoped to a generation** (ADR-12). Every start creates a fresh per-run state `Arc` with its own generation id. A **supervisor task** catches every way that run can end: panic, error, duration complete, sensor lost, trainer unresponsive, or a stop request. Every ending goes through one `finalize()` that marks the run's own state and puts the trainer in a **safe state**. A finalize from an old generation can never touch a newer run's state or trainer output. `stop()` returns only after finalize has released the trainer, and concurrent stops share that completion. A `start()` issued during a stop waits for it.
+2. **Trainer I/O goes through a `TrainerSink` trait.** Each command has a 3 s timeout. All commands the controller issues are serialized through one async mutex. Tests can swap in a fake trainer.
+3. **A single "send if different" step.** On every tick the loop compares the power it wants with the power it last confirmed sending, and sends again when they differ. "Released" counts as a target (used while paused). This one rule handles power restore after the cadence cut, resend after a reconnect, restore on resume, and retry of a failed pause release.
+4. **The PID freezes while its output is not reaching the trainer** (ADR-14): during a cadence-zero cut, the HR-ceiling override (which clears with hysteresis), the `trainer_lost` window, and pause. On exit from any of those it re-seeds from the power actually delivered and ramps under the normal rate limits. A safety cut that cannot be delivered within 3 ticks stops the ride with `TrainerUnresponsive`.
 
-The **safe state** is "Set Target Resistance Level 0 %" (FTMS 0x04 / FE-C page 0x30). If the trainer rejects that, the fallback is target power 0 W. The backend calls this itself from `stop_session`, `pause_session`, window close and app exit, and from the controller's own self-stops.
+The **safe state** (ADR-11) is reached by **target power 0 W first, then resistance level 0 %**. The release counts as delivered if the 0 W command succeeded. The backend calls this itself from `stop_session`, `pause_session`, window close and app exit, and from the controller's own self-stops. On app close the release has a total budget of 4 s (ADR-17).
 
 Tests are deterministic. The HR settle test is a pure synchronous plant simulation with no clock. Task-level tests use `tokio::time::Instant` together with `#[tokio::test(start_paused = true)]`.
 
@@ -26,16 +27,17 @@ flowchart LR
     WC[CloseRequested / ExitRequested] --> STOP
     STOPZ[stop_zone_control] --> STOP
   end
-  subgraph ZoneController ["ZoneController (Arc, &self API)"]
-    STOP[stop reason] -->|ControlMsg::Stop| CH[(mpsc)]
+  subgraph ZoneController ["ZoneController (Arc, &self API, lifecycle mutex)"]
+    STOP[stop reason] -->|ControlMsg::Stop| CH[(mpsc, per run)]
     PAUSE[pause] -->|ControlMsg::Pause| CH
     RESUME[resume] -->|ControlMsg::Resume| CH
-    SUP[supervisor task] -->|spawn + await JoinHandle| LOOP[control_loop]
+    SUP[supervisor task, run gen N] -->|spawn + await JoinHandle| LOOP[control_loop gen N]
     CH --> LOOP
     LOOP -->|StopReason / panic| SUP
-    SUP --> FIN[finalize: state + safe state + log]
+    SUP --> FIN[finalize: run-N state + safe state + log]
+    FIN -->|done watch = true| STOP
   end
-  LOOP -->|set_power / release, 2 s timeout| SINK[TrainerSink]
+  LOOP -->|set_power / release, 3 s timeout| SINK[TrainerSink: cmd mutex serializes]
   FIN --> SINK
   SINK -->|impl for Arc<Mutex<DeviceManager>>| DM[DeviceManager::set_target_power / set_resistance]
   DM -->|clamp 0..=2000 W| TR[FTMS / FE-C]
@@ -46,11 +48,12 @@ Files touched (Area B):
 | File | Change |
 |---|---|
 | `session/zone_control/pid.rs` | Replace `PidController` with `HrPid` (positional, integral in watts, conditional integration, dt guard, derivative on measurement); `adaptive_gains` gets new values; `HrSmoother` unchanged |
-| `session/zone_control/controller.rs` | Supervisor, `ControlMsg` channel, `TrainerSink` usage, `tokio::time::Instant`, reconcile-send, pause dt fix, smoothed-HR ceiling, trainer-lost grace, power band function |
-| `session/zone_control/trainer.rs` (new) | `TrainerSink` trait, `DeviceManagerSink` impl, `FakeTrainer` (`#[cfg(test)]`) |
+| `session/zone_control/controller.rs` | Generation-scoped runs (`Run` struct), lifecycle mutex, supervisor, `ControlMsg` channel, `TrainerSink` usage, `tokio::time::Instant`, reconcile-send including the "released" target, PID freeze/re-seed, override hysteresis, undelivered-safety-cut stop, pause dt fix, smoothed-HR ceiling, trainer-lost grace, power band function |
+| `session/zone_control/trainer.rs` (new) | `TrainerSink` trait, `DeviceManagerSink` impl (command mutex, 3 s timeout, 0 W then resistance 0 % release), `FakeTrainer` (`#[cfg(test)]`) |
+| `session/zone_control/lifecycle.rs` (new) | Plain async hook bodies `on_session_stop`, `on_session_pause`, `on_session_resume`, `on_app_close` that take `&ZoneController` (plus the session/storage pieces they need). Tauri handlers call these in one line each (ADR-18) |
 | `session/zone_control/types.rs` | `ZoneTarget::validate()`, `ZoneTarget::midpoint()`, new `StopReason` variants, `ZoneControlStatus.stop_reason` |
-| `commands.rs` | Validation in `start_zone_control`/`save_user_config`; `stop_session`/`pause_session`/`resume_session` drive the controller; `set_trainer_power` keeps the clamp; `AppState.zone_controller: Arc<ZoneController>` |
-| `lib.rs` | `CloseRequested` and `RunEvent::ExitRequested` stop zone control; `Arc<ZoneController>` construction |
+| `commands.rs` | Validation in `start_zone_control`/`save_user_config`; one-line hook calls in `stop_session`/`pause_session`/`resume_session`; `set_trainer_power` keeps the clamp; `AppState.zone_controller: Arc<ZoneController>` |
+| `lib.rs` | One-line `on_app_close` calls from `CloseRequested` and `RunEvent::ExitRequested`; `Arc<ZoneController>` construction |
 | `config.rs` | `MAX_TRAINER_WATTS`, `clamp_trainer_watts()` plus its tests |
 | `device/manager.rs` | **One line only** (see ADR-5) |
 | `Cargo.toml` | dev-dependency `tokio` feature `test-util` (needed for `start_paused`) |
@@ -75,9 +78,10 @@ Existing patterns followed:
 - It is `None` while active.
 - After the controller ends, it holds the reason until the next start.
 - `phase` gains the values `"paused"`, `"trainer_lost"` and `"stopped"`. Existing values are unchanged.
+- While a run is finalizing, the status still shows that run (it does not report `active: false`) until finalize completes.
 
-**`StopReason`**: adds `SessionStopped`, `AppClosing` and `ControllerFault`. These are externally tagged unit variants, so they serialize as strings like `"ControllerFault"`.
-- **Area D** must add those three to the TS `StopReason` union and `stop_reason?: StopReason | null` to `ZoneControlStatus` in `src/lib/tauri.ts`. Existing frontend code ignores unknown fields, so it keeps working without that.
+**`StopReason`**: adds `SessionStopped`, `AppClosing`, `ControllerFault` and `TrainerUnresponsive` (ADR-15). These are externally tagged unit variants, so they serialize as strings like `"ControllerFault"`.
+- **Area D** must add those four to the TS `StopReason` union and `stop_reason?: StopReason | null` to `ZoneControlStatus` in `src/lib/tauri.ts`. Existing frontend code ignores unknown fields, so it keeps working without that.
 
 **`stop_zone_control`** keeps returning `Option<StopReason>`.
 - If a controller was running or had already ended, it returns that reason.
@@ -99,8 +103,12 @@ The existing ascending checks stay. Message example: `"FTP must be between 50 an
 | Constant | Value | Notes |
 |---|---|---|
 | `config::MAX_TRAINER_WATTS` | 2000 | |
-| `TRAINER_COMMAND_TIMEOUT` | 2 s | |
-| `TRAINER_LOST_STOP_SECS` | 30 | Same as HR sensor lost |
+| `TRAINER_COMMAND_TIMEOUT` | 3 s | Per command, including waiting for the command mutex and the DeviceManager lock |
+| `TRAINER_LOST_STOP_SECS` | 30 | Same as HR sensor lost. Applies only when no safety override is pending |
+| `SAFETY_UNDELIVERED_STOP_TICKS` | 3 | Consecutive ticks a pending safety override may stay undelivered before `TrainerUnresponsive` |
+| `HR_CEILING_CLEAR_MARGIN_BPM` | 3 | Override clears below ceiling − 3 … |
+| `HR_CEILING_CLEAR_SAMPLES` | 2 | … for 2 consecutive HR samples |
+| `APP_CLOSE_RELEASE_BUDGET` | 4 s | Total release budget on app close/exit |
 | `TRAINER_REFRESH_SECS` | 10 | Periodic re-assert of the target |
 | `MAX_TICK_DT_SECS` | 2 × tick period | dt cap |
 | `SAFE_RESISTANCE_LEVEL` | 0 | |
@@ -154,6 +162,8 @@ Storing I in watts (Ki applied at integration time) means that switching gain ti
 
 **Reversibility:** easy. The change is internal to `pid.rs` and `process_hr_tick`.
 
+> **Amended by ADR-14:** the band clamp now comes *before* the rate limit, and the PID freezes and re-seeds around overrides.
+
 ### ADR-2: Deterministic test harness, no real clock
 **Context.** AC1 needs a 20-minute plant simulation, and AC4–AC10 need timing without sleeps.
 
@@ -193,7 +203,9 @@ ANT+ FE-C defines Basic Resistance (page 48/0x30, 0–100 % in 0.5 % units), Tar
 - **C. ERG at a low wattage (for example 50 W).** Stays in ERG, so a slowing rider still meets rising torque.
 - **D. Resistance level 0 % (FTMS 0x04 with value 0; FE-C page 0x30 with value 0).** This uses the existing `DeviceManager::set_resistance(id, 0)` on both protocols. Both protocols leave ERG and the trainer goes to its minimum brake. If the FTMS trainer lacks "Resistance Target Setting Supported" it answers 0x02, so fall back to **target power 0 W**. That is still ERG, but the target is the minimum brake, and it is what the existing cadence-zero cut already sends.
 
-**Decision: D with a 0 W fallback.**
+> **Superseded by ADR-11** (release order is now 0 W first, then resistance 0 %; delivered ⇔ 0 W succeeded). The options analysis below still stands.
+
+**Decision (original, superseded): D with a 0 W fallback.**
 - `TrainerSink::release()` tries `set_resistance(0)`. On error or timeout it tries `set_target_power(0)`. It logs `info!("Zone control ended ({reason:?}): trainer released via resistance 0%")`, or `warn!` naming the fallback or the double failure.
 - Pause uses the same release. Resume clears `sent_power`, so the next tick re-sends the target (ERG mode resumes because Set Target Power switches the mode back).
 
@@ -216,6 +228,8 @@ ANT+ FE-C defines Basic Resistance (page 48/0x30, 0–100 % in 0.5 % units), Tar
 - Reconnect: `sent=None` → re-sent on the first tick that sees the trainer.
 - A reconnect too fast for any tick to see triggers the 10 s refresh.
 - **This is a behaviour change.** A transient command failure now holds for up to 30 s instead of stopping at once.
+
+> **Amended by ADR-13, ADR-15 and ADR-16:** the PID freezes while output isn't delivered; HR-ceiling override hysteresis; the 30 s grace applies only when no safety override is pending; pause uses "released" as the reconcile target.
 
 **Reversibility:** easy.
 
@@ -245,11 +259,13 @@ ANT+ FE-C defines Basic Resistance (page 48/0x30, 0–100 % in 0.5 % units), Tar
 **Decision.** Direct calls from the existing command handlers and lifecycle hooks into `ZoneController`'s `&self` API. These are idempotent no-ops when control is inactive:
 - `stop_session`: `zone_controller.stop(StopReason::SessionStopped).await` runs **before** `stop_session_with_log` (trainer released first, then the session is saved).
 - `pause_session` / `resume_session`: `zone_controller.pause().await` / `.resume().await` (the release on pause is ADR-3).
-- `lib.rs` `WindowEvent::CloseRequested`: `stop(StopReason::AppClosing)` inside the existing `block_on`, before the session save. It is bounded by the 2 s command timeout.
+- `lib.rs` `WindowEvent::CloseRequested`: `stop(StopReason::AppClosing)` inside the existing `block_on`, before the session save. Bounded by the 4 s app-close release budget (ADR-17).
 - `lib.rs` switches `builder.run(ctx)` to `builder.build(ctx)?.run(|app, ev| …)`, handling `RunEvent::ExitRequested { .. }` the same way. This covers macOS Cmd+Q and other exits that skip `CloseRequested`; see [`tauri::RunEvent`](https://docs.rs/tauri/latest/tauri/enum.RunEvent.html) (enum is `#[non_exhaustive]`, so the match needs `_ => {}`). A second call is a no-op.
 - The controller's self-stops (duration complete, sensor lost, trainer lost, panic) go through the supervisor's `finalize` (ADR-8).
 
 Pause and resume are shared: a session pause and a zone-only pause set the same flag. Area D's UI calls both on Pause, which is idempotent.
+
+> **Amended by ADR-18:** hook bodies move into plain functions in `lifecycle.rs`.
 
 **Alternative rejected.** A broadcast "session state" channel that the controller subscribes to. It adds a new cross-module event type for three call sites.
 
@@ -265,6 +281,8 @@ Pause and resume are shared: a session pause and a zone-only pause set the same 
 - `start()` holds `task` for the whole start so that two starts are serialized. It calls `stop_inner` first.
 - Every `TrainerSink` call is wrapped in `tokio::time::timeout(TRAINER_COMMAND_TIMEOUT, …)`, and that timeout covers acquiring the DeviceManager lock. A timeout returns `Err(AppError::Session("Trainer command timed out"))` and is treated like any failure (ADR-4).
 
+> **Superseded by ADR-12 (lifecycle and generations) and ADR-17 (command serialization and timeouts).**
+
 **Reversibility:** easy.
 
 ### ADR-8: Panic containment
@@ -273,6 +291,8 @@ Pause and resume are shared: a session pause and a zone-only pause set the same 
 - `control_loop` returns `StopReason` (`UserStopped` / `SessionStopped` / `AppClosing` from `ControlMsg::Stop`, the self-stop reasons, or `ControllerFault` if the mpsc closes).
 - `finalize` sets `active=false`, `paused=false`, `phase="stopped"` and `stop_reason=Some(reason)`, then calls `sink.release()` and logs.
 - `tokio::Mutex` does not poison, so `finalize` can always lock `state`. The release profile does not set `panic = "abort"` (checked in `Cargo.toml`), so unwinding is caught by the `JoinHandle`.
+
+> **Amended by ADR-12:** `finalize` only touches its own run's state `Arc` and signals that run's `done` watch.
 
 **Reversibility:** easy.
 
@@ -296,22 +316,210 @@ Pause and resume are shared: a session pause and a zone-only pause set the same 
 - **Ordering.** Duration expiry is now checked **before** the cadence-zero early return. Today a cadence stop prevents duration completion.
 - **Previous HR for the AC9 decay.** It is the PID's own `prev_measurement` (the previous tick's smoothed HR), not `last_hr`.
 
+> **Amended by ADR-13 (pause reconcile) and ADR-15 (ceiling hysteresis).** `last_tick_at` now advances on every tick, paused or not.
+
+**Reversibility:** easy.
+
+### Review-1 amendments (ADR-11 to ADR-18)
+These record the spec-owner rulings from design review 1 (2026-10-18). Where they conflict with an earlier ADR, they win.
+
+### ADR-11: Release sequence (supersedes ADR-3's decision)
+**Ruling.** Send target power 0 W first, then resistance level 0 %.
+
+**Decision.** `TrainerSink::release(budget) -> ReleaseOutcome`:
+1. `set_power(0)`. **Release counts as delivered iff this returns `Ok`.**
+2. Then `set_resistance(0)`, best effort. Its result is logged but never used to decide whether the release was delivered. FTMS's "no indication = success" (`ftms.rs` timeout branch) therefore never makes a failed release look delivered.
+   - For FTMS, step 1 still reports `Ok` on an indication timeout. That is the device layer's existing contract and the spec owner accepted it for the 0 W step.
+
+**Outcome logging:**
+
+| Outcome | Log |
+|---|---|
+| 0 W `Ok` | `info!("Zone control ended ({reason:?}): trainer released (0 W ok, resistance 0 %: ok\|failed: …)")` |
+| 0 W failed, timed out, or out of budget | `error!("Zone control ended ({reason:?}): trainer release NOT confirmed: …")`. The resistance step is still attempted if budget remains |
+
+The same `release()` is the pause target (ADR-13). ERG resumes on the next Set Target Power, because that command switches the mode back.
+
+**Why 0 W first.** It is the command every ERG trainer accepts (the cadence-zero cut already relies on it). It is also the fastest way to remove a trapped high wattage. Resistance 0 % then takes the trainer out of ERG where the trainer supports it. Accepted residual risk: FE-C page 0x30 behaviour is unverified (old Risk 3), which is acceptable because 0 W is already delivered.
+
+**Reversibility:** easy.
+
+### ADR-12: Generation-scoped runs and stop/start exclusivity (supersedes ADR-7's structure)
+**Context.** Review found that a finalize from an old run could overwrite a newer run's status or send a release after the new run's initial power. It also found that concurrent `stop()` callers could return before the trainer was released.
+
+**Decision.**
+```rust
+struct Run {
+    gen: u64,
+    state: Arc<Mutex<ControlLoopState>>,        // per-run; finalize touches only this
+    ctl_tx: mpsc::UnboundedSender<ControlMsg>,
+    done: watch::Receiver<Option<StopReason>>,  // Some(reason) once finalize (incl. release) completed
+}
+pub struct ZoneController {
+    lifecycle: tokio::sync::Mutex<()>,             // held for the whole of start() and stop()
+    current: std::sync::Mutex<Option<Arc<Run>>>,   // brief, never held across .await
+    next_gen: AtomicU64,
+    sink: Arc<dyn …> / generic T: TrainerSink,     // shared; carries active_gen (below)
+}
+```
+- **`stop(reason)`:**
+  1. Acquire `lifecycle`.
+  2. Clone `current`.
+  3. If it is `None`, return `None`. If its `done` already holds `Some(r)`, return `Some(r)` without sending anything.
+  4. Otherwise send `ControlMsg::Stop(reason)` (ignore send error: the run is already ending by itself).
+  5. `done.wait_for(Option::is_some)`, then return that reason.
+
+  `lifecycle` is held until the supervisor's finalize, including the release, has completed. A second concurrent `stop()` blocks on `lifecycle` and then takes the "already done" branch. Both callers therefore return only after the release, with the same reason (the first reason wins).
+- **`start(target, …)`:**
+  1. Acquire `lifecycle`.
+  2. If `current` is `Some` and not done, do the same stop sequence with `UserStopped` and await `done`. This covers a run that is self-finalizing with no `stop()` call.
+  3. Allocate `gen = next_gen.fetch_add(1)`.
+  4. Set `sink.set_active_gen(gen)`.
+  5. Build a **new** `Run` (fresh state `Arc`), store it in `current`, and send the initial power under `gen`.
+  6. Spawn the supervisor.
+  7. Release `lifecycle`.
+
+  A `start()` issued during an in-flight stop waits on `lifecycle`.
+- **Generation fence in the sink.** Every sink call carries its `gen`. After acquiring the command mutex (ADR-17), the sink drops a call whose `gen` < `active_gen` and returns `Err(Stale)`. A command queued by an old run, for example one that had timed out but not yet got the mutex, can therefore never reach the trainer after a newer run's initial command. The old run's release always precedes `set_active_gen(new)`, because `start` awaits `done` first.
+- **`status()`** locks only `current` (brief std mutex), then that run's `state`. It never touches `lifecycle`, so it stays responsive during stop and start (AC10).
+- **`pause()` / `resume()`** send `ControlMsg` to the current run under a brief `current` lock (no `lifecycle`). They are no-ops if there is no live run.
+
+**Reversibility:** easy (internal).
+
+### ADR-13: Pause reconcile
+**Ruling 8.** While paused the reconcile keeps running with **Released** as the target.
+
+**Decision.**
+- `sent: Delivered` where `enum Delivered { Unknown, Watts(u16), Released }`.
+- On each tick (and immediately on `ControlMsg::Pause` / `Resume`):
+  - **Paused:** `effective = Released`. If `sent != Released`, call `release()`. Delivered → `sent = Released`. Not delivered → `sent = Unknown`, enter `trainer_lost` timing; retried on the next tick. After 30 s, stop with `TrainerDisconnected` and a final release attempt.
+  - **Resumed:** `effective` goes back to the target. `sent == Released` ≠ target, so it is re-sent on the first reconcile (immediate on `Resume`).
+- While paused: time-in-zone is not counted, the PID is frozen (ADR-14), and `last_tick_at` still advances, so the first tick after resume has a normal dt (AC8).
+
+**Reversibility:** easy.
+
+### ADR-14: PID freeze while output is not delivered, re-seed on exit (amends ADR-1)
+**Ruling 4.**
+
+**Freeze conditions:** cadence-zero override active, HR-ceiling override active, `trainer_lost` (the last attempt was not delivered, or there is no trainer), or paused.
+
+While frozen, `process_hr_tick` does **not** call `HrPid::update`. There is no integration, no decay, no `prev_measurement` / `u_{k−1}` advance and no gain change. The smoother keeps collecting.
+
+**Re-seed on exit.** On the first tick with no freeze condition, call `HrPid::reseed(delivered)`:
+- `u_{k−1} = delivered`, where `delivered` is the power last confirmed delivered: 0 after a cadence cut or pause release, 50 after the HR-ceiling override, the last `Watts(w)` after `trainer_lost`, and 0 if nothing was ever confirmed.
+- `prev_measurement = None`, so D = 0 on the first post-freeze tick.
+- I is untouched (it was frozen).
+
+The normal update then runs.
+
+**Order change in the law (amends ADR-1).** Band, then rate limit:
+```
+b_k = clamp(v_k, floor, ceiling)
+u_k = clamp(b_k, u_{k−1} − 30, u_{k−1} + up_k)
+```
+When `u_{k−1}` is inside the band, this is identical to the original order (the band is convex). When `u_{k−1}` is below the band (re-seeded from 0 after a cadence cut), the power **ramps up from 0 W** at ≤ `up_k` per tick instead of jumping to the floor. Conditional integration still compares `u_k` to `v_k`, so the integral does not wind while the ramp is rate-limited.
+
+**Power mode** has no PID. On exit, the reconcile sends the target directly (AC5: within 2 ticks).
+
+**Tests.**
+- `hr_ceiling_override_30s_first_post_override_command_at_most_delivered_plus_max_up`: delivered 50 W; first command ≤ 70 W, since `up_k` = 20 in recovery.
+- `hr_mode_after_cadence_zero_ramps_up_from_zero`: first command ≤ 20 W, and each later step ≤ 20 W.
+- `pid_state_unchanged_during_override`: the integral and `u_{k−1}` are identical before and after 6 frozen ticks.
+- `power_mode_restores_target_within_2_ticks_after_cadence_returns` (AC5).
+
+**Reversibility:** easy.
+
+### ADR-15: HR-ceiling override hysteresis and the bounded safety-cut grace
+**Ruling 5 (hysteresis).**
+- **Enter** when smoothed HR > `max_hr` (checked on every HR sample in the sensor branch, and on every tick).
+- **Clear** when smoothed HR < `max_hr − 3` on **2 consecutive HR samples**. The counter resets on any sample ≥ `max_hr − 3`.
+- While active, `effective = Watts(SAFETY_POWER)` (50 W). On clear, resume via ADR-14 from the delivered power.
+
+**Ruling 6 (bounded grace).**
+- `pending_safety_undelivered_ticks` counts consecutive ticks on which a safety override (cadence-zero or HR-ceiling) is active and `sent != Watts(override)` after that tick's send attempt.
+- At **3**, the loop returns the new `StopReason::TrainerUnresponsive`, and `finalize` attempts the release (ADR-11). In practice that is about 3 s in power mode and about 15 s in HR mode at 5 s ticks.
+- The 30 s `TRAINER_LOST_STOP_SECS` grace applies **only when no safety override is pending**.
+
+**Tests.**
+- `hr_ceiling_clears_only_after_two_samples_below_ceiling_minus_3`
+- `single_sample_below_clear_threshold_keeps_override`
+- `undelivered_cadence_cut_for_3_ticks_stops_trainer_unresponsive`
+- `undelivered_hr_ceiling_cut_for_3_ticks_stops_trainer_unresponsive`
+- `trainer_lost_without_override_waits_30s`
+
+**Reversibility:** easy (constants).
+
+### ADR-16: Timeouts are 3 s (ruling 9)
+`TRAINER_COMMAND_TIMEOUT` = 3 s everywhere (replaces 2 s).
+- With `ftms.rs`'s existing ≤ 2 s indication wait, an already-granted FTMS command fits.
+- The first command after connect also runs Request Control, worst case about 4 s. It may time out once. The spawned command task (ADR-17) still completes, and the next tick re-sends.
+
+**Reversibility:** easy.
+
+### ADR-17: Command serialization, timeout mechanics and close budget
+**Serialization (review question).**
+- `DeviceManagerSink` owns `cmd_lock: Arc<tokio::sync::Mutex<()>>`. Each controller command runs as:
+  ```rust
+  let task = tokio::spawn(async move {
+      let _g = cmd_lock.lock_owned().await;          // waits for any previous (even timed-out) command
+      if gen < active_gen.load() { return Err(Stale) }
+      let mut dm = dm.lock().await;
+      let id = dm.connected_trainer_id().ok_or(..)?;
+      dm.set_target_power(&id, config::clamp_trainer_watts(w as i32)).await   // or set_resistance
+  });
+  timeout(deadline, task).await
+  ```
+- The guard lives inside the spawned task. When the caller times out, the task keeps running and holds `cmd_lock` until the underlying DeviceManager call returns, including FE-C's `spawn_blocking`. The next controller command therefore waits for it, and controller commands never overlap.
+- **Accepted residual:** manual UI commands (`set_trainer_power`, `set_trainer_resistance`) do not take `cmd_lock` and can interleave with controller commands at the DeviceManager lock. This is accepted per the review.
+- The control loop does not block its `select!` on a command. It awaits the command future inside `select!` alongside `ctl_rx`, so `ControlMsg::Stop` is seen at once. Dropping the caller's future leaves the spawned command task running to completion, under the generation fence.
+
+**Close/stop bounds (ruling 7).**
+
+| Path | Budget | Real worst case |
+|---|---|---|
+| `stop_zone_control` / `stop_session` / self-stop | Normal per-command timeouts | Loop exit is immediate. Release = 0 W (≤ 3 s, including waiting on `cmd_lock` and the DeviceManager lock) + resistance 0 % (≤ 3 s) ≈ **6 s**, then return |
+| App close (`CloseRequested`) / `ExitRequested` | **4 s total** | `on_app_close` calls `stop_with_budget(AppClosing, 4 s)`. The 0 W send gets `min(3 s, budget)` first, and the resistance step gets whatever remains (skipped if < 250 ms). The UI thread is blocked ≤ **4 s** plus the session save |
+
+- **DeviceManager lock held by a scan or reconnect** (today up to about 4 s, C7): the command waits on the DeviceManager lock inside the timeout. On close the 0 W send may time out, in which case the release is **not confirmed** and is logged at `error!`. The trainer then keeps its last state until it drops the BLE/ANT link as the app exits.
+- **Dependency on Area C (C7):** remove DeviceManager lock holding across scans and reconnects. Once that lands, the lock wait is bounded by other short commands.
+
+**Reversibility:** easy.
+
+### ADR-18: Lifecycle hooks as plain functions
+**Decision.** New `session/zone_control/lifecycle.rs`:
+- `pub async fn on_session_stop(zc: &ZoneController) -> Option<StopReason>`, which calls `zc.stop(SessionStopped)`.
+- `on_session_pause(zc)` and `on_session_resume(zc)`.
+- `on_app_close(zc)`, which calls `zc.stop_with_budget(AppClosing, APP_CLOSE_RELEASE_BUDGET)`.
+
+They depend only on `ZoneController` (generic over `TrainerSink`), so tests drive them with `FakeTrainer` and paused time:
+- `on_session_stop_releases_trainer_before_returning`
+- `on_session_pause_releases_and_resume_resends`
+- `on_app_close_respects_4s_budget_with_hung_trainer`
+- `on_app_close_logs_unconfirmed_release_when_zero_watt_fails` (asserts `ReleaseOutcome::NotConfirmed`)
+
+The Tauri handlers in `commands.rs` and `lib.rs` each gain **one line** calling these, placed before the session save. Only that wiring is checked manually (accepted).
+
 **Reversibility:** easy.
 
 ## Failure modes
 
 | Failure | Detection | Behavior | Recovery |
 |---|---|---|---|
-| Control task panics | Supervisor `JoinError::is_panic()` | `stop_reason=ControllerFault`, inactive, release sent, `error!` log | User restarts the zone ride |
-| Trainer command hangs | 2 s `timeout` | Counts as a failure: `sent=None`, phase `trainer_lost` | Resent next tick; stops after 30 s with `TrainerDisconnected` and a release attempt |
-| Trainer disconnects | `connected_trainer_id()` is None, or the send fails | Hold, phase `trainer_lost` | Reconnect → re-sent within 1 tick, or the 10 s refresh |
-| Trainer rejects resistance 0 (FTMS 0x02) | `set_resistance` error | Fallback to `set_target_power(0)`, `warn!` | n/a |
-| Release fails entirely (trainer gone) | Both calls error | `warn!("trainer release failed")`. The trainer is disconnected anyway, and its own behaviour applies on reconnect. | Next manual command |
+| Control task panics | Supervisor `JoinError::is_panic()` | That run's state: `stop_reason=ControllerFault`, inactive. Release (0 W, then resistance 0 %). `error!` log | User restarts the zone ride |
+| Trainer command hangs | 3 s `timeout` on the spawned command task | Counts as a failure: `sent=Unknown`, phase `trainer_lost`, PID frozen. The task keeps `cmd_lock` until the DeviceManager call returns | Re-sent next tick. Stops after 30 s (no override pending) or 3 ticks (safety override pending) |
+| Trainer disconnects | `connected_trainer_id()` is None, or the send fails | Hold, phase `trainer_lost`, PID frozen | Reconnect → re-sent within 1 tick from the delivered power, or by the 10 s refresh |
+| Safety cut (cadence zero / HR ceiling) cannot be delivered | 3 consecutive undelivered ticks | Stop with `TrainerUnresponsive`, release attempt | User restarts |
+| 0 W release fails | `set_power(0)` error, timeout or budget exhausted | `error!("… trainer release NOT confirmed")`; resistance 0 % still attempted if budget remains | Trainer's own behaviour on link loss |
+| Trainer rejects resistance 0 % (FTMS 0x02) | `set_resistance` error | Logged only; release already counted via 0 W | n/a |
+| Stop and start race | `lifecycle` mutex, generation fence | Start waits for finalize. Stale-generation commands are dropped in the sink | n/a |
+| Concurrent stops | `lifecycle` mutex | Second caller waits, then returns the same reason after the release | n/a |
 | HR spike above max | Smoothed HR > max | Ignored unless it persists in the median | n/a |
-| App closed mid-ride | `CloseRequested` / `ExitRequested` | Stop(AppClosing) + release, bounded by 2 s | n/a |
+| HR hovering at the ceiling | Hysteresis (< max − 3 for 2 samples) | Override stays until it clears, so no chatter | Ramps from 50 W |
+| App closed mid-ride | `CloseRequested` / `ExitRequested` | Stop(AppClosing) + release within a **4 s** total budget, 0 W first | Unconfirmed → `error!` |
+| DeviceManager lock held by scan or reconnect (C7) | Command timeout | Commands fail; on close the release may be unconfirmed | Area C's lock-scope fix |
 | Invalid target or config from UI | `validate()` | `Err(AppError::Session(msg))`, nothing started | User corrects it |
 | HR plant faster or slower than tuned for | Not detected | Slower settling. Grid shows 0/27 failures across tau 30–90 s, delay 5–25 s, gain 0.25–0.5 | Retune gains (pure table) |
-| Initial estimate far too high (+60 W) | Not detected | Overshoot of up to 18 bpm in simulation (11/27 plants fail the 5 bpm bound); the HR ceiling safety and the 30 W/tick ramp-down limit it | Better estimate; out of AC1 scope |
+| Initial estimate far too high (+60 W) | Not detected | Overshoot of up to 18 bpm in simulation; the HR ceiling safety and the 30 W/tick ramp-down limit it | Better estimate; out of AC1 scope |
 
 ## Migration and rollback
 - No schema or persisted-data changes. The command shapes are additive (`stop_reason` field, new enum variants).
@@ -322,18 +530,22 @@ Pause and resume are shared: a session pause and a zone-only pause set the same 
 
 | AC | Component(s) | Test(s) (planned names) |
 |---|---|---|
-| AC1 | `pid.rs` HrPid, `process_hr_tick`, sim harness | `hr_pid_zero_error_stable_hr_holds_power`, `hr_pid_integral_frozen_while_at_band_ceiling`, `hr_pid_integral_frozen_while_rate_limited`, `hr_pid_integral_unwinds_when_error_reverses_at_ceiling`, `hr_pid_first_tick_reference_value` (hand-computed), `hr_plant_20bpm_below_settles_without_overshoot_or_oscillation`, `hr_plant_grid_settles_across_lag_and_delay` |
+| AC1 | `pid.rs` HrPid, `process_hr_tick`, sim harness | `hr_pid_zero_error_stable_hr_holds_power`, `hr_pid_integral_frozen_while_at_band_ceiling`, `hr_pid_integral_frozen_while_rate_limited`, `hr_pid_integral_unwinds_when_error_reverses_at_ceiling`, `hr_pid_first_tick_reference_value` (hand-computed), `hr_plant_20bpm_below_settles_without_overshoot_or_oscillation`, `hr_plant_grid_settles_across_lag_and_delay`, `pid_state_unchanged_during_override`, `hr_ceiling_override_30s_first_post_override_command_at_most_delivered_plus_max_up`, `hr_mode_after_cadence_zero_ramps_up_from_zero` |
 | AC2 | `hr_power_band` | `custom_hr_zone_band_is_min_to_150pct_ftp`, `custom_hr_zone_without_ftp_caps_at_400`, `custom_hr_150_160_commands_above_55pct_ftp` |
-| AC3 | `ZoneTarget::validate`, `hr_power_band`, `save_user_config` validators (extracted as `validate_user_config(&SessionConfig)`) | `power_zone_8_rejected`, `hr_zone_6_rejected`, `zone_0_custom_accepted`, `lower_equal_upper_rejected`, `power_bound_above_2000_rejected`, `hr_bound_above_250_rejected`, `midpoint_of_max_bounds_does_not_overflow`, `hr_band_floor_never_exceeds_ceiling_for_any_ftp` (FTP 1..=2000 × zone 0..=7), `initial_power_with_tiny_ftp_does_not_panic`, `ftp_below_50_rejected`, `ftp_above_1000_rejected`, `non_increasing_hr_zones_rejected` (already passes; regression) |
+| AC3 | `ZoneTarget::validate`, `hr_power_band`, `validate_user_config(&SessionConfig)` | `power_zone_8_rejected`, `hr_zone_6_rejected`, `zone_0_custom_accepted`, `lower_equal_upper_rejected`, `power_bound_above_2000_rejected`, `hr_bound_above_250_rejected`, `midpoint_of_max_bounds_does_not_overflow`, `hr_band_floor_never_exceeds_ceiling_for_any_ftp` (FTP 1..=2000 × zone 0..=7), `initial_power_with_tiny_ftp_does_not_panic`, `ftp_below_50_rejected`, `ftp_above_1000_rejected`, `non_increasing_hr_zones_rejected` (already passes; regression) |
 | AC4 | supervisor, `finalize` | `control_task_panic_reports_controller_fault_and_releases_trainer` (FakeTrainer panics on first `set_power`), `self_stop_on_duration_complete_releases_trainer` |
-| AC5 | reconcile-send | `power_mode_restores_target_within_2_ticks_after_cadence_returns`, `target_resent_within_2_ticks_after_trainer_reconnect`, `trainer_lost_for_30s_stops_with_trainer_disconnected` |
-| AC6 | `ZoneController::{stop,pause,resume}`, `finalize`, `TrainerSink::release`, command and lifecycle wiring | `stop_releases_trainer_with_resistance_zero`, `release_falls_back_to_zero_watts_when_resistance_rejected`, `pause_releases_trainer_and_resume_resends_target`, `stop_session_reason_reported_in_status`, `sensor_lost_stop_releases_trainer`, `stop_when_inactive_is_noop` (no command sent). Wiring in `stop_session`/`pause_session`/close/exit: manual check (see Risks) |
+| AC5 | reconcile-send, ADR-14 re-seed | `power_mode_restores_target_within_2_ticks_after_cadence_returns`, `target_resent_within_2_ticks_after_trainer_reconnect`, `trainer_lost_without_override_waits_30s` |
+| AC6 | `ZoneController::{stop,stop_with_budget,pause,resume}`, `finalize`, `TrainerSink::release`, `lifecycle.rs`, safety-cut bound | `release_sends_zero_watts_before_resistance_zero`, `release_delivered_iff_zero_watts_ok`, `release_not_confirmed_when_zero_watts_fails_even_if_resistance_ok`, `pause_releases_trainer_and_resume_resends_target`, `failed_pause_release_is_retried_next_tick`, `paused_trainer_lost_30s_stops_trainer_disconnected`, `sensor_lost_stop_releases_trainer`, `stop_when_inactive_is_noop`, `undelivered_cadence_cut_for_3_ticks_stops_trainer_unresponsive`, `undelivered_hr_ceiling_cut_for_3_ticks_stops_trainer_unresponsive`, `hr_ceiling_clears_only_after_two_samples_below_ceiling_minus_3`, `single_sample_below_clear_threshold_keeps_override`, `on_session_stop_releases_trainer_before_returning`, `on_session_pause_releases_and_resume_resends`, `on_app_close_respects_4s_budget_with_hung_trainer`, `on_app_close_logs_unconfirmed_release_when_zero_watt_fails`; lifecycle/stop races: `stop_then_start_old_generation_never_commands_after_new_initial`, `two_concurrent_stops_both_return_after_release`, `start_during_in_flight_stop_waits_for_release`, `self_finalize_racing_start_does_not_touch_new_run_status`, `stale_generation_command_dropped_by_sink`. One-line Tauri wiring: manual check |
 | AC7 | `config::clamp_trainer_watts`, manager.rs line, `DeviceManagerSink` | `clamp_trainer_watts_caps_at_2000`, `clamp_trainer_watts_negative_is_zero`, `clamp_trainer_watts_u16_max_does_not_wrap` |
-| AC8 | `resume` sets `last_tick_at`, dt cap | `pause_10_minutes_adds_zero_time_in_zone`, `first_tick_after_resume_uses_normal_dt` |
-| AC9 | HrPid `prev_measurement` | `integral_decays_when_smoothed_hr_falls_between_ticks`, `no_integral_decay_when_smoothed_hr_rises_above_zone` (both driven by real successive ticks; the existing injected-`last_hr` tests are replaced) |
-| AC10 | `TrainerSink` timeout, `ZoneController` lock split | `hung_trainer_command_times_out_within_2s_and_counts_as_failure`, `status_responsive_while_stop_awaits_task` |
+| AC8 | `last_tick_at` advances every tick, dt cap | `pause_10_minutes_adds_zero_time_in_zone`, `first_tick_after_resume_uses_normal_dt` |
+| AC9 | HrPid `prev_measurement` | `integral_decays_when_smoothed_hr_falls_between_ticks`, `no_integral_decay_when_smoothed_hr_rises_above_zone` (driven by real successive ticks; the injected-`last_hr` tests are replaced) |
+| AC10 | `DeviceManagerSink` spawned command + timeout + `cmd_lock`; `status()` lock independence | `hung_trainer_command_times_out_within_3s_and_counts_as_failure`, `next_command_waits_for_timed_out_previous_command`, `status_responsive_while_stop_awaits_task` |
 | AC11 | HrPid dt guard, smoothed ceiling | `hr_pid_zero_dt_returns_unchanged_power`, `hr_pid_negative_dt_returns_unchanged_power`, `single_hr_spike_above_max_does_not_cut_power`, `sustained_hr_above_max_cuts_to_safety_power` |
 | AC12 | all | `cd src-tauri && cargo test`, `npm run check`. Each slice records its test failing before the fix. |
+
+All task-level tests run under `#[tokio::test(start_paused = true)]` with `FakeTrainer`. `FakeTrainer` records `(gen, Cmd, tokio::time::Instant)` and has scriptable behaviour per call: Ok, Err, Hang(duration), PanicOnce.
+
+`DeviceManagerSink` can't be built without a real DeviceManager. Its spawn, lock, timeout and fence logic is therefore factored into a generic `SerializedSink<B: TrainerBackendCalls>` that is tested with a fake backend. `DeviceManagerSink` is a thin impl of `TrainerBackendCalls`.
 
 ## Risks and spikes
 1. **Riskiest: gains that satisfy AC1 exist and are robust.** The spike is done in Python (`/tmp/claude-1001/-home-mpereira-Extra-repos-personal-training-app/7aca0652-ae45-4f8f-9b9d-c5cb23cc4579/scratchpad/sim/{hrsim,grid,grid2,oldlaw}.py`):
@@ -341,37 +553,44 @@ Pause and resume are shared: a session pause and a zone-only pause set the same 
    - With the scaled gains it fails 0/27 (worst 1 bpm, settle ≤ 230 s).
    - The old law overshoots 23 bpm and oscillates without end.
 
-   Slice 1 ports the harness to Rust **first**, against the current code, to confirm that the Rust test fails before the fix.
-2. **AC10 timeout versus FTMS internals.** `ftms.rs::write_control_and_wait` already waits up to 2 s for the indication and treats a timeout as success. The first command also runs a Request Control round trip. A trainer that never indicates would therefore hit the 2 s outer bound on every command, count as failed, and get stopped after 30 s.
-   - **Dependency on Area C:** keep the inner indication wait ≤ 1.5 s (the Request Control and command waits together must fit inside 2 s), or the spec should relax AC10 to about 3 s.
-   - Until that is resolved this is an open conflict. B uses 2 s as spec'd.
-3. **FE-C mode switching on page 0x30 has not been verified against the member-only FE-C profile.** Mitigations: the 0 W fallback, and a manual check on an FE-C trainer in Phase 2 if one is available. Otherwise it is recorded as unproven.
-4. **Wiring in Tauri handlers (`stop_session`, `pause_session`, CloseRequested, ExitRequested) cannot be unit-tested without a Tauri runtime.** The behaviour behind each one-line call is tested through `ZoneController`. The wiring gets a recorded manual check with `npm run tauri dev` and the simulator.
-5. **Concurrent edits.**
-   - Area C edits `device/manager.rs` (one line from B, ADR-5).
-   - Area D adds `get_session_status` to `commands.rs`/`lib.rs` handler lists.
-   - Area E may touch `Cargo.toml`.
+   The band-then-rate order (ADR-14) is identical in normal operation, so this result still holds. Slice 1 ports the harness to Rust **first**, against the current code, to confirm that it fails before the fix.
+2. **Second riskiest: lifecycle concurrency (ADR-12).** Mitigated by deterministic race tests under paused time. Slice 4 builds the lifecycle before any reconcile logic depends on it.
+3. **FTMS timing under 3 s.** `ftms.rs` waits ≤ 2 s for an indication and treats a timeout as success. The first command after connect also runs Request Control (worst case about 4 s), so it may time out once and be retried. No spec conflict remains at 3 s.
+4. **FE-C page 0x30 unverified:** accepted, because 0 W is sent first and decides delivery.
+5. **Tauri wiring:** only the one-line calls are manual (accepted). Hook bodies are tested via `lifecycle.rs`.
+6. **Close blocks the UI thread up to 4 s** (`block_on`) plus the session save. Accepted per ruling 7.
+7. **Cross-area dependencies.**
+   - **Area C:**
+     - Keep the one clamp line in `set_target_power` (ADR-5).
+     - Remove DeviceManager lock holding across scans and reconnects (C7). Without it, commands and the close-time release can time out behind a scan.
+     - Resistance level 0 must still mean minimum resistance after C13 scaling.
+   - **Area D:**
+     - Add the new `StopReason` variants and `stop_reason` to the TS types.
+     - Expect the new phases.
+     - Edits the same `commands.rs`/`lib.rs` handler lists.
+   - **Area E:** may touch `Cargo.toml` (B adds the `tokio` `test-util` dev-dependency).
 
-   All of these are textual merge conflicts at most.
+   All file overlaps are textual merges at most.
 
 ## Implementation plan
-Each slice is one commit with its tests (failing test first).
+Each slice is one commit with its tests (failing test first). The riskiest work comes first.
 
 1. **AC1 harness and new HR law.**
    - Add the plant simulation test against the current `process_hr_tick` and confirm it fails.
-   - Implement `HrPid` per ADR-1 (dt guard, derivative on measurement, conditional integration, integral in watts, decay on smoothed HR falling) and the new gain table.
-   - Remove the re-entry reset and rewrite or replace the old PID and re-entry tests.
+   - Implement `HrPid` per ADR-1 and ADR-14: dt guard, derivative on measurement, conditional integration, integral in watts, band-then-rate, `reseed()`, decay on smoothed HR falling. Add the new gain table.
+   - Remove the re-entry reset and replace the old PID and re-entry tests.
    - Covers AC1, AC9 and the AC11 dt part.
-2. **Band and validation.** `hr_power_band` (AC2, no-panic AC3), `ZoneTarget::validate`/`midpoint`, `validate_user_config`, wiring in `start_zone_control`/`save_user_config`, and the initial-power clamp into the band. Covers AC2 and AC3.
-3. **Single clamp.** `config::clamp_trainer_watts` plus the one-line `manager.rs` insertion, and removal of `as i16` in the controller. Covers AC7.
-4. **`TrainerSink` and deterministic clock.**
-   - Add the trait, `DeviceManagerSink` with a 2 s timeout, and the test-only `FakeTrainer`.
-   - Switch to `tokio::time::Instant`.
-   - Add the `test-util` dev-dependency.
-   - Change the controller to be generic over `T: TrainerSink`.
-   - Covers AC10 timeout.
-5. **Supervisor, ControlMsg channel and finalize.** Panic containment, the `stop_reason` status field and new `StopReason` variants, release on every exit, the lock split (`Arc<ZoneController>`, `&self` API), and updated `commands.rs`/`lib.rs` construction. Covers AC4, AC6 controller part, and AC10 lock.
-6. **Reconcile-send.** `sent_power`, refresh, `trainer_lost` grace, cadence restore and reconnect resend, duration check before the cadence early return. Covers AC5.
-7. **Pause and HR ceiling.** Pause release and resume resend via ControlMsg, `last_tick_at` on resume, dt cap, smoothed HR ceiling. Covers AC8, the AC11 ceiling part, and AC6 pause.
-8. **Backend lifecycle wiring.** `stop_session`/`pause_session`/`resume_session` call the controller, plus `CloseRequested` and `RunEvent::ExitRequested` in `lib.rs`, followed by the manual check in `tauri dev` with the simulator. Covers AC6 wiring.
-9. **Final.** Full `cargo test` and `npm run check`; `design.md` Status: Current with a Verification section; `spec.md` Status: Built.
+2. **Band and validation.** `hr_power_band`, `ZoneTarget::validate`/`midpoint`, `validate_user_config`, wiring in `start_zone_control`/`save_user_config`, and the initial-power clamp into the band. Covers AC2 and AC3.
+3. **Single clamp.** `config::clamp_trainer_watts` plus the one-line `manager.rs` insertion, and removal of `as i16`. Covers AC7.
+4. **Sink and lifecycle core.**
+   - `TrainerSink` trait, `SerializedSink` (spawned command, `cmd_lock`, 3 s timeout, generation fence), `release()` per ADR-11, `DeviceManagerSink`, `FakeTrainer`.
+   - `tokio::time::Instant` and the `test-util` dev-dependency.
+   - Generation-scoped `Run`, `lifecycle` mutex, supervisor and finalize, `done` watch, `stop`/`stop_with_budget`/`start` per ADR-12, `stop_reason` status field and new `StopReason` variants, `Arc<ZoneController>` in `commands.rs`/`lib.rs`.
+   - Includes all race tests.
+   - Covers AC4, AC10, and the AC6 controller part.
+5. **Reconcile, freeze and safety bounds.**
+   - `Delivered` state, refresh, `trainer_lost` grace, PID freeze and re-seed, HR-ceiling hysteresis on smoothed HR, undelivered-safety-cut stop, cadence restore and reconnect resend, duration check before the cadence early return.
+   - Covers AC5, the AC11 ceiling part, and AC6 (`TrainerUnresponsive`).
+6. **Pause.** "Released" as the paused target with retry, immediate reconcile on Pause and Resume, `last_tick_at` on every tick, dt cap. Covers AC8 and AC6 pause.
+7. **Lifecycle hooks.** `lifecycle.rs` functions plus tests, then the one-line calls in `stop_session`/`pause_session`/`resume_session`, `CloseRequested` and `RunEvent::ExitRequested`. Finish with the manual check in `tauri dev` with the simulator. Covers the AC6 wiring.
+8. **Final.** Full `cargo test` and `npm run check`; `design.md` Status: Current with a Verification section; `spec.md` Status: Built.
